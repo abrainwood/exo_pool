@@ -380,6 +380,15 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
     id_token = entry.data.get("id_token")
     expires_at = entry.data.get("expires_at", 0)
 
+    # Log whether this is the initial fetch or a REST fallback
+    mqtt_client = store.get("mqtt_client")
+    if mqtt_client and mqtt_client.connected:
+        _LOGGER.debug("REST poll fired while MQTT is connected (likely initial fetch)")
+    elif mqtt_client:
+        _LOGGER.warning("REST fallback poll - MQTT is disconnected")
+    else:
+        _LOGGER.debug("REST fetch (MQTT not yet initialized)")
+
     # Reuse Home Assistant's shared aiohttp client session
     session = aiohttp_client.async_get_clientsession(hass)
     # Refresh token if missing, expired, or about to expire
@@ -999,8 +1008,9 @@ def _schedule_credential_refresh(hass: HomeAssistant, entry: ConfigEntry) -> Non
         except Exception:
             _LOGGER.warning("MQTT credential refresh failed", exc_info=True)
 
-    store["credential_refresh_task"] = hass.async_create_task(
-        _refresh_and_reconnect()
+    store["credential_refresh_task"] = hass.async_create_background_task(
+        _refresh_and_reconnect(),
+        name="exo_pool_credential_refresh",
     )
 
 
