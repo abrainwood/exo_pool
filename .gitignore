@@ -1,5 +1,6 @@
 # Secrets
 .env
+.dev-token
 
 # Ignore everything except integration code
 custom_components/exo_pool/.storage/
