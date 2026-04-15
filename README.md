@@ -165,6 +165,50 @@ Have success with other models? Please share!
 
 ---
 
+## Development
+
+### Prerequisites
+
+- Docker
+- Python 3.9+
+- A Zodiac iAqualink account with an eXO device
+
+### Quick start
+
+```bash
+git clone https://github.com/benjycov/exo_pool.git
+cd exo_pool
+
+# Create .env with your Zodiac credentials
+echo "EXO_EMAIL=your@email.com" > .env
+echo "EXO_PASSWORD=yourpassword" >> .env
+
+# Start a dev HA instance (auto-onboards, configures integration)
+make dev
+
+# Open http://localhost:8125 (login: dev / devdevdev)
+```
+
+### Useful commands
+
+```bash
+make test       # run unit + integration tests
+make logs       # tail the HA container logs
+make restart    # restart HA after code changes (volume-mounted, no rebuild)
+make stop       # stop the container
+```
+
+### Running tests
+
+```bash
+pip install pytest pytest-asyncio awsiotsdk
+python3 -m pytest tests/ -v
+```
+
+Tests are isolated from Home Assistant - no HA installation required to run them.
+
+---
+
 ## Support
 
 - **Bugs / Feature Requests**: [GitHub Issues](https://github.com/benjycov/exo_pool/issues)
