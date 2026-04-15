@@ -15,6 +15,52 @@ import asyncio
 
 _LOGGER = logging.getLogger(__name__)
 
+# Header names we want to surface when present on any response
+_RATE_LIMIT_HEADERS = frozenset(
+    h.lower()
+    for h in (
+        "Retry-After",
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-RateLimit-Reset",
+        "RateLimit-Limit",
+        "RateLimit-Remaining",
+        "RateLimit-Reset",
+        "RateLimit-Policy",
+        "X-Rate-Limit-Limit",
+        "X-Rate-Limit-Remaining",
+        "X-Rate-Limit-Reset",
+    )
+)
+
+
+_SENSITIVE_HEADER_NAMES = frozenset(
+    h.lower()
+    for h in (
+        "Authorization",
+        "Set-Cookie",
+        "X-Amz-Security-Token",
+        "X-Amzn-Remapped-Authorization",
+    )
+)
+
+
+def _log_response_headers(
+    response: aiohttp.ClientResponse, *, label: str
+) -> None:
+    """Log all response headers at DEBUG; highlight any rate-limit headers at INFO."""
+    headers_dict = {
+        k: ("REDACTED" if k.lower() in _SENSITIVE_HEADER_NAMES else v)
+        for k, v in response.headers.items()
+    }
+    _LOGGER.debug("%s response headers: %s", label, headers_dict)
+    rate_headers = {
+        k: v for k, v in headers_dict.items() if k.lower() in _RATE_LIMIT_HEADERS
+    }
+    if rate_headers:
+        _LOGGER.info("%s rate-limit headers found: %s", label, rate_headers)
+
+
 # API endpoints and keys from config_flow.py and REST sensors
 LOGIN_URL = "https://prod.zodiac-io.com/users/v1/login"
 REFRESH_URL = "https://prod.zodiac-io.com/users/v1/refresh"
@@ -56,6 +102,12 @@ READ_DEFERRAL_JITTER_MIN = 15.0
 READ_DEFERRAL_JITTER_MAX = 45.0
 DEBOUNCE_JITTER_MIN = 30.0
 DEBOUNCE_JITTER_MAX = 90.0
+
+# AWS IoT MQTT
+IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
+IOT_REGION = "us-east-1"
+MQTT_CREDENTIAL_REFRESH_BUFFER = 300  # refresh 5 min before expiry
+REST_FALLBACK_INTERVAL = 1800  # 30 min REST poll as safety net
 
 
 async def _async_rate_limit(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -366,6 +418,7 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
         DATA_URL_TEMPLATE.format(serial_number), headers=headers
     ) as response:
         _LOGGER.debug("Data fetch response status: %s", response.status)
+        _log_response_headers(response, label="Data fetch")
         if response.status != 200:
             error_text = await response.text()
             is_rate_limited = response.status == 429 or "Too Many Requests" in str(
@@ -489,6 +542,7 @@ async def _full_login(
     await _async_rate_limit(hass, entry)
     async with session.post(LOGIN_URL, json=payload, headers=headers) as response:
         _LOGGER.debug("Login response status: %s", response.status)
+        _log_response_headers(response, label="Login")
         if response.status != 200:
             error_text = await response.text()
             _LOGGER.error("Failed to authenticate: %s", error_text)
@@ -530,6 +584,7 @@ async def _full_login(
         if refresh_token:
             update_data["refresh_token"] = refresh_token
         hass.config_entries.async_update_entry(entry, data=update_data)
+        _store_aws_credentials(hass, entry, data)
 
 
 async def _refresh_token(
@@ -545,6 +600,7 @@ async def _refresh_token(
     await _async_rate_limit(hass, entry)
     async with session.post(REFRESH_URL, json=payload, headers=headers) as response:
         _LOGGER.debug("Refresh response status: %s", response.status)
+        _log_response_headers(response, label="Token refresh")
         if response.status != 200:
             error_text = await response.text()
             _LOGGER.error("Failed to refresh token: %s", error_text)
@@ -574,6 +630,7 @@ async def _refresh_token(
         if refresh_token:
             update_data["refresh_token"] = refresh_token
         hass.config_entries.async_update_entry(entry, data=update_data)
+        _store_aws_credentials(hass, entry, data)
         return True
 
 
@@ -592,6 +649,20 @@ def _get_entry_store(hass: HomeAssistant, entry: ConfigEntry) -> dict:
     if DOMAIN not in hass.data:
         hass.data[DOMAIN] = {}
     return hass.data[DOMAIN].setdefault(entry.entry_id, {})
+
+
+def _store_aws_credentials(hass: HomeAssistant, entry: ConfigEntry, data: dict) -> None:
+    """Extract and store AWS credentials from a login/refresh response."""
+    credentials = data.get("credentials")
+    if not credentials:
+        _LOGGER.debug("No AWS credentials in response - MQTT will use REST fallback")
+        return
+    store = _get_entry_store(hass, entry)
+    store["aws_credentials"] = credentials
+    _LOGGER.debug(
+        "Stored AWS credentials (expire %s)",
+        credentials.get("Expiration", "unknown"),
+    )
 
 
 async def _async_boost_refresh_interval(
@@ -679,20 +750,48 @@ def _apply_schedule_update(
 async def _execute_write(
     hass: HomeAssistant, entry: ConfigEntry, item: _WriteItem
 ) -> None:
+    if item.kind == "pool":
+        desired = {"equipment": {"swc_0": item.payload}}
+    elif item.kind == "heating":
+        desired = {"heating": {item.target: item.payload}}
+    elif item.kind == "schedule":
+        desired = {"schedules": {item.target: item.payload}}
+    else:
+        raise Exception(f"Unknown write kind: {item.kind}")
+
+    # Try MQTT first - no rate limits, instant delivery
+    store = _get_entry_store(hass, entry)
+    mqtt_client = store.get("mqtt_client")
+    if mqtt_client and mqtt_client.connected:
+        _LOGGER.debug("Writing %s via MQTT: %s", item.key, desired)
+        try:
+            mqtt_client.publish_desired(desired)
+            return
+        except Exception:
+            _LOGGER.warning(
+                "MQTT write failed for %s - falling back to REST",
+                item.key,
+                exc_info=True,
+            )
+
+    # REST fallback
+    _LOGGER.debug("Writing %s via REST fallback", item.key)
+    await _execute_write_rest(hass, entry, item, desired)
+
+
+async def _execute_write_rest(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    item: _WriteItem,
+    desired: dict,
+) -> None:
+    """Execute a write via REST POST (fallback when MQTT is unavailable)."""
     serial_number = entry.data["serial_number"]
     id_token = entry.data.get("id_token")
     if not id_token:
         raise Exception(f"No id_token available for write {item.key}")
 
-    if item.kind == "pool":
-        payload = {"state": {"desired": {"equipment": {"swc_0": item.payload}}}}
-    elif item.kind == "heating":
-        payload = {"state": {"desired": {"heating": {item.target: item.payload}}}}
-    elif item.kind == "schedule":
-        payload = {"state": {"desired": {"schedules": {item.target: item.payload}}}}
-    else:
-        raise Exception(f"Unknown write kind: {item.kind}")
-
+    payload = {"state": {"desired": desired}}
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "User-Agent": "okhttp/3.14.7",
@@ -780,6 +879,7 @@ async def _post_write(
     """Post a write request and return the response status and body."""
     await _async_rate_limit(hass, entry)
     async with session.post(url, json=payload, headers=headers) as response:
+        _log_response_headers(response, label=f"Write ({item_key})")
         response_text = await response.text()
         _LOGGER.debug(
             "Write response for %s: %s %s",
@@ -788,6 +888,141 @@ async def _post_write(
             response_text,
         )
         return response.status, response_text
+
+
+def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Create and connect the MQTT client if AWS credentials are available.
+
+    Runs in a background thread since awsiotsdk connect is blocking.
+    On success, shadow updates feed directly into the coordinator
+    via async_set_updated_data, and the REST poll interval is relaxed
+    to a 30-minute fallback.
+    """
+    store = _get_entry_store(hass, entry)
+    credentials = store.get("aws_credentials")
+    if not credentials:
+        # Credentials aren't stored yet - the token was still valid from the
+        # previous session so _full_login/_refresh_token wasn't called.
+        # Do an explicit token refresh to get AWS credentials.
+        _LOGGER.debug("No AWS credentials yet - triggering token refresh to obtain them")
+        import asyncio
+
+        async def _fetch_credentials():
+            session = aiohttp_client.async_get_clientsession(hass)
+            await _refresh_authentication(hass, entry, session)
+
+        future = asyncio.run_coroutine_threadsafe(_fetch_credentials(), hass.loop)
+        try:
+            future.result(timeout=30)
+        except Exception:
+            _LOGGER.warning("Failed to obtain AWS credentials", exc_info=True)
+            return
+        credentials = store.get("aws_credentials")
+        if not credentials:
+            _LOGGER.debug("Still no AWS credentials after refresh - skipping MQTT")
+            return
+
+    coordinator = store.get("coordinator")
+    if coordinator is None:
+        return
+
+    from .mqtt_client import ExoMqttClient
+
+    mqtt_client = store.get("mqtt_client")
+    if mqtt_client is None:
+        mqtt_client = ExoMqttClient(
+            loop=hass.loop,
+            endpoint=IOT_ENDPOINT,
+            region=IOT_REGION,
+            serial=entry.data["serial_number"],
+        )
+        store["mqtt_client"] = mqtt_client
+
+    def _on_shadow_update(reported: dict) -> None:
+        """Called on HA event loop when MQTT delivers a shadow update."""
+        coordinator.async_set_updated_data(reported)
+
+    mqtt_client.set_shadow_callback(_on_shadow_update)
+
+    try:
+        mqtt_client.connect(credentials)
+        # Relax REST polling - MQTT push resets the timer on each update
+        coordinator.update_interval = timedelta(seconds=REST_FALLBACK_INTERVAL)
+        _LOGGER.info(
+            "MQTT connected - REST fallback interval set to %ss",
+            REST_FALLBACK_INTERVAL,
+        )
+    except Exception:
+        _LOGGER.warning(
+            "MQTT connection failed - continuing with REST polling",
+            exc_info=True,
+        )
+    # Schedule credential refresh on the HA event loop (not from this worker thread)
+    hass.loop.call_soon_threadsafe(_schedule_credential_refresh, hass, entry)
+
+
+def _schedule_credential_refresh(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Schedule MQTT credential refresh before they expire."""
+    store = _get_entry_store(hass, entry)
+    credentials = store.get("aws_credentials")
+    if not credentials:
+        return
+
+    # Cancel any existing refresh task
+    if task := store.get("credential_refresh_task"):
+        task.cancel()
+
+    expiration_str = credentials.get("Expiration", "")
+    if not expiration_str:
+        return
+
+    from datetime import datetime, timezone
+
+    try:
+        expires_at = datetime.fromisoformat(
+            expiration_str.replace("Z", "+00:00")
+        ).timestamp()
+    except (ValueError, TypeError):
+        _LOGGER.warning("Could not parse credential expiration: %s", expiration_str)
+        return
+
+    delay = max(0, expires_at - time.time() - MQTT_CREDENTIAL_REFRESH_BUFFER)
+    _LOGGER.debug("Scheduling MQTT credential refresh in %.0fs", delay)
+
+    async def _refresh_and_reconnect() -> None:
+        await asyncio.sleep(delay)
+        _LOGGER.info("Refreshing AWS credentials for MQTT")
+        try:
+            session = aiohttp_client.async_get_clientsession(hass)
+            await _refresh_authentication(hass, entry, session)
+            await hass.async_add_executor_job(_connect_mqtt, hass, entry)
+        except Exception:
+            _LOGGER.warning("MQTT credential refresh failed", exc_info=True)
+
+    store["credential_refresh_task"] = hass.async_create_task(
+        _refresh_and_reconnect()
+    )
+
+
+def cleanup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Clean up MQTT client and scheduled tasks for a config entry.
+
+    Called from async_unload_entry before the store is deleted.
+    """
+    store = _get_entry_store(hass, entry)
+
+    # Disconnect MQTT
+    mqtt_client = store.get("mqtt_client")
+    if mqtt_client:
+        try:
+            mqtt_client.disconnect()
+        except Exception:
+            _LOGGER.debug("Error disconnecting MQTT during cleanup", exc_info=True)
+
+    # Cancel scheduled tasks
+    for task_key in ("credential_refresh_task", "debounce_refresh_task", "boost_task"):
+        if task := store.get(task_key):
+            task.cancel()
 
 
 async def get_coordinator(hass: HomeAssistant, entry: ConfigEntry):
@@ -801,16 +1036,17 @@ async def get_coordinator(hass: HomeAssistant, entry: ConfigEntry):
             _LOGGER,
             name="Exo Pool",
             update_method=lambda: async_update_data(hass, entry),
-            # Poll at a moderate interval to reduce cloud load
             update_interval=timedelta(seconds=seconds),
         )
         store["coordinator"] = coordinator
-        # Perform initial refresh
+        # Initial data via REST - ensures entities have data immediately
         try:
             await coordinator.async_config_entry_first_refresh()
         except Exception as e:
             _LOGGER.error("Initial data fetch failed: %s", e)
             raise
+        # Start MQTT in background - REST continues as fallback
+        await hass.async_add_executor_job(_connect_mqtt, hass, entry)
     return store["coordinator"]
 
 

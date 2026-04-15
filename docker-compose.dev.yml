@@ -1,0 +1,16 @@
+services:
+  homeassistant:
+    container_name: ha-exo-pool-dev
+    image: ghcr.io/home-assistant/home-assistant:stable
+    volumes:
+      # Mount the custom component directly - edits reflect on restart
+      - ./custom_components/exo_pool:/config/custom_components/exo_pool:ro
+      # Persist HA config/state across restarts
+      - ha-exo-pool-dev-config:/config
+    ports:
+      - "8125:8123"
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+volumes:
+  ha-exo-pool-dev-config:
