@@ -122,7 +122,7 @@ class ExoMqttClient:
             payload=payload,
             qos=mqtt.QoS.AT_LEAST_ONCE,
         )
-        _LOGGER.debug("Published desired state to %s", topic)
+        _LOGGER.info("MQTT write: %s", desired)
 
     def _build_connection(self, credentials: dict) -> mqtt.Connection:
         """Build an MQTT connection with SigV4 WebSocket auth."""
@@ -180,7 +180,16 @@ class ExoMqttClient:
 
         reported = self._extract_reported(topic, data)
         if reported is None:
+            _LOGGER.debug("Shadow message on %s (no reported state to extract)", topic)
             return
+
+        _LOGGER.info("Shadow update received via %s", topic.split("/")[-1])
+        if "update/documents" in topic:
+            previous = data.get("previous", {}).get("state", {}).get("reported")
+            if previous:
+                changes = _summarize_changes(previous, reported)
+                if changes:
+                    _LOGGER.info("Shadow changes: %s", ", ".join(changes))
 
         if self._shadow_callback is not None:
             self._loop.call_soon_threadsafe(self._shadow_callback, reported)
@@ -210,3 +219,20 @@ class ExoMqttClient:
         # Re-subscribe since we use clean_session=True
         self._subscribe_shadow_topics()
         self._request_shadow()
+
+
+def _summarize_changes(old: dict, new: dict, path: str = "") -> list[str]:
+    """Return a list of human-readable change descriptions."""
+    changes = []
+    all_keys = set(list(old.keys()) + list(new.keys()))
+    for key in sorted(all_keys):
+        full_path = f"{path}.{key}" if path else key
+        old_val = old.get(key)
+        new_val = new.get(key)
+        if old_val == new_val:
+            continue
+        if isinstance(old_val, dict) and isinstance(new_val, dict):
+            changes.extend(_summarize_changes(old_val, new_val, full_path))
+        else:
+            changes.append(f"{full_path}: {old_val} -> {new_val}")
+    return changes
