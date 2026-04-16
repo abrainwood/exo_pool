@@ -1,9 +1,8 @@
 """Tests for ExoMqttClient - AWS IoT MQTT client for eXO device shadow."""
 from __future__ import annotations
 
-import asyncio
 import json
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -14,60 +13,8 @@ from tests.conftest import (
     SAMPLE_SERIAL,
 )
 
-
-@pytest.fixture
-def mock_mqtt_connection():
-    """Create a mock MQTT connection that behaves like awscrt mqtt."""
-    conn = MagicMock()
-
-    # connect() returns a future that resolves immediately
-    connect_future = MagicMock()
-    connect_future.result.return_value = None
-    conn.connect.return_value = connect_future
-
-    # disconnect() returns a future
-    disconnect_future = MagicMock()
-    disconnect_future.result.return_value = None
-    conn.disconnect.return_value = disconnect_future
-
-    # subscribe() returns (future, packet_id)
-    sub_future = MagicMock()
-    sub_future.result.return_value = None
-    conn.subscribe.return_value = (sub_future, 1)
-
-    # publish() returns (future, packet_id)
-    pub_future = MagicMock()
-    pub_future.result.return_value = None
-    conn.publish.return_value = (pub_future, 1)
-
-    return conn
-
-
-@pytest.fixture
-def mock_event_loop():
-    """Mock the HA event loop for thread-safe callback bridging."""
-    loop = MagicMock()
-    loop.call_soon_threadsafe = MagicMock()
-    return loop
-
-
-@pytest.fixture
-def build_client(mock_mqtt_connection, mock_event_loop):
-    """Factory to build an ExoMqttClient with mocked internals."""
-    from custom_components.exo_pool.mqtt_client import ExoMqttClient
-
-    def _build(**kwargs):
-        client = ExoMqttClient(
-            loop=mock_event_loop,
-            endpoint=kwargs.get("endpoint", IOT_ENDPOINT),
-            region=kwargs.get("region", IOT_REGION),
-            serial=kwargs.get("serial", SAMPLE_SERIAL),
-        )
-        # Inject the mock connection so we don't hit real AWS
-        client._build_connection = MagicMock(return_value=mock_mqtt_connection)
-        return client
-
-    return _build
+# Fixtures mock_mqtt_connection, mock_event_loop, and build_client
+# are defined in conftest.py and shared with test_mqtt_integration.py.
 
 
 class TestConnect:
@@ -550,27 +497,26 @@ class TestBuildConnection:
     """Test that _build_connection creates a properly configured MQTT connection."""
 
     def test_build_connection_uses_sigv4_websockets(self):
+        from unittest.mock import patch
         from custom_components.exo_pool.mqtt_client import ExoMqttClient
         import custom_components.exo_pool.mqtt_client as mqtt_mod
 
-        mock_builder = MagicMock()
         mock_conn = MagicMock()
-        mock_builder.websockets_with_default_aws_signing.return_value = mock_conn
 
-        loop = MagicMock()
-        client = ExoMqttClient(
-            loop=loop,
-            endpoint=IOT_ENDPOINT,
-            region=IOT_REGION,
-            serial=SAMPLE_SERIAL,
-        )
+        with patch.object(
+            mqtt_mod,
+            "mqtt_connection_builder",
+        ) as mock_builder:
+            mock_builder.websockets_with_default_aws_signing.return_value = mock_conn
 
-        original_builder = mqtt_mod.mqtt_connection_builder
-        mqtt_mod.mqtt_connection_builder = mock_builder
-        try:
+            loop = MagicMock()
+            client = ExoMqttClient(
+                loop=loop,
+                endpoint=IOT_ENDPOINT,
+                region=IOT_REGION,
+                serial=SAMPLE_SERIAL,
+            )
             result = client._build_connection(SAMPLE_CREDENTIALS)
-        finally:
-            mqtt_mod.mqtt_connection_builder = original_builder
 
         mock_builder.websockets_with_default_aws_signing.assert_called_once()
         call_kwargs = mock_builder.websockets_with_default_aws_signing.call_args.kwargs

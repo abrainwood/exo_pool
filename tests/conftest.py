@@ -39,3 +39,58 @@ SAMPLE_CREDENTIALS = {
 SAMPLE_SERIAL = "JT21007072"
 IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
 IOT_REGION = "us-east-1"
+
+
+@pytest.fixture
+def mock_mqtt_connection():
+    """Create a mock MQTT connection that behaves like awscrt mqtt."""
+    from unittest.mock import MagicMock
+
+    conn = MagicMock()
+
+    connect_future = MagicMock()
+    connect_future.result.return_value = None
+    conn.connect.return_value = connect_future
+
+    disconnect_future = MagicMock()
+    disconnect_future.result.return_value = None
+    conn.disconnect.return_value = disconnect_future
+
+    sub_future = MagicMock()
+    sub_future.result.return_value = None
+    conn.subscribe.return_value = (sub_future, 1)
+
+    pub_future = MagicMock()
+    pub_future.result.return_value = None
+    conn.publish.return_value = (pub_future, 1)
+
+    return conn
+
+
+@pytest.fixture
+def mock_event_loop():
+    """Mock the HA event loop for thread-safe callback bridging."""
+    from unittest.mock import MagicMock
+
+    loop = MagicMock()
+    loop.call_soon_threadsafe = MagicMock()
+    return loop
+
+
+@pytest.fixture
+def build_client(mock_mqtt_connection, mock_event_loop):
+    """Factory to build an ExoMqttClient with mocked internals."""
+    from unittest.mock import MagicMock
+    from custom_components.exo_pool.mqtt_client import ExoMqttClient
+
+    def _build(**kwargs):
+        client = ExoMqttClient(
+            loop=mock_event_loop,
+            endpoint=kwargs.get("endpoint", IOT_ENDPOINT),
+            region=kwargs.get("region", IOT_REGION),
+            serial=kwargs.get("serial", SAMPLE_SERIAL),
+        )
+        client._build_connection = MagicMock(return_value=mock_mqtt_connection)
+        return client
+
+    return _build

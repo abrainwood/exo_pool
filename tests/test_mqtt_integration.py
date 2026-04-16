@@ -14,13 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from custom_components.exo_pool.mqtt_client import ExoMqttClient
-from tests.conftest import (
-    IOT_ENDPOINT,
-    IOT_REGION,
-    SAMPLE_CREDENTIALS,
-    SAMPLE_SERIAL,
-)
+from tests.conftest import SAMPLE_CREDENTIALS, SAMPLE_SERIAL
 
 
 # ---------------------------------------------------------------------------
@@ -114,43 +108,37 @@ def _make_update_documents(current_reported: dict, previous_reported: dict) -> b
 
 
 @pytest.fixture
-def connected_client():
-    """An ExoMqttClient connected with mocked MQTT internals."""
-    mock_conn = MagicMock()
-    connect_future = MagicMock()
-    connect_future.result.return_value = None
-    mock_conn.connect.return_value = connect_future
-    disconnect_future = MagicMock()
-    disconnect_future.result.return_value = None
-    mock_conn.disconnect.return_value = disconnect_future
-    sub_future = MagicMock()
-    sub_future.result.return_value = None
-    mock_conn.subscribe.return_value = (sub_future, 1)
-    pub_future = MagicMock()
-    pub_future.result.return_value = None
-    mock_conn.publish.return_value = (pub_future, 1)
+def connected_client(build_client, mock_mqtt_connection, mock_event_loop):
+    """An ExoMqttClient connected with mocked MQTT internals.
 
-    loop = MagicMock()
-    client = ExoMqttClient(
-        loop=loop,
-        endpoint=IOT_ENDPOINT,
-        region=IOT_REGION,
-        serial=SAMPLE_SERIAL,
-    )
-    client._build_connection = MagicMock(return_value=mock_conn)
-
-    # Collect what gets bridged to the HA loop
+    Uses shared fixtures from conftest. The event loop bridge executes
+    callbacks synchronously so received_data is populated immediately.
+    """
     received_data = []
 
     def capture_call_soon(fn, *args):
         fn(*args)
 
-    loop.call_soon_threadsafe = capture_call_soon
+    mock_event_loop.call_soon_threadsafe = capture_call_soon
 
+    client = build_client()
     client.set_shadow_callback(lambda data: received_data.append(data))
     client.connect(SAMPLE_CREDENTIALS)
 
-    return client, mock_conn, received_data
+    return client, mock_mqtt_connection, received_data
+
+
+@pytest.fixture
+def get_accepted_data(connected_client):
+    """Fire a get/accepted message and return the parsed coordinator data."""
+    _, mock_conn, received = connected_client
+    cb = _get_subscribe_callback(mock_conn, "get/accepted")
+    cb(
+        topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/get/accepted",
+        payload=_make_get_accepted(REAL_REPORTED_STATE),
+        dup=False, qos=1, retain=False,
+    )
+    return received[0]
 
 
 def _get_subscribe_callback(mock_conn, topic_fragment: str):
@@ -165,32 +153,12 @@ def _get_subscribe_callback(mock_conn, topic_fragment: str):
 class TestGetAcceptedDataContract:
     """shadow/get/accepted → coordinator data matches entity expectations."""
 
-    def test_full_reported_state_reaches_callback(self, connected_client):
-        _, mock_conn, received = connected_client
-        cb = _get_subscribe_callback(mock_conn, "get/accepted")
+    def test_full_reported_state_reaches_callback(self, get_accepted_data):
+        assert get_accepted_data == REAL_REPORTED_STATE
 
-        cb(
-            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/get/accepted",
-            payload=_make_get_accepted(REAL_REPORTED_STATE),
-            dup=False, qos=1, retain=False,
-        )
-
-        assert len(received) == 1
-        data = received[0]
-        # Round-trip fidelity: the reported state must arrive unchanged
-        assert data == REAL_REPORTED_STATE
-
-    def test_sensor_data_paths_exist(self, connected_client):
+    def test_sensor_data_paths_exist(self, get_accepted_data):
         """All sensor.py read paths must be present in coordinator data."""
-        _, mock_conn, received = connected_client
-        cb = _get_subscribe_callback(mock_conn, "get/accepted")
-        cb(
-            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/get/accepted",
-            payload=_make_get_accepted(REAL_REPORTED_STATE),
-            dup=False, qos=1, retain=False,
-        )
-        data = received[0]
-        swc = data["equipment"]["swc_0"]
+        swc = get_accepted_data["equipment"]["swc_0"]
 
         # TempSensor
         assert swc["sns_3"]["value"] == 22
@@ -213,19 +181,11 @@ class TestGetAcceptedDataContract:
         assert swc["error_code"] == 0
 
         # WifiRssiSensor
-        assert data["debug"]["RSSI"] == -43
+        assert get_accepted_data["debug"]["RSSI"] == -43
 
-    def test_binary_sensor_data_paths_exist(self, connected_client):
+    def test_binary_sensor_data_paths_exist(self, get_accepted_data):
         """All binary_sensor.py read paths must be present."""
-        _, mock_conn, received = connected_client
-        cb = _get_subscribe_callback(mock_conn, "get/accepted")
-        cb(
-            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/get/accepted",
-            payload=_make_get_accepted(REAL_REPORTED_STATE),
-            dup=False, qos=1, retain=False,
-        )
-        data = received[0]
-        swc = data["equipment"]["swc_0"]
+        swc = get_accepted_data["equipment"]["swc_0"]
 
         # FilterPumpBinarySensor
         assert swc["filter_pump"]["state"] == 1
@@ -237,23 +197,16 @@ class TestGetAcceptedDataContract:
         assert swc["production"] == 1
 
         # AwsConnectivityBinarySensor
-        assert data["aws"]["status"] == "connected"
+        assert get_accepted_data["aws"]["status"] == "connected"
 
         # ScheduleBinarySensor - schedules dict exists with valid entries
-        schedules = data["schedules"]
+        schedules = get_accepted_data["schedules"]
         assert "sch1" in schedules
         assert schedules["sch1"]["active"] == 0
 
-    def test_switch_data_paths_exist(self, connected_client):
+    def test_switch_data_paths_exist(self, get_accepted_data):
         """All switch.py read paths must be present."""
-        _, mock_conn, received = connected_client
-        cb = _get_subscribe_callback(mock_conn, "get/accepted")
-        cb(
-            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/get/accepted",
-            payload=_make_get_accepted(REAL_REPORTED_STATE),
-            dup=False, qos=1, retain=False,
-        )
-        swc = received[0]["equipment"]["swc_0"]
+        swc = get_accepted_data["equipment"]["swc_0"]
 
         # ORPBoostSwitch
         assert swc["boost"] == 0
@@ -274,16 +227,9 @@ class TestGetAcceptedDataContract:
         # SWCLowModeSwitch
         assert swc["low"] == 0
 
-    def test_number_data_paths_exist(self, connected_client):
+    def test_number_data_paths_exist(self, get_accepted_data):
         """All number.py read paths must be present."""
-        _, mock_conn, received = connected_client
-        cb = _get_subscribe_callback(mock_conn, "get/accepted")
-        cb(
-            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/get/accepted",
-            payload=_make_get_accepted(REAL_REPORTED_STATE),
-            dup=False, qos=1, retain=False,
-        )
-        swc = received[0]["equipment"]["swc_0"]
+        swc = get_accepted_data["equipment"]["swc_0"]
 
         # Capability flags that control which number entities are created
         assert swc["ph_only"] == 1
@@ -295,16 +241,9 @@ class TestGetAcceptedDataContract:
         # ExoPoolSwcLowOutputNumber
         assert swc["swc_low"] == REAL_REPORTED_STATE["equipment"]["swc_0"]["swc_low"]
 
-    def test_climate_data_paths_exist(self, connected_client):
+    def test_climate_data_paths_exist(self, get_accepted_data):
         """climate.py reads from equipment.swc_0 and aux_2."""
-        _, mock_conn, received = connected_client
-        cb = _get_subscribe_callback(mock_conn, "get/accepted")
-        cb(
-            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/get/accepted",
-            payload=_make_get_accepted(REAL_REPORTED_STATE),
-            dup=False, qos=1, retain=False,
-        )
-        swc = received[0]["equipment"]["swc_0"]
+        swc = get_accepted_data["equipment"]["swc_0"]
 
         # Climate reads water temp for current_temperature
         assert swc["sns_3"]["value"] == 22
