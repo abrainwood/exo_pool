@@ -36,6 +36,7 @@ _SUBSCRIBE_TIMEOUT = 5
 _CONNECT_TIMEOUT = 10
 _DISCONNECT_TIMEOUT = 5
 _SUBSCRIBE_DELAY = 0.3
+_HEARTBEAT_INTERVAL = 900  # 15 min shadow refresh via MQTT
 
 
 class ExoMqttClient:
@@ -60,6 +61,7 @@ class ExoMqttClient:
         self._connection: mqtt.Connection | None = None
         self._connected = False
         self._shadow_callback: Callable[[dict], None] | None = None
+        self._heartbeat_cancel: Callable | None = None
 
         # CRT resources - created once, reused across reconnections
         self._event_loop_group = io.EventLoopGroup(1)
@@ -96,9 +98,11 @@ class ExoMqttClient:
 
         self._subscribe_shadow_topics()
         self._request_shadow()
+        self._start_heartbeat()
 
     def disconnect(self) -> None:
         """Disconnect from AWS IoT."""
+        self._stop_heartbeat()
         if self._connection is not None:
             try:
                 self._connection.disconnect().result(timeout=_DISCONNECT_TIMEOUT)
@@ -169,6 +173,27 @@ class ExoMqttClient:
             qos=mqtt.QoS.AT_LEAST_ONCE,
         )
         _LOGGER.debug("Requested shadow state via %s", topic)
+
+    def _start_heartbeat(self) -> None:
+        """Start periodic shadow/get to keep coordinator data fresh."""
+        self._stop_heartbeat()
+        handle = self._loop.call_later(
+            _HEARTBEAT_INTERVAL, self._heartbeat_tick
+        )
+        self._heartbeat_cancel = handle.cancel
+
+    def _stop_heartbeat(self) -> None:
+        """Cancel the heartbeat timer."""
+        if self._heartbeat_cancel is not None:
+            self._heartbeat_cancel()
+            self._heartbeat_cancel = None
+
+    def _heartbeat_tick(self) -> None:
+        """Fire a shadow/get and reschedule."""
+        if self._connected and self._connection is not None:
+            _LOGGER.debug("MQTT heartbeat - requesting shadow state")
+            self._request_shadow()
+        self._start_heartbeat()
 
     def _on_shadow_message(self, topic, payload, dup, qos, retain, **kwargs):
         """Handle incoming shadow messages (runs on CRT thread)."""

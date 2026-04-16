@@ -406,6 +406,86 @@ class TestReconnection:
         assert client.connected is True
 
 
+class TestHeartbeat:
+    """Heartbeat (periodic shadow/get) tests."""
+
+    def test_connect_starts_heartbeat(self, build_client, mock_event_loop):
+        client = build_client()
+        client.connect(SAMPLE_CREDENTIALS)
+
+        # Should have scheduled a call_later on the event loop
+        mock_event_loop.call_later.assert_called()
+        args = mock_event_loop.call_later.call_args
+        interval = args.args[0] if args.args else args[0][0]
+        assert interval == 900  # _HEARTBEAT_INTERVAL
+
+    def test_heartbeat_tick_requests_shadow(
+        self, build_client, mock_mqtt_connection
+    ):
+        client = build_client()
+        client.connect(SAMPLE_CREDENTIALS)
+        initial_pub_count = mock_mqtt_connection.publish.call_count
+
+        # Simulate the heartbeat firing
+        client._heartbeat_tick()
+
+        new_pub_calls = mock_mqtt_connection.publish.call_args_list[
+            initial_pub_count:
+        ]
+        get_calls = [
+            c
+            for c in new_pub_calls
+            if (c.kwargs.get("topic") or c.args[0]).endswith("/shadow/get")
+        ]
+        assert len(get_calls) == 1
+
+    def test_heartbeat_reschedules_after_tick(
+        self, build_client, mock_event_loop
+    ):
+        client = build_client()
+        client.connect(SAMPLE_CREDENTIALS)
+        initial_call_count = mock_event_loop.call_later.call_count
+
+        client._heartbeat_tick()
+
+        assert mock_event_loop.call_later.call_count > initial_call_count
+
+    def test_heartbeat_skips_when_disconnected(
+        self, build_client, mock_mqtt_connection
+    ):
+        client = build_client()
+        client.connect(SAMPLE_CREDENTIALS)
+        initial_pub_count = mock_mqtt_connection.publish.call_count
+
+        client._on_connection_interrupted(
+            connection=mock_mqtt_connection, error=Exception("down")
+        )
+
+        client._heartbeat_tick()
+
+        # Should not publish when disconnected
+        new_pub_calls = mock_mqtt_connection.publish.call_args_list[
+            initial_pub_count:
+        ]
+        get_calls = [
+            c
+            for c in new_pub_calls
+            if (c.kwargs.get("topic") or c.args[0]).endswith("/shadow/get")
+        ]
+        assert len(get_calls) == 0
+
+    def test_disconnect_cancels_heartbeat(self, build_client, mock_event_loop):
+        # Set up call_later to return a mock handle with cancel()
+        mock_handle = MagicMock()
+        mock_event_loop.call_later.return_value = mock_handle
+
+        client = build_client()
+        client.connect(SAMPLE_CREDENTIALS)
+        client.disconnect()
+
+        mock_handle.cancel.assert_called()
+
+
 class TestBuildConnection:
     """Test that _build_connection creates a properly configured MQTT connection."""
 
