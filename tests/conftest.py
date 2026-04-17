@@ -36,7 +36,7 @@ SAMPLE_CREDENTIALS = {
     "IdentityId": "us-east-1:00000000-0000-0000-0000-000000000000",
 }
 
-SAMPLE_SERIAL = "JT21007072"
+SAMPLE_SERIAL = "JT00000000"
 IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
 IOT_REGION = "us-east-1"
 

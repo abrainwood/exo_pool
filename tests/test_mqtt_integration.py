@@ -2,7 +2,7 @@
 
 Verifies that shadow payloads from AWS IoT produce data in the exact
 shape that the existing entity platforms expect. Uses real device data
-captured from Andrew's eXO (JT21007072) as test fixtures.
+captured from a real eXO device as test fixtures.
 
 This is the critical integration seam - if these tests pass, the entities
 will render correctly regardless of whether data came from REST or MQTT.
@@ -18,7 +18,7 @@ from tests.conftest import SAMPLE_CREDENTIALS, SAMPLE_SERIAL
 
 
 # ---------------------------------------------------------------------------
-# Real device shadow data captured from JT21007072 (2026-04-15)
+# Real device shadow data captured from an eXO device
 # ---------------------------------------------------------------------------
 
 REAL_REPORTED_STATE = {
@@ -60,7 +60,7 @@ REAL_REPORTED_STATE = {
             "lang": 0,
             "amp": 1,
             "aux230": 0,
-            "sn": "ALWA01011338210240",
+            "sn": "ALWA00000000000000",
             "version": "V1",
             "exo_state": 1,
         },
