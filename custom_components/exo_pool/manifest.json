@@ -1,14 +1,12 @@
 {
   "domain": "exo_pool",
   "name": "Exo Pool",
-  "codeowners": [
-    "@benjycov"
-  ],
+  "codeowners": ["@benjycov"],
   "config_flow": true,
   "documentation": "https://github.com/benjycov/exo_pool",
   "integration_type": "hub",
   "iot_class": "cloud_push",
-  "requirements": ["awsiotsdk>=1.28.0"],
   "issue_tracker": "https://github.com/benjycov/exo_pool/issues",
+  "requirements": ["awsiotsdk>=1.28.0"],
   "version": "0.2.0"
 }
