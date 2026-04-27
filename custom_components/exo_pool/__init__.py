@@ -6,7 +6,7 @@ from homeassistant.config_entries import (
 from homeassistant.core import HomeAssistant, ServiceCall
 import logging
 from .const import DOMAIN
-from .api import get_coordinator
+from .api import get_coordinator, cleanup_entry
 from . import api as exo_api
 from homeassistant.helpers.device_registry import DeviceRegistry, async_get
 from homeassistant.helpers import entity_registry as er
@@ -89,6 +89,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry, ["sensor", "binary_sensor", "switch", "number", "button", "climate"]
         )
         if result and entry.entry_id in hass.data[DOMAIN]:
+            cleanup_entry(hass, entry)
             del hass.data[DOMAIN][entry.entry_id]
         _LOGGER.debug("Unloaded platforms for entry: %s", entry.entry_id)
         return result

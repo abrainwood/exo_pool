@@ -4,6 +4,13 @@ A custom integration to connect your Zodiac iAqualink **Exo** pool system to Hom
 
 ## 🆕 What’s New
 
+- **15 Apr 2026**
+1) **Real-time updates via AWS IoT MQTT.** The integration now connects to the same AWS IoT shadow endpoint used by the official iAqualink app, giving sub-second state sync instead of REST polling. No additional setup required - it uses credentials already provided by the Zodiac login API.
+2) Writes (set points, switches, schedules) now go via MQTT when connected, eliminating 429 rate limit errors on writes.
+3) REST polling is kept as a 1-hour fallback in case MQTT disconnects, but under normal operation all data flows through MQTT push.
+4) AWS credentials are automatically refreshed before expiry (~hourly).
+5) Added `awsiotsdk` as a dependency (installed automatically by HACS).
+
 - **7 Feb 2026**
 1) Small retry fix to get around 401 'token expired' errors on schedule write attempts (and associated logging updates).
 
@@ -62,7 +69,8 @@ A custom integration to connect your Zodiac iAqualink **Exo** pool system to Hom
 - **Climate (experimental)** – Heat Pump control when Aux 2 is configured for heat mode.
 - **Services** – Control and modify schedules (see below).
 - **Diagnostics & Dynamic Device Info** – View hardware configuration and live status; serial number and software version update periodically.
-- **Configurable Refresh Rate** – Adjust the `Refresh Interval` number (300–3600 s, default 600 s) if you see *Too Many Requests* errors.
+- **Real-time MQTT Updates** – Connects to AWS IoT for instant state sync (same protocol as the official app). No MQTT broker or addon required.
+- **Configurable Refresh Rate** – The `Refresh Interval` number (300-3600 s) controls the REST fallback poll interval. Under normal MQTT operation this rarely fires.
 
 ---
 
@@ -141,7 +149,7 @@ After early Node-RED flows and REST template hacks, this dedicated integration w
 ## Limitations
 
 - Restricted to **Exo** devices only; use the core iAqualink integration for other hardware.
-- Commands (set points, Aux switches, etc.) can be slightly laggy; polling is temporarily boosted to ~10 s for ~60 s after changes.
+- Commands (set points, Aux switches, etc.) are near-instant via MQTT. If MQTT is unavailable, writes fall back to REST which may be subject to rate limits.
 - Schedule keys, names and endpoints are determined by the device; disabling a schedule is modelled as `00:00–00:00`.
 - RPM is only relevant to VSP schedules.
 - The heat pump climate entity only appears when Aux 2 is set to heat mode.
@@ -154,6 +162,50 @@ Confirmed working with:
 - **Exo IQ LS** (dual-link ORP & pH, Zodiac VSP pump).
 
 Have success with other models? Please share!
+
+---
+
+## Development
+
+### Prerequisites
+
+- Docker
+- Python 3.9+
+- A Zodiac iAqualink account with an eXO device
+
+### Quick start
+
+```bash
+git clone https://github.com/benjycov/exo_pool.git
+cd exo_pool
+
+# Create .env with your Zodiac credentials
+echo "EXO_EMAIL=your@email.com" > .env
+echo "EXO_PASSWORD=yourpassword" >> .env
+
+# Start a dev HA instance (auto-onboards, configures integration)
+make dev
+
+# Open http://localhost:8125 (login: dev / devdevdev)
+```
+
+### Useful commands
+
+```bash
+make test       # run unit + integration tests
+make logs       # tail the HA container logs
+make restart    # restart HA after code changes (volume-mounted, no rebuild)
+make stop       # stop the container
+```
+
+### Running tests
+
+```bash
+pip install pytest pytest-asyncio awsiotsdk
+python3 -m pytest tests/ -v
+```
+
+Tests are isolated from Home Assistant - no HA installation required to run them.
 
 ---
 

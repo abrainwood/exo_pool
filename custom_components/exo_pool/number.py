@@ -77,7 +77,7 @@ class ExoPoolORPSetPointNumber(CoordinatorEntity, NumberEntity):
 
     _attr_icon = "mdi:water-check"
     _attr_mode = "box"
-    _attr_step = 10
+    _attr_native_step = 10
     _attr_native_min_value = 600
     _attr_native_max_value = 900
 
@@ -119,7 +119,7 @@ class ExoPoolPHSetPointNumber(CoordinatorEntity, NumberEntity):
 
     _attr_icon = "mdi:test-tube"
     _attr_mode = "box"
-    _attr_step = 0.1
+    _attr_native_step = 0.1
     _attr_native_min_value = 6.0
     _attr_native_max_value = 7.6
 
@@ -162,7 +162,7 @@ class ExoPoolSwcOutputNumber(CoordinatorEntity, NumberEntity):
 
     _attr_icon = "mdi:water-percent"
     _attr_mode = "box"
-    _attr_step = 1
+    _attr_native_step = 1
     _attr_native_min_value = 0
     _attr_native_max_value = 100
     _attr_native_unit_of_measurement = PERCENTAGE
@@ -198,7 +198,7 @@ class ExoPoolSwcLowOutputNumber(CoordinatorEntity, NumberEntity):
 
     _attr_icon = "mdi:water-percent"
     _attr_mode = "box"
-    _attr_step = 1
+    _attr_native_step = 1
     _attr_native_min_value = 0
     _attr_native_max_value = 100
     _attr_native_unit_of_measurement = PERCENTAGE
@@ -236,7 +236,7 @@ class ExoPoolRefreshIntervalNumber(CoordinatorEntity, NumberEntity):
 
     _attr_icon = "mdi:update"
     _attr_mode = "box"
-    _attr_step = 1
+    _attr_native_step = 1
     _attr_native_min_value = REFRESH_MIN
     _attr_native_max_value = REFRESH_MAX
     _attr_native_unit_of_measurement = UnitOfTime.SECONDS
