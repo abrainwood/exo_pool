@@ -11,21 +11,32 @@ import pytest
 # Stub out the homeassistant package so mqtt_client.py can be imported
 # without a full HA installation. mqtt_client.py itself has no HA deps,
 # but importing via custom_components.exo_pool triggers __init__.py which does.
-# We pre-register the mqtt_client module directly to short-circuit that.
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
-_mqtt_spec = importlib.util.spec_from_file_location(
-    "custom_components.exo_pool.mqtt_client",
-    _REPO_ROOT / "custom_components" / "exo_pool" / "mqtt_client.py",
-)
-_mqtt_mod = importlib.util.module_from_spec(_mqtt_spec)
 
-# Ensure parent packages exist in sys.modules
 for pkg in ("custom_components", "custom_components.exo_pool"):
     if pkg not in sys.modules:
         sys.modules[pkg] = types.ModuleType(pkg)
 
-sys.modules["custom_components.exo_pool.mqtt_client"] = _mqtt_mod
-_mqtt_spec.loader.exec_module(_mqtt_mod)
+
+def load_exo_pool_module(name: str):
+    """Load a custom_components.exo_pool submodule directly.
+
+    custom_components.exo_pool is the fake stub package registered above, so
+    its __init__ can't be reached through a normal `from .foo import bar`.
+    """
+    full_name = f"custom_components.exo_pool.{name}"
+    if full_name in sys.modules:
+        return sys.modules[full_name]
+    spec = importlib.util.spec_from_file_location(
+        full_name, _REPO_ROOT / "custom_components" / "exo_pool" / f"{name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[full_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+load_exo_pool_module("mqtt_client")
 
 
 SAMPLE_CREDENTIALS = {
@@ -69,11 +80,17 @@ def mock_mqtt_connection():
 
 @pytest.fixture
 def mock_event_loop():
-    """Mock the HA event loop for thread-safe callback bridging."""
+    """Mock the HA event loop for thread-safe callback bridging.
+
+    call_soon_threadsafe runs its callback immediately so tests see the
+    same effects a real loop would produce on its next tick. A test that
+    needs to prove a call goes through call_soon_threadsafe rather than
+    hitting the loop directly can override it with a bare MagicMock.
+    """
     from unittest.mock import MagicMock
 
     loop = MagicMock()
-    loop.call_soon_threadsafe = MagicMock()
+    loop.call_soon_threadsafe = MagicMock(side_effect=lambda fn, *args: fn(*args))
     return loop
 
 

@@ -2,6 +2,10 @@
 .env
 .dev-token
 
+# Python
+__pycache__/
+.pytest_cache/
+
 # Ignore everything except integration code
 custom_components/exo_pool/.storage/
 custom_components/exo_pool/*.db

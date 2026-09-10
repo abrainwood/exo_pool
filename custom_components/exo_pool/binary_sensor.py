@@ -314,12 +314,7 @@ class AwsConnectivityBinarySensor(CoordinatorEntity, BinarySensorEntity):
 
 
 class MqttConnectedBinarySensor(CoordinatorEntity, BinarySensorEntity):
-    """MQTT transport connectivity - independent of cloud/auth state.
-
-    Tracks the AWS IoT MQTT transport itself, not login/token health or
-    the device's own reported "aws" status. During a WAN outage this is
-    the entity that shows the integration degraded to REST polling.
-    """
+    """MQTT transport connectivity - independent of cloud/auth state."""
 
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
     _attr_icon = "mdi:transit-connection-variant"
@@ -342,11 +337,6 @@ class MqttConnectedBinarySensor(CoordinatorEntity, BinarySensorEntity):
     def is_on(self) -> bool:
         mqtt_client = get_mqtt_client(self._hass, self._entry)
         return bool(mqtt_client and mqtt_client.connected)
-
-    @property
-    def available(self) -> bool:
-        """Return availability based on data fetch success."""
-        return self.coordinator.data is not None
 
 
 class ScheduleBinarySensor(CoordinatorEntity, BinarySensorEntity):
