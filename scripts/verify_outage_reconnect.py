@@ -4,8 +4,9 @@
 Drives the `ha-exo-pool-dev` dev container through a simulated WAN outage
 and checks that the fix in PR #4 behaves as designed: the retry chain
 re-arms itself with growing backoff instead of dying after one failed
-attempt, `binary_sensor.mqtt_connected` tracks the transport honestly, and
-the interrupt watchdog forces a reconnect if resume never arrives.
+attempt, the exo_pool MQTT-connectivity binary_sensor (resolved at runtime -
+see resolve_mqtt_entity_id()) tracks the transport honestly, and the
+interrupt watchdog forces a reconnect if resume never arrives.
 
 Usage:
     export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
@@ -75,7 +76,6 @@ BLACKHOLE_HOSTS = [
     "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com",
 ]
 IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
-MQTT_ENTITY = "binary_sensor.mqtt_connected"
 HOSTS_MARKER = "# exo-pool-outage-harness"
 
 # Mirrors api.py's own constants so the harness's timeouts track the fix
@@ -257,6 +257,41 @@ def wait_for_log_pattern(
         time.sleep(min(poll_interval, remaining))
 
 
+# --- MQTT entity resolution (unit tested) ---------------------------------
+
+MQTT_ENTITY_DOMAIN = "binary_sensor."
+MQTT_ENTITY_SUFFIX = "mqtt_connected"
+
+
+class MqttEntityResolutionError(RuntimeError):
+    """Raised when the exo_pool MQTT-connectivity entity can't be uniquely resolved."""
+
+
+def resolve_mqtt_entity_id(entity_ids: list[str]) -> str:
+    """Pick the `binary_sensor.*mqtt_connected` entity out of `entity_ids`.
+
+    HA prefixes the entity ID with the device name, so a hardcoded ID
+    breaks silently on a device rename - match the domain/suffix shape and
+    resolve it at runtime instead.
+    """
+    matches = [
+        eid for eid in entity_ids
+        if eid.startswith(MQTT_ENTITY_DOMAIN) and eid.endswith(MQTT_ENTITY_SUFFIX)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        exo_candidates = [eid for eid in entity_ids if "exo" in eid]
+        raise MqttEntityResolutionError(
+            f"no {MQTT_ENTITY_DOMAIN}*{MQTT_ENTITY_SUFFIX} entity found; "
+            f"exo-matching entities seen: {exo_candidates or 'none'}"
+        )
+    raise MqttEntityResolutionError(
+        f"expected exactly one {MQTT_ENTITY_DOMAIN}*{MQTT_ENTITY_SUFFIX} entity, "
+        f"found {len(matches)}: {matches}"
+    )
+
+
 # --- HA REST API -------------------------------------------------------
 
 
@@ -296,6 +331,11 @@ def _ha_request(method: str, path: str, token: str, data: dict | None = None) ->
 def get_entity_state(token: str, entity_id: str) -> str:
     state = _ha_request("GET", f"/api/states/{entity_id}", token)
     return state["state"]
+
+
+def list_entity_ids(token: str) -> list[str]:
+    states = _ha_request("GET", "/api/states", token)
+    return [s["entity_id"] for s in states or []]
 
 
 def get_exo_pool_entry_id(token: str) -> str:
@@ -370,11 +410,11 @@ def block_iot_endpoint_tcp(container: Container, teardown: BestEffortTeardown, e
 # --- Scenarios ---------------------------------------------------------
 
 
-def scenario_baseline(token: str) -> None:
-    state = get_entity_state(token, MQTT_ENTITY)
+def scenario_baseline(token: str, mqtt_entity: str) -> None:
+    state = get_entity_state(token, mqtt_entity)
     if state != "on":
-        raise ScenarioFailure(f"{MQTT_ENTITY} baseline is {state!r}, expected 'on'")
-    print(f"PASS baseline: {MQTT_ENTITY} is on")
+        raise ScenarioFailure(f"{mqtt_entity} baseline is {state!r}, expected 'on'")
+    print(f"PASS baseline: {mqtt_entity} is on")
 
 
 def _wait_for_min_retry_attempts(container: Container, since: str, min_attempts: int, timeout: float) -> list[RetryAttempt]:
@@ -413,7 +453,7 @@ def _assert_backoff_reset_to_base(container: Container, token: str, entry_id: st
     return attempts[0]
 
 
-def scenario_outage_and_recovery(container: Container, token: str, teardown: BestEffortTeardown) -> None:
+def scenario_outage_and_recovery(container: Container, token: str, teardown: BestEffortTeardown, mqtt_entity: str) -> None:
     entry_id = get_exo_pool_entry_id(token)
     since = now_utc_iso()
 
@@ -424,10 +464,10 @@ def scenario_outage_and_recovery(container: Container, token: str, teardown: Bes
     assert_growing_backoff(attempts)
     print(f"PASS retry backoff grows: {attempts[:3]}")
 
-    sensor_state = get_entity_state(token, MQTT_ENTITY)
+    sensor_state = get_entity_state(token, mqtt_entity)
     if sensor_state != "off":
-        raise ScenarioFailure(f"{MQTT_ENTITY} did not flip off during outage (state={sensor_state!r})")
-    print(f"PASS sensor flip: {MQTT_ENTITY} is off during outage")
+        raise ScenarioFailure(f"{mqtt_entity} did not flip off during outage (state={sensor_state!r})")
+    print(f"PASS sensor flip: {mqtt_entity} is off during outage")
 
     next_wait_cap = attempts[-1].delay if attempts else MQTT_RETRY_BASE_DELAY
     teardown.run()
@@ -437,9 +477,9 @@ def scenario_outage_and_recovery(container: Container, token: str, teardown: Bes
         timeout=next_wait_cap * 2 + 60,
         label="reconnect after DNS recovery",
     )
-    recovered_state = get_entity_state(token, MQTT_ENTITY)
+    recovered_state = get_entity_state(token, mqtt_entity)
     if recovered_state != "on":
-        raise ScenarioFailure(f"{MQTT_ENTITY} did not return to 'on' after recovery (state={recovered_state!r})")
+        raise ScenarioFailure(f"{mqtt_entity} did not return to 'on' after recovery (state={recovered_state!r})")
     print("PASS recovery: reconnected and sensor back on")
 
     reset_attempt = _assert_backoff_reset_to_base(container, token, entry_id, teardown)
@@ -495,6 +535,12 @@ def main() -> int:
 
     token = load_ha_token()
 
+    try:
+        mqtt_entity = resolve_mqtt_entity_id(list_entity_ids(token))
+    except (MqttEntityResolutionError, RuntimeError) as e:
+        print(f"FATAL: could not resolve the exo_pool MQTT-connectivity entity: {e}")
+        return 1
+
     results: dict[str, str] = {}
     teardown = BestEffortTeardown()
 
@@ -508,14 +554,14 @@ def main() -> int:
 
     try:
         try:
-            scenario_baseline(token)
+            scenario_baseline(token, mqtt_entity)
             results["baseline"] = "PASS"
         except (ScenarioFailure, AssertionError, RuntimeError) as e:
             results["baseline"] = f"FAIL: {e}"
 
         if results["baseline"] == "PASS":
             try:
-                scenario_outage_and_recovery(container, token, teardown)
+                scenario_outage_and_recovery(container, token, teardown, mqtt_entity)
                 results["outage_and_recovery"] = "PASS"
             except (ScenarioFailure, AssertionError, RuntimeError) as e:
                 results["outage_and_recovery"] = f"FAIL: {e}"

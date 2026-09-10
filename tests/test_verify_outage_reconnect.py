@@ -151,6 +151,31 @@ def test_container_logs_since_raises_loudly_when_log_file_unreadable():
         container.logs_since("2026-09-10T12:00:00Z")
 
 
+def test_resolve_mqtt_entity_id_picks_the_matching_binary_sensor():
+    entity_ids = ["sensor.exo_pool_temperature", "binary_sensor.exo_pool_mqtt_connected"]
+
+    resolved = harness.resolve_mqtt_entity_id(entity_ids)
+
+    assert resolved == "binary_sensor.exo_pool_mqtt_connected"
+
+
+def test_resolve_mqtt_entity_id_lists_exo_candidates_when_no_match():
+    entity_ids = ["sensor.exo_pool_temperature", "binary_sensor.other_thing"]
+
+    with pytest.raises(harness.MqttEntityResolutionError, match="sensor.exo_pool_temperature"):
+        harness.resolve_mqtt_entity_id(entity_ids)
+
+
+def test_resolve_mqtt_entity_id_rejects_multiple_matches():
+    entity_ids = ["binary_sensor.exo_pool_mqtt_connected", "binary_sensor.exo_pool2_mqtt_connected"]
+
+    with pytest.raises(
+        harness.MqttEntityResolutionError,
+        match="binary_sensor.exo_pool_mqtt_connected.*binary_sensor.exo_pool2_mqtt_connected",
+    ):
+        harness.resolve_mqtt_entity_id(entity_ids)
+
+
 def test_best_effort_teardown_runs_all_actions_even_if_one_raises():
     order = []
     teardown = harness.BestEffortTeardown()
