@@ -1009,16 +1009,7 @@ def _schedule_mqtt_retry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 
 def _trigger_mqtt_reconnect(hass: HomeAssistant, entry: ConfigEntry, *, name: str) -> None:
-    """Start a reconnect attempt now, forcing a fresh credential refresh.
-
-    Used by the watchdog and re-subscribe-failure paths, both of which
-    exist precisely because the current credentials may be bad - so the
-    normal expiry-based skip in _async_refresh_and_reconnect doesn't apply
-    here. Shares the mqtt_retry_task slot with the scheduled backoff chain:
-    if an attempt is actively running, this is a no-op (single-flight); if
-    the chain is merely asleep between attempts, this preempts the wait and
-    starts now, since a live trigger outranks a scheduled guess.
-    """
+    """Reconnect now with fresh credentials, preempting a sleeping backoff but not a running attempt."""
     if not _entry_is_loaded(hass, entry):
         return
     store = _get_entry_store(hass, entry)
