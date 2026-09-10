@@ -86,11 +86,7 @@ def mock_mqtt_connection():
 
 @pytest.fixture
 def mock_event_loop():
-    """Mock the HA event loop for thread-safe callback bridging.
-
-    call_soon_threadsafe runs its callback immediately so tests see the
-    same effects a real loop would produce on its next tick.
-    """
+    """Mock HA event loop - call_soon_threadsafe executes its callback inline."""
     from unittest.mock import MagicMock
 
     loop = MagicMock()
@@ -100,12 +96,7 @@ def mock_event_loop():
 
 @pytest.fixture
 def mock_event_loop_deferred():
-    """A mock event loop whose call_soon_threadsafe only records the call.
-
-    For a test proving a call is routed through call_soon_threadsafe rather
-    than touching the loop directly - mock_event_loop's passthrough would
-    hide that distinction.
-    """
+    """Mock HA event loop - call_soon_threadsafe only records the call."""
     from unittest.mock import MagicMock
 
     loop = MagicMock()

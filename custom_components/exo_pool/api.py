@@ -982,7 +982,10 @@ def _schedule_mqtt_retry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         return
     store = _get_entry_store(hass, entry)
     delay = store.get("mqtt_retry_delay", MQTT_RETRY_BASE_DELAY)
-    sleep_for = delay + random.uniform(0, delay * MQTT_RETRY_JITTER_FRACTION)
+    jitter_span = delay * MQTT_RETRY_JITTER_FRACTION
+    sleep_for = min(
+        delay + random.uniform(-jitter_span, jitter_span), MQTT_RETRY_MAX_DELAY
+    )
     store["mqtt_retry_delay"] = min(delay * 2, MQTT_RETRY_MAX_DELAY)
 
     task = store.get("mqtt_retry_task")

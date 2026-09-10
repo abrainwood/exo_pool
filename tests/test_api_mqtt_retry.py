@@ -122,6 +122,26 @@ async def test_schedule_mqtt_retry_adds_jitter_on_top_of_the_backoff_delay(
     sleep_mock.assert_called_once_with(api.MQTT_RETRY_BASE_DELAY + 5.0)
 
 
+async def test_schedule_mqtt_retry_never_sleeps_past_the_fifteen_minute_cap(
+    hass, entry, monkeypatch, captured_reconnect_coros
+):
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(api.asyncio, "sleep", sleep_mock)
+    # Always the maximum possible jitter for whatever bounds are passed.
+    monkeypatch.setattr(api.random, "uniform", lambda a, b: b)
+    monkeypatch.setattr(api, "_refresh_authentication", AsyncMock(return_value=None))
+    monkeypatch.setattr(api, "_connect_mqtt", MagicMock(return_value=True))
+
+    store = api._get_entry_store(hass, entry)
+    store["mqtt_retry_delay"] = api.MQTT_RETRY_MAX_DELAY
+
+    api._schedule_mqtt_retry(hass, entry)
+    await captured_reconnect_coros[0]
+
+    sleep_mock.assert_called_once()
+    assert sleep_mock.call_args.args[0] <= api.MQTT_RETRY_MAX_DELAY
+
+
 async def test_a_retry_that_succeeds_resets_the_backoff_to_base(
     hass, entry, monkeypatch, captured_reconnect_coros
 ):
