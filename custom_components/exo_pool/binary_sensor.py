@@ -338,6 +338,10 @@ class MqttConnectedBinarySensor(CoordinatorEntity, BinarySensorEntity):
         mqtt_client = get_mqtt_client(self._hass, self._entry)
         return bool(mqtt_client and mqtt_client.connected)
 
+    @property
+    def available(self) -> bool:
+        return True
+
 
 class ScheduleBinarySensor(CoordinatorEntity, BinarySensorEntity):
     """Binary sensor representing a single schedule's active state."""

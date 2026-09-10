@@ -44,3 +44,16 @@ def test_is_on_false_when_mqtt_transport_down_even_though_aws_status_is_connecte
     sensor = _make_sensor(hass, entry, coordinator)
 
     assert sensor.is_on is False
+
+
+def test_available_and_off_when_both_mqtt_and_the_rest_coordinator_are_down():
+    hass = FakeHass()
+    entry = FakeEntry()
+    coordinator = MagicMock(data=None, last_update_success=False)
+    store = api._get_entry_store(hass, entry)
+    store["mqtt_client"] = MagicMock(connected=False)
+
+    sensor = _make_sensor(hass, entry, coordinator)
+
+    assert sensor.available is True
+    assert sensor.is_on is False
