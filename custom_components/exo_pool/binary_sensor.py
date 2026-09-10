@@ -12,6 +12,7 @@ from homeassistant.helpers.update_coordinator import (
 import logging
 from .api import (
     get_coordinator,
+    get_mqtt_client,
     ERROR_CODES,
     _authentication_failed,
     _last_auth_error,
@@ -37,6 +38,7 @@ async def async_setup_entry(
         AuthenticationStatusBinarySensor(entry, coordinator),
         ConnectedBinarySensor(entry, coordinator),
         AwsConnectivityBinarySensor(entry, coordinator),
+        MqttConnectedBinarySensor(hass, entry, coordinator),
     ]
 
     # Add a binary sensor per schedule item
@@ -307,6 +309,42 @@ class AwsConnectivityBinarySensor(CoordinatorEntity, BinarySensorEntity):
 
     @property
     def available(self):
+        """Return availability based on data fetch success."""
+        return self.coordinator.data is not None
+
+
+class MqttConnectedBinarySensor(CoordinatorEntity, BinarySensorEntity):
+    """MQTT transport connectivity - independent of cloud/auth state.
+
+    Tracks the AWS IoT MQTT transport itself, not login/token health or
+    the device's own reported "aws" status. During a WAN outage this is
+    the entity that shows the integration degraded to REST polling.
+    """
+
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_icon = "mdi:transit-connection-variant"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, coordinator: DataUpdateCoordinator):
+        super().__init__(coordinator)
+        self._hass = hass
+        self._entry = entry
+        self._attr_name = "MQTT Connected"
+        self._attr_unique_id = f"{entry.entry_id}_mqtt_connected"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": "Exo Pool",
+            "manufacturer": "Zodiac",
+            "model": "Exo",
+        }
+
+    @property
+    def is_on(self) -> bool:
+        mqtt_client = get_mqtt_client(self._hass, self._entry)
+        return bool(mqtt_client and mqtt_client.connected)
+
+    @property
+    def available(self) -> bool:
         """Return availability based on data fetch success."""
         return self.coordinator.data is not None
 

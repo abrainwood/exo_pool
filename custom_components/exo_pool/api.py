@@ -108,6 +108,9 @@ IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
 IOT_REGION = "us-east-1"
 MQTT_CREDENTIAL_REFRESH_BUFFER = 300  # refresh 5 min before expiry
 REST_FALLBACK_INTERVAL = 3600  # 1 hour REST poll - last resort when MQTT is dead
+MQTT_RETRY_BASE_DELAY = 30.0
+MQTT_RETRY_MAX_DELAY = 900.0  # 15 min cap
+MQTT_RETRY_JITTER_FRACTION = 0.2
 
 
 async def _async_rate_limit(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -905,14 +908,62 @@ async def _async_refresh_and_reconnect(
     """Refresh AWS credentials and reconnect MQTT.
 
     Called when MQTT reconnect fails due to expired credentials,
-    or proactively by the credential refresh timer.
+    or proactively by the credential refresh timer. Any failure here -
+    including one raised by _refresh_authentication before _connect_mqtt
+    is ever reached - arms the next bounded-backoff retry itself, so the
+    chain never depends on _connect_mqtt or _schedule_credential_refresh.
     """
+    connected = False
     try:
         session = aiohttp_client.async_get_clientsession(hass)
         await _refresh_authentication(hass, entry, session)
-        await hass.async_add_executor_job(_connect_mqtt, hass, entry)
+        connected = await hass.async_add_executor_job(_connect_mqtt, hass, entry)
     except Exception:
         _LOGGER.warning("MQTT credential refresh and reconnect failed", exc_info=True)
+
+    if connected:
+        _reset_mqtt_retry_backoff(hass, entry)
+    else:
+        _schedule_mqtt_retry(hass, entry)
+
+
+def _reset_mqtt_retry_backoff(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reset the MQTT reconnect backoff to base after a successful attempt.
+
+    Never cancels the task that is calling this - a successful retry attempt
+    resets the backoff from inside its own scheduled task.
+    """
+    store = _get_entry_store(hass, entry)
+    store["mqtt_retry_delay"] = MQTT_RETRY_BASE_DELAY
+    task = store.pop("mqtt_retry_task", None)
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
+
+
+def _schedule_mqtt_retry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Arm the next bounded exponential-backoff MQTT reconnect attempt.
+
+    Called unconditionally from _async_refresh_and_reconnect's failure path.
+    """
+    store = _get_entry_store(hass, entry)
+    delay = store.get("mqtt_retry_delay", MQTT_RETRY_BASE_DELAY)
+    sleep_for = delay + random.uniform(0, delay * MQTT_RETRY_JITTER_FRACTION)
+    store["mqtt_retry_delay"] = min(delay * 2, MQTT_RETRY_MAX_DELAY)
+
+    if task := store.get("mqtt_retry_task"):
+        task.cancel()
+
+    async def _retry_later() -> None:
+        try:
+            await asyncio.sleep(sleep_for)
+        except asyncio.CancelledError:
+            return
+        _LOGGER.info("Retrying MQTT reconnect after %.0fs backoff", sleep_for)
+        await _async_refresh_and_reconnect(hass, entry)
+
+    store["mqtt_retry_task"] = hass.async_create_background_task(
+        _retry_later(), name="exo_pool_mqtt_retry"
+    )
 
 
 def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -969,6 +1020,12 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     mqtt_client.set_shadow_callback(_on_shadow_update)
 
+    def _on_mqtt_state_changed(_connected: bool) -> None:
+        """Called on HA event loop when the transport connected state flips."""
+        coordinator.async_update_listeners()
+
+    mqtt_client.set_state_changed_callback(_on_mqtt_state_changed)
+
     def _on_reconnect_failed() -> None:
         """Called on HA event loop when MQTT re-subscribe fails (stale credentials)."""
         _LOGGER.warning("MQTT reconnect failed - refreshing credentials")
@@ -978,6 +1035,15 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     mqtt_client.set_reconnect_failed_callback(_on_reconnect_failed)
+
+    def _on_watchdog_fire() -> None:
+        """Called on HA event loop when interrupt->resume takes too long."""
+        hass.async_create_background_task(
+            _async_refresh_and_reconnect(hass, entry),
+            name="exo_pool_watchdog_reconnect",
+        )
+
+    mqtt_client.set_interrupted_watchdog_callback(_on_watchdog_fire)
 
     try:
         mqtt_client.connect(credentials)
@@ -1055,9 +1121,19 @@ def cleanup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
             _LOGGER.debug("Error disconnecting MQTT during cleanup", exc_info=True)
 
     # Cancel scheduled tasks
-    for task_key in ("credential_refresh_task", "debounce_refresh_task", "boost_task"):
+    for task_key in (
+        "credential_refresh_task",
+        "debounce_refresh_task",
+        "boost_task",
+        "mqtt_retry_task",
+    ):
         if task := store.get(task_key):
             task.cancel()
+
+
+def get_mqtt_client(hass: HomeAssistant, entry: ConfigEntry):
+    """Return the entry's MQTT client, or None if it hasn't connected yet."""
+    return _get_entry_store(hass, entry).get("mqtt_client")
 
 
 async def get_coordinator(hass: HomeAssistant, entry: ConfigEntry):
