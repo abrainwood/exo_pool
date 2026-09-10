@@ -4,6 +4,25 @@ A custom integration to connect your Zodiac iAqualink **Exo** pool system to Hom
 
 ## 🆕 What’s New
 
+- ** 27 Apr 2026** – 🚀 Real-time MQTT Integration (Major Upgrade)
+1) Real-time updates via AWS IoT MQTT
+  1.1) The integration now connects to the same AWS IoT device shadow used by the official iAqualink app.
+  1.2) State updates are sub-second instead of polling-based.
+2) Zero 429 rate limit issues
+  2.1) Reads and writes no longer rely on REST polling under normal operation.
+  2.2) Eliminates “Too Many Requests” errors entirely in most setups.
+3) Instant writes
+  3.1) Changes (pH, ORP, schedules, switches) are sent via MQTT and applied immediately.
+4) Automatic fallback to REST
+  4.1) If MQTT is unavailable, the integration safely falls back to REST polling.
+  4.2) A low-frequency (1 hour) poll ensures resilience.
+5) Automatic credential handling
+  5.1) AWS credentials are extracted from the Zodiac API and refreshed automatically.
+  5.2) Seamless reconnects with no user intervention.
+6) No configuration changes required
+  6.1) Existing setups continue to work unchanged.
+  6.2) No MQTT broker or additional setup needed.
+
 - **7 Feb 2026**
 1) Small retry fix to get around 401 'token expired' errors on schedule write attempts (and associated logging updates).
 
@@ -55,17 +74,68 @@ A custom integration to connect your Zodiac iAqualink **Exo** pool system to Hom
 
 - **Automatic Authentication** – Secure login to the iAqualink API using your email and password.
 - **System Selection** – Pick your Exo system from multiple pools/devices (filtered to `device_type: "exo"`).
+- **Real-time MQTT Updates** – Instant state sync via AWS IoT (no polling required)
 - **Sensors** – Temperature, pH, ORP, ORP Boost Time Remaining, Pump RPM, Error Code, Wi-Fi RSSI.
 - **Binary Sensors** – Filter Pump running, Chlorinator running, Error State, Authentication Status, Connected, and one per schedule.
 - **Switches** – ORP Boost, Power State, Production, Aux 1, Aux 2, SWC Low.
 - **Numbers** – SWC Output, SWC Low Output, Refresh Interval, plus pH/ORP Set Points when supported.
-- **Climate (experimental)** – Heat Pump control when Aux 2 is configured for heat mode.
+- **Climate** – Heat Pump control when Aux 2 is configured for heat mode.
 - **Services** – Control and modify schedules (see below).
 - **Diagnostics & Dynamic Device Info** – View hardware configuration and live status; serial number and software version update periodically.
-- **Configurable Refresh Rate** – Adjust the `Refresh Interval` number (300–3600 s, default 600 s) if you see *Too Many Requests* errors.
+- **Rest Fallback** - Automatic resilience if MQTT is unavailable.
 
 ---
 
+## 🧠 Architecture
+
+The integration uses a **hybrid cloud model** combining real-time MQTT updates with REST as a fallback.
+
+### Primary Path (MQTT – Real-time)
+
+1. Home Assistant authenticates with the Zodiac API (email/password).
+2. The API response includes temporary **AWS IoT credentials**.
+3. The integration connects to Zodiac’s AWS IoT endpoint using MQTT over WebSockets.
+4. It subscribes to the device’s **shadow topics** (same mechanism used by the official iAqualink app).
+5. When the pool system updates state, AWS pushes changes instantly to Home Assistant.
+6. Updates are fed directly into the HA coordinator → entities update in real time.
+
+- ✔ Sub-second updates  
+- ✔ No polling  
+- ✔ No rate limits  
+
+---
+
+### Write Path (MQTT → REST fallback)
+
+- Commands (pH, ORP, schedules, switches) are sent via MQTT to the device shadow:
+
+desired state → AWS IoT → device
+
+- If MQTT is unavailable:
+  - The integration automatically falls back to REST API writes.
+
+---
+
+### Fallback Path (REST)
+
+- A low-frequency REST poll (~1 hour) runs as a safety net.
+- If MQTT disconnects:
+  - REST polling temporarily resumes to maintain visibility.
+
+- ✔ Ensures resilience  
+- ✔ Prevents total loss of state  
+
+---
+
+### Credential Lifecycle
+
+- AWS credentials are **temporary (~1 hour lifetime)**.
+- The integration:
+  - refreshes them before expiry
+  - reconnects MQTT automatically
+  - recovers cleanly from failures
+
+---
 ## Schedule Services
 
 Each Exo schedule is exposed as a binary sensor:
@@ -141,7 +211,6 @@ After early Node-RED flows and REST template hacks, this dedicated integration w
 ## Limitations
 
 - Restricted to **Exo** devices only; use the core iAqualink integration for other hardware.
-- Commands (set points, Aux switches, etc.) can be slightly laggy; polling is temporarily boosted to ~10 s for ~60 s after changes.
 - Schedule keys, names and endpoints are determined by the device; disabling a schedule is modelled as `00:00–00:00`.
 - RPM is only relevant to VSP schedules.
 - The heat pump climate entity only appears when Aux 2 is set to heat mode.
@@ -161,3 +230,6 @@ Have success with other models? Please share!
 
 - **Bugs / Feature Requests**: [GitHub Issues](https://github.com/benjycov/exo_pool/issues)
 - **Q&A / Discussion**: [GitHub Discussions](https://github.com/benjycov/exo_pool/discussions)
+
+## Credits
+Special thanks on this release to Andrew Brainwood (https://github.com/abrainwood) for the excellent work on the migration to MQTT.
