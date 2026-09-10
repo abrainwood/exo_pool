@@ -207,6 +207,23 @@ python3 -m pytest tests/ -v
 
 Tests are isolated from Home Assistant - no HA installation required to run them.
 
+### Verifying the MQTT outage-reconnect fix
+
+`scripts/verify_outage_reconnect.py` drives the running dev container through
+a simulated WAN outage and checks the retry/backoff/watchdog behaviour end to
+end - only ever against `ha-exo-pool-dev` on port 8125, never a live instance.
+
+```bash
+export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
+# Create one at http://localhost:8125/profile/security (dev / devdevdev),
+# or reuse the token scripts/dev-setup.py already saved to .dev-token.
+python3 scripts/verify_outage_reconnect.py
+```
+
+The watchdog scenario needs `NET_ADMIN` on the container to block traffic
+with iptables; it's skipped with a clear message if that's unavailable, or
+pass `--skip-watchdog` to skip it deliberately.
+
 ---
 
 ## Support
