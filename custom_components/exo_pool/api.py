@@ -923,7 +923,7 @@ def _aws_credentials_need_refresh(hass: HomeAssistant, entry: ConfigEntry) -> bo
 
 
 async def _async_refresh_and_reconnect(
-    hass: HomeAssistant, entry: ConfigEntry
+    hass: HomeAssistant, entry: ConfigEntry, *, force_credential_refresh: bool = False
 ) -> None:
     """Refresh AWS credentials and reconnect MQTT.
 
@@ -937,12 +937,15 @@ async def _async_refresh_and_reconnect(
     connected = False
     error: Exception | None = None
     try:
-        if _aws_credentials_need_refresh(hass, entry):
+        if force_credential_refresh or _aws_credentials_need_refresh(hass, entry):
             session = aiohttp_client.async_get_clientsession(hass)
             await _refresh_authentication(hass, entry, session)
         connected = await hass.async_add_executor_job(_connect_mqtt, hass, entry)
     except Exception as err:
         error = err
+
+    if not _entry_is_loaded(hass, entry):
+        return
 
     if connected:
         _reset_mqtt_retry_backoff(hass, entry)
@@ -967,6 +970,7 @@ def _reset_mqtt_retry_backoff(hass: HomeAssistant, entry: ConfigEntry) -> None:
     store = _get_entry_store(hass, entry)
     store["mqtt_retry_delay"] = MQTT_RETRY_BASE_DELAY
     store["mqtt_retry_attempts"] = 0
+    store["mqtt_retry_sleeping"] = False
     task = store.pop("mqtt_retry_task", None)
     if task is not None and task is not asyncio.current_task():
         task.cancel()
@@ -974,6 +978,8 @@ def _reset_mqtt_retry_backoff(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 def _schedule_mqtt_retry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Arm the next bounded exponential-backoff MQTT reconnect attempt."""
+    if not _entry_is_loaded(hass, entry):
+        return
     store = _get_entry_store(hass, entry)
     delay = store.get("mqtt_retry_delay", MQTT_RETRY_BASE_DELAY)
     sleep_for = delay + random.uniform(0, delay * MQTT_RETRY_JITTER_FRACTION)
@@ -984,7 +990,11 @@ def _schedule_mqtt_retry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         task.cancel()
 
     async def _retry_later() -> None:
-        await asyncio.sleep(sleep_for)
+        store["mqtt_retry_sleeping"] = True
+        try:
+            await asyncio.sleep(sleep_for)
+        finally:
+            store["mqtt_retry_sleeping"] = False
         if not _entry_is_loaded(hass, entry):
             return
         _LOGGER.info("Retrying MQTT reconnect after %.0fs backoff", sleep_for)
@@ -996,21 +1006,28 @@ def _schedule_mqtt_retry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 
 def _trigger_mqtt_reconnect(hass: HomeAssistant, entry: ConfigEntry, *, name: str) -> None:
-    """Start a reconnect attempt now, unless one is already in flight.
+    """Start a reconnect attempt now, forcing a fresh credential refresh.
 
-    Shares the mqtt_retry_task slot with the scheduled backoff chain so the
-    watchdog and re-subscribe-failure paths can't double-schedule an
-    attempt for one real failure, and so cleanup_entry can always cancel
-    whichever attempt is running.
+    Used by the watchdog and re-subscribe-failure paths, both of which
+    exist precisely because the current credentials may be bad - so the
+    normal expiry-based skip in _async_refresh_and_reconnect doesn't apply
+    here. Shares the mqtt_retry_task slot with the scheduled backoff chain:
+    if an attempt is actively running, this is a no-op (single-flight); if
+    the chain is merely asleep between attempts, this preempts the wait and
+    starts now, since a live trigger outranks a scheduled guess.
     """
     if not _entry_is_loaded(hass, entry):
         return
     store = _get_entry_store(hass, entry)
     task = store.get("mqtt_retry_task")
     if task is not None and not task.done():
-        return
+        if not store.get("mqtt_retry_sleeping"):
+            return
+        _LOGGER.info("Preempting a sleeping MQTT retry backoff for %s", name)
+        task.cancel()
     store["mqtt_retry_task"] = hass.async_create_background_task(
-        _async_refresh_and_reconnect(hass, entry), name=name
+        _async_refresh_and_reconnect(hass, entry, force_credential_refresh=True),
+        name=name,
     )
 
 

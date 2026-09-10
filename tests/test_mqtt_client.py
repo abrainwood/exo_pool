@@ -95,7 +95,8 @@ class TestConnect:
         mock_mqtt_connection.subscribe.return_value = (sub_future, 1)
         client = build_client()
 
-        client.connect(SAMPLE_CREDENTIALS)
+        with pytest.raises(ConnectionError):
+            client.connect(SAMPLE_CREDENTIALS)
 
         assert client.connected is False
 
@@ -109,9 +110,21 @@ class TestConnect:
         client = build_client()
         client.set_reconnect_failed_callback(reconnect_cb)
 
-        client.connect(SAMPLE_CREDENTIALS)
+        with pytest.raises(ConnectionError):
+            client.connect(SAMPLE_CREDENTIALS)
 
         mock_event_loop.call_soon_threadsafe.assert_any_call(reconnect_cb)
+
+    def test_connect_with_all_subscribes_failing_raises(
+        self, build_client, mock_mqtt_connection
+    ):
+        sub_future = MagicMock()
+        sub_future.result.side_effect = Exception("Forbidden")
+        mock_mqtt_connection.subscribe.return_value = (sub_future, 1)
+        client = build_client()
+
+        with pytest.raises(ConnectionError):
+            client.connect(SAMPLE_CREDENTIALS)
 
 
 class TestDisconnect:
@@ -548,21 +561,22 @@ class TestInterruptWatchdog:
         watchdog_handle.cancel.assert_called()
 
     def test_arming_never_touches_call_later_directly_from_the_crt_thread(
-        self, build_client, mock_mqtt_connection, mock_event_loop
+        self, build_client, mock_mqtt_connection, mock_event_loop_deferred
     ):
         client = build_client()
         client.connect(SAMPLE_CREDENTIALS)
-        # Override the fixture's auto-exec default: prove the timer mutation
-        # is gated behind call_soon_threadsafe, not run inline on this thread.
-        mock_event_loop.call_soon_threadsafe = MagicMock()
-        mock_event_loop.call_later.reset_mock()
+        # Swap to the non-executing loop double for the interrupt itself, so
+        # the timer mutation's call_soon_threadsafe gating is observable.
+        client._loop = mock_event_loop_deferred
 
         client._on_connection_interrupted(
             connection=mock_mqtt_connection, error=Exception("blip")
         )
 
-        mock_event_loop.call_later.assert_not_called()
-        mock_event_loop.call_soon_threadsafe.assert_called_with(client._arm_watchdog_on_loop)
+        mock_event_loop_deferred.call_later.assert_not_called()
+        mock_event_loop_deferred.call_soon_threadsafe.assert_called_with(
+            client._arm_watchdog_on_loop
+        )
 
 
 class TestConnectionStateChanged:
@@ -622,18 +636,17 @@ class TestHeartbeat:
         assert interval == _HEARTBEAT_INTERVAL
 
     def test_starting_never_touches_call_later_directly_off_the_loop_thread(
-        self, build_client, mock_event_loop
+        self, build_client, mock_event_loop_deferred
     ):
         # connect() runs the blocking handshake on an executor thread in
         # production - prove the heartbeat timer is armed via
         # call_soon_threadsafe rather than call_later called inline there.
-        mock_event_loop.call_soon_threadsafe = MagicMock()
-        client = build_client()
+        client = build_client(loop=mock_event_loop_deferred)
 
         client.connect(SAMPLE_CREDENTIALS)
 
-        mock_event_loop.call_later.assert_not_called()
-        mock_event_loop.call_soon_threadsafe.assert_any_call(
+        mock_event_loop_deferred.call_later.assert_not_called()
+        mock_event_loop_deferred.call_soon_threadsafe.assert_any_call(
             client._start_heartbeat_on_loop
         )
 

@@ -203,6 +203,24 @@ async def test_reconnect_bails_out_when_the_entry_is_no_longer_loaded(
     assert entry.entry_id not in hass.data.get(api.DOMAIN, {})
 
 
+async def test_entry_unloaded_during_connect_does_not_resurrect_the_store(
+    hass, entry, monkeypatch
+):
+    monkeypatch.setattr(api, "_refresh_authentication", AsyncMock(return_value=None))
+
+    def _connect_then_unload(hass_, entry_):
+        # Simulate async_unload_entry racing in while _connect_mqtt is
+        # running on its executor thread.
+        del hass_.data[api.DOMAIN][entry_.entry_id]
+        return False
+
+    monkeypatch.setattr(api, "_connect_mqtt", _connect_then_unload)
+
+    await api._async_refresh_and_reconnect(hass, entry)
+
+    assert entry.entry_id not in hass.data.get(api.DOMAIN, {})
+
+
 async def test_reconnect_skips_credential_refresh_when_credentials_are_still_fresh(
     hass, entry, monkeypatch
 ):
@@ -237,6 +255,95 @@ async def test_reconnect_refreshes_credentials_when_they_are_expired(
     await api._async_refresh_and_reconnect(hass, entry)
 
     refresh.assert_called_once()
+
+
+async def test_a_fully_failed_subscribe_does_not_reset_the_backoff(
+    hass, entry, monkeypatch
+):
+    mqtt_client_mod = sys.modules["custom_components.exo_pool.mqtt_client"]
+    real_exo_mqtt_client = mqtt_client_mod.ExoMqttClient
+
+    store = api._get_entry_store(hass, entry)
+    store["aws_credentials"] = {
+        "AccessKeyId": "x",
+        "SecretKey": "y",
+        "SessionToken": "z",
+        "Expiration": "",
+    }
+    store["coordinator"] = MagicMock()
+    store["mqtt_retry_delay"] = 120.0
+    store["mqtt_retry_attempts"] = 2
+    monkeypatch.setattr(api, "_refresh_authentication", AsyncMock(return_value=None))
+
+    mock_connection = MagicMock()
+    connect_future = MagicMock()
+    connect_future.result.return_value = None
+    mock_connection.connect.return_value = connect_future
+    sub_future = MagicMock()
+    sub_future.result.side_effect = Exception("Forbidden")
+    mock_connection.subscribe.return_value = (sub_future, 1)
+
+    def _build_real_client(*, loop, endpoint, region, serial):
+        client = real_exo_mqtt_client(
+            loop=loop, endpoint=endpoint, region=region, serial=serial
+        )
+        client._build_connection = MagicMock(return_value=mock_connection)
+        return client
+
+    monkeypatch.setattr(mqtt_client_mod, "ExoMqttClient", _build_real_client)
+
+    try:
+        await api._async_refresh_and_reconnect(hass, entry)
+
+        # A fully-failed subscribe (real mqtt_client.connect(), driven all
+        # the way through) must not look like a successful connect - the
+        # backoff must keep climbing, not reset to base.
+        assert store["mqtt_retry_delay"] > 120.0
+        assert store["mqtt_retry_attempts"] == 3
+    finally:
+        await _cancel_retry_task(hass, entry)
+
+
+async def test_trigger_mqtt_reconnect_forces_credential_refresh_even_when_not_expired(
+    hass, entry, monkeypatch, captured_reconnect_coros
+):
+    from datetime import datetime, timedelta, timezone
+
+    store = api._get_entry_store(hass, entry)
+    store["aws_credentials"] = {
+        "Expiration": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    }
+    refresh = AsyncMock(return_value=None)
+    monkeypatch.setattr(api, "_refresh_authentication", refresh)
+    monkeypatch.setattr(api, "_connect_mqtt", MagicMock(return_value=True))
+
+    # _on_reconnect_failed fires precisely because subscribes were rejected
+    # despite a future Expiration - a plain expiry check would never
+    # re-authenticate here.
+    api._trigger_mqtt_reconnect(hass, entry, name="exo_pool_reconnect_refresh")
+    await captured_reconnect_coros[0]
+
+    refresh.assert_called_once()
+
+
+async def test_trigger_mqtt_reconnect_preempts_a_sleeping_backoff_wait(
+    hass, entry, monkeypatch, captured_reconnect_coros
+):
+    monkeypatch.setattr(api, "_refresh_authentication", AsyncMock(return_value=None))
+    monkeypatch.setattr(api, "_connect_mqtt", MagicMock(return_value=True))
+
+    # Three failures have already pushed the backoff to 240s and the current
+    # retry task is asleep waiting it out - exactly the multi-hour-outage
+    # shape the watchdog exists to interrupt.
+    store = api._get_entry_store(hass, entry)
+    sleeping_task = MagicMock(done=MagicMock(return_value=False))
+    store["mqtt_retry_task"] = sleeping_task
+    store["mqtt_retry_sleeping"] = True
+
+    api._trigger_mqtt_reconnect(hass, entry, name="exo_pool_watchdog_reconnect")
+
+    sleeping_task.cancel.assert_called_once()
+    assert len(captured_reconnect_coros) == 1
 
 
 async def test_trigger_mqtt_reconnect_does_not_double_schedule_while_one_is_in_flight(
@@ -280,7 +387,7 @@ async def test_connect_mqtt_wires_the_watchdog_callback_to_force_a_reconnect(
     watchdog_fire()
     await hass.async_block_till_done()
 
-    reconnect.assert_called_once_with(hass, entry)
+    reconnect.assert_called_once_with(hass, entry, force_credential_refresh=True)
 
 
 async def test_connect_mqtt_wires_the_state_changed_callback_to_coordinator_listeners(

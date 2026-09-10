@@ -52,6 +52,12 @@ IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
 IOT_REGION = "us-east-1"
 
 
+@pytest.fixture(autouse=True)
+def _fast_subscribe(monkeypatch):
+    """Skip the real per-topic subscribe pacing delay in tests."""
+    monkeypatch.setattr(load_exo_pool_module("mqtt_client"), "_SUBSCRIBE_DELAY", 0)
+
+
 @pytest.fixture
 def mock_mqtt_connection():
     """Create a mock MQTT connection that behaves like awscrt mqtt."""
@@ -83,14 +89,27 @@ def mock_event_loop():
     """Mock the HA event loop for thread-safe callback bridging.
 
     call_soon_threadsafe runs its callback immediately so tests see the
-    same effects a real loop would produce on its next tick. A test that
-    needs to prove a call goes through call_soon_threadsafe rather than
-    hitting the loop directly can override it with a bare MagicMock.
+    same effects a real loop would produce on its next tick.
     """
     from unittest.mock import MagicMock
 
     loop = MagicMock()
     loop.call_soon_threadsafe = MagicMock(side_effect=lambda fn, *args: fn(*args))
+    return loop
+
+
+@pytest.fixture
+def mock_event_loop_deferred():
+    """A mock event loop whose call_soon_threadsafe only records the call.
+
+    For a test proving a call is routed through call_soon_threadsafe rather
+    than touching the loop directly - mock_event_loop's passthrough would
+    hide that distinction.
+    """
+    from unittest.mock import MagicMock
+
+    loop = MagicMock()
+    loop.call_soon_threadsafe = MagicMock()
     return loop
 
 
@@ -102,7 +121,7 @@ def build_client(mock_mqtt_connection, mock_event_loop):
 
     def _build(**kwargs):
         client = ExoMqttClient(
-            loop=mock_event_loop,
+            loop=kwargs.get("loop", mock_event_loop),
             endpoint=kwargs.get("endpoint", IOT_ENDPOINT),
             region=kwargs.get("region", IOT_REGION),
             serial=kwargs.get("serial", SAMPLE_SERIAL),

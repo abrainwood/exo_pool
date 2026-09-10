@@ -125,6 +125,7 @@ class ExoMqttClient:
         if self._subscribe_shadow_topics():
             self._set_connected(True)
             self._request_shadow()
+            self._start_heartbeat()
         else:
             _LOGGER.warning(
                 "All subscribes failed after connect - credentials may have expired"
@@ -132,7 +133,9 @@ class ExoMqttClient:
             self._set_connected(False)
             if self._reconnect_failed_callback is not None:
                 self._loop.call_soon_threadsafe(self._reconnect_failed_callback)
-        self._start_heartbeat()
+            raise ConnectionError(
+                "All shadow subscribes failed after connect - credentials may have expired"
+            )
 
     def disconnect(self) -> None:
         """Disconnect from AWS IoT."""
