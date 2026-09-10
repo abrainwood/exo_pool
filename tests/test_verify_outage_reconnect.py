@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import subprocess
 import sys
 
 import pytest
@@ -102,6 +103,52 @@ def test_assert_dev_instance_url_rejects_default_ha_port():
 
 def test_assert_dev_instance_url_accepts_dev_container_port():
     harness.assert_dev_instance_url("http://localhost:8125")
+
+
+def test_strip_ansi_codes_removes_colour_escapes():
+    coloured = "\x1b[36m2026-09-10 12:14:00.123\x1b[0m WARNING MQTT reconnect attempt 1\n"
+
+    stripped = harness.strip_ansi_codes(coloured)
+
+    assert stripped == "2026-09-10 12:14:00.123 WARNING MQTT reconnect attempt 1\n"
+
+
+def test_filter_log_lines_since_excludes_stale_timestamp():
+    log_text = (
+        "2026-04-21 05:16:44.000 INFO (MainThread) stale line from months ago\n"
+        "2026-09-10 12:14:00.500 WARNING (MainThread) MQTT reconnect attempt 1\n"
+    )
+
+    filtered = harness.filter_log_lines_since(log_text, "2026-09-10T12:00:00Z")
+
+    assert "stale line from months ago" not in filtered
+    assert "MQTT reconnect attempt 1" in filtered
+
+
+def test_filter_log_lines_since_carries_continuation_lines_with_their_entry():
+    log_text = (
+        "2026-04-21 05:16:44.000 ERROR (MainThread) stale traceback\n"
+        "Traceback (most recent call last): stale continuation\n"
+        "2026-09-10 12:14:00.500 ERROR (MainThread) current traceback\n"
+        "Traceback (most recent call last): current continuation\n"
+    )
+
+    filtered = harness.filter_log_lines_since(log_text, "2026-09-10T12:00:00Z")
+
+    assert "stale continuation" not in filtered
+    assert "current continuation" in filtered
+
+
+def test_container_logs_since_raises_loudly_when_log_file_unreadable():
+    def fake_runner(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args, returncode=1, stdout="", stderr="cat: /config/home-assistant.log: No such file"
+        )
+
+    container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
+
+    with pytest.raises(harness.HaLogUnavailableError, match="/config/home-assistant.log"):
+        container.logs_since("2026-09-10T12:00:00Z")
 
 
 def test_best_effort_teardown_runs_all_actions_even_if_one_raises():

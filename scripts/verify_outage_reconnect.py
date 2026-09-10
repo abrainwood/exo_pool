@@ -44,6 +44,14 @@ HA_URL = f"http://localhost:{DEV_HA_PORT}"
 TOKEN_FILE = ".dev-token"
 TOKEN_ENV_VAR = "EXO_HARNESS_TOKEN"
 
+# On the dev image HA writes here, not to stdout/stderr - `docker logs`
+# silently returns a stale, frozen stream instead of failing.
+HA_LOG_PATH = "/config/home-assistant.log"
+
+
+class HaLogUnavailableError(Exception):
+    """Raised when the dev container's home-assistant.log can't be read."""
+
 
 class NotDevInstanceError(Exception):
     """Raised when the target URL is not confirmed to be the dev container."""
@@ -74,6 +82,40 @@ HOSTS_MARKER = "# exo-pool-outage-harness"
 # instead of drifting from it independently.
 MQTT_RETRY_BASE_DELAY = 30.0
 INTERRUPT_WATCHDOG_TIMEOUT = 180
+
+
+# --- HA log-file parsing (unit tested) ------------------------------------
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi_codes(text: str) -> str:
+    """Remove ANSI colour escapes docker's log capture leaves in the text."""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
+# HA's file-handler timestamp: "YYYY-MM-DD HH:MM:SS.mmm ". Fixed-width and
+# zero-padded, so lexical comparison against a same-format key sorts
+# correctly - no need to parse into a datetime.
+_LOG_LINE_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.\d{3} ")
+
+
+def filter_log_lines_since(log_text: str, since_iso: str) -> str:
+    """Keep only home-assistant.log lines timestamped at/after `since_iso`.
+
+    A line with no leading timestamp (a traceback continuation) inherits the
+    previous timestamped line's inclusion decision.
+    """
+    since_key = time.strftime("%Y-%m-%d %H:%M:%S", time.strptime(since_iso, "%Y-%m-%dT%H:%M:%SZ"))
+    kept: list[str] = []
+    include = False
+    for line in strip_ansi_codes(log_text).splitlines():
+        match = _LOG_LINE_TS_RE.match(line)
+        if match:
+            include = match.group(1) >= since_key
+        if include:
+            kept.append(line)
+    return "\n".join(kept) + ("\n" if kept else "")
 
 
 # --- Retry-log parsing (unit tested) -------------------------------------
@@ -146,7 +188,7 @@ class ScenarioFailure(Exception):
 
 
 class Container:
-    """Thin wrapper over `docker exec`/`docker logs` for one named container."""
+    """Thin wrapper over `docker exec` for one named container."""
 
     def __init__(self, name: str, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run):
         self.name = name
@@ -169,13 +211,21 @@ class Container:
         )
 
     def logs_since(self, since_iso: str) -> str:
+        """Read HA_LOG_PATH inside the container, filtered to lines since `since_iso`.
+
+        Rotation is untracked: HA only rotates this file on process restart,
+        and every scenario here only reloads the config entry, never restarts
+        HA, so a run can't straddle a rotation.
+        """
         result = self._runner(
-            ["docker", "logs", self.name, "--since", since_iso],
+            ["docker", "exec", self.name, "cat", HA_LOG_PATH],
             capture_output=True, text=True, timeout=20,
         )
-        # HA logs to stdout; docker interleaves both streams into a single
-        # chronological record either way, so both are relevant here.
-        return result.stdout + result.stderr
+        if result.returncode != 0:
+            raise HaLogUnavailableError(
+                f"could not read {HA_LOG_PATH} in {self.name}: {result.stderr.strip()}"
+            )
+        return filter_log_lines_since(result.stdout, since_iso)
 
 
 def now_utc_iso() -> str:
