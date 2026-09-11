@@ -286,10 +286,9 @@ class TestShadowCallback:
         # Callback should NOT have been called with bad data
         callback.assert_not_called()
 
-    def test_update_accepted_does_not_invoke_callback(
+    def test_update_accepted_does_not_invoke_callback_because_its_state_is_partial(
         self, build_client, mock_mqtt_connection, mock_event_loop
     ):
-        """update/accepted carries partial state - should not feed coordinator."""
         callback = MagicMock()
         client = build_client()
         client.set_shadow_callback(callback)
@@ -314,10 +313,9 @@ class TestShadowCallback:
 
         mock_event_loop.call_soon_threadsafe.assert_not_called()
 
-    def test_update_delta_does_not_invoke_callback(
+    def test_update_delta_does_not_invoke_callback_because_it_carries_only_changed_fields(
         self, build_client, mock_mqtt_connection, mock_event_loop
     ):
-        """update/delta carries only changed fields - should not feed coordinator."""
         callback = MagicMock()
         client = build_client()
         client.set_shadow_callback(callback)
@@ -720,7 +718,7 @@ class TestHeartbeat:
 class TestBuildConnection:
     """Test that _build_connection creates a properly configured MQTT connection."""
 
-    def test_build_connection_uses_sigv4_websockets(self):
+    def test_build_connection_signs_the_websocket_connection_with_aws_credentials(self):
         from unittest.mock import patch
         from custom_components.exo_pool.mqtt_client import ExoMqttClient
         import custom_components.exo_pool.mqtt_client as mqtt_mod

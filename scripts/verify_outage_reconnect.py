@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
-"""Repeatable harness for the MQTT outage-reconnect fix (issue #2 / PR #4).
+"""Drives the dev container through a simulated MQTT WAN outage.
 
-Drives the `ha-exo-pool-dev` dev container through a simulated WAN outage
-and checks that the fix in PR #4 behaves as designed. Scenario list and
-what each one asserts: see the README's "Verifying the MQTT
-outage-reconnect fix" section.
+See the README's "Verifying the MQTT outage-reconnect fix" section for
+the scenario list and what each one asserts. Requires the dev container
+from `make dev` to be running and the exo_pool integration configured.
 
 Usage:
     export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
     # Create one at http://localhost:8125/profile/security (dev / devdevdev),
     # or reuse the token scripts/dev-setup.py already saved to .dev-token.
     python3 scripts/verify_outage_reconnect.py [--skip-watchdog]
-
-Requires the dev container from `make dev` to be running and the exo_pool
-integration already configured in it. Never touches anything but the dev
-container on port 8125 - see assert_dev_instance_url().
 """
 from __future__ import annotations
 
@@ -790,8 +785,8 @@ def block_port_total_outage(
 def precondition_met(sensor_state: str, peer_ips: list[str] | None) -> bool:
     """True only if the sensor reads 'on' AND an established peer actually exists.
 
-    A sensor reading 'on' with no established peer is exactly the
-    looks-healthy-but-isn't gap issue #2 was about - both must hold.
+    A sensor reading 'on' with no established peer is a looks-healthy-but-isn't
+    gap - both must hold.
     """
     return sensor_state == "on" and bool(peer_ips)
 
@@ -1005,8 +1000,8 @@ def _enter_retry_chain_from_connected(container: Container, since: str, peers: l
 
 
 def scenario_reconnect_from_connected(container: Container, token: str, teardown: BestEffortTeardown, entry_id: str, mqtt_entity: str) -> bool | None:
-    """Issue #2's actual reproduction: MQTT is connected, the network dies
-    underneath it, and the retry chain must re-arm and keep going."""
+    """MQTT is connected, the network dies underneath it, and the retry
+    chain must re-arm and keep going."""
     if not check_net_admin_capable(container.name):
         print(
             "SKIP reconnect-from-connected: could not run iptables against the dev "
@@ -1073,7 +1068,7 @@ def scenario_interrupt_resume_recovers(container: Container, token: str, teardow
     """The common transient-blip path, distinct from the rare watchdog one:
     the connection drops, the CRT resumes via a different address within
     seconds, the resubscribe fails on stale credentials, and the fix forces
-    a refresh to recover - observed live on issue #2's actual dev box.
+    a refresh to recover.
 
     Blocks only the connection's actual current peer(s), not the whole
     rotating pool - unlike scenario_reconnect_from_connected and

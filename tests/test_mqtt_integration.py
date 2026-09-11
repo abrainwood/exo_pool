@@ -10,7 +10,6 @@ will render correctly regardless of whether data came from REST or MQTT.
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -156,8 +155,7 @@ class TestGetAcceptedDataContract:
     def test_full_reported_state_reaches_callback(self, get_accepted_data):
         assert get_accepted_data == REAL_REPORTED_STATE
 
-    def test_sensor_data_paths_exist(self, get_accepted_data):
-        """All sensor.py read paths must be present in coordinator data."""
+    def test_all_sensor_py_read_paths_are_present_in_coordinator_data(self, get_accepted_data):
         swc = get_accepted_data["equipment"]["swc_0"]
 
         # TempSensor
@@ -183,8 +181,7 @@ class TestGetAcceptedDataContract:
         # WifiRssiSensor
         assert get_accepted_data["debug"]["RSSI"] == -43
 
-    def test_binary_sensor_data_paths_exist(self, get_accepted_data):
-        """All binary_sensor.py read paths must be present."""
+    def test_all_binary_sensor_py_read_paths_are_present(self, get_accepted_data):
         swc = get_accepted_data["equipment"]["swc_0"]
 
         # FilterPumpBinarySensor
@@ -204,8 +201,7 @@ class TestGetAcceptedDataContract:
         assert "sch1" in schedules
         assert schedules["sch1"]["active"] == 0
 
-    def test_switch_data_paths_exist(self, get_accepted_data):
-        """All switch.py read paths must be present."""
+    def test_all_switch_py_read_paths_are_present(self, get_accepted_data):
         swc = get_accepted_data["equipment"]["swc_0"]
 
         # ORPBoostSwitch
@@ -227,8 +223,7 @@ class TestGetAcceptedDataContract:
         # SWCLowModeSwitch
         assert swc["low"] == 0
 
-    def test_number_data_paths_exist(self, get_accepted_data):
-        """All number.py read paths must be present."""
+    def test_all_number_py_read_paths_are_present(self, get_accepted_data):
         swc = get_accepted_data["equipment"]["swc_0"]
 
         # Capability flags that control which number entities are created
@@ -241,8 +236,7 @@ class TestGetAcceptedDataContract:
         # ExoPoolSwcLowOutputNumber
         assert swc["swc_low"] == REAL_REPORTED_STATE["equipment"]["swc_0"]["swc_low"]
 
-    def test_climate_data_paths_exist(self, get_accepted_data):
-        """climate.py reads from equipment.swc_0 and aux_2."""
+    def test_climate_py_reads_from_equipment_swc_0_and_aux_2(self, get_accepted_data):
         swc = get_accepted_data["equipment"]["swc_0"]
 
         # Climate reads water temp for current_temperature
@@ -255,8 +249,7 @@ class TestGetAcceptedDataContract:
 class TestUpdateDocumentsDataContract:
     """shadow/update/documents → coordinator data on state change."""
 
-    def test_chlorinator_percentage_change(self, connected_client):
-        """Simulates the exact change we observed: swc 30 → 40."""
+    def test_chlorinator_percentage_change_from_30_to_40_reaches_callback(self, connected_client):
         _, mock_conn, received = connected_client
         cb = _get_subscribe_callback(mock_conn, "update/documents")
 
@@ -275,8 +268,7 @@ class TestUpdateDocumentsDataContract:
         data = received[0]
         assert data["equipment"]["swc_0"]["swc"] == 40
 
-    def test_aux_switch_toggle(self, connected_client):
-        """Simulates aux_1 toggled on."""
+    def test_aux_1_toggled_on_reaches_callback(self, connected_client):
         _, mock_conn, received = connected_client
         cb = _get_subscribe_callback(mock_conn, "update/documents")
 
@@ -292,8 +284,7 @@ class TestUpdateDocumentsDataContract:
 
         assert received[0]["equipment"]["swc_0"]["aux_1"]["state"] == 1
 
-    def test_ph_sensor_reading_update(self, connected_client):
-        """Simulates a device-pushed sensor reading (no user action)."""
+    def test_device_pushed_ph_sensor_reading_reaches_callback_without_user_action(self, connected_client):
         _, mock_conn, received = connected_client
         cb = _get_subscribe_callback(mock_conn, "update/documents")
 
@@ -309,8 +300,7 @@ class TestUpdateDocumentsDataContract:
 
         assert received[0]["equipment"]["swc_0"]["sns_1"]["value"] == 74
 
-    def test_schedule_activation(self, connected_client):
-        """Simulates a schedule becoming active."""
+    def test_schedule_becoming_active_reaches_callback(self, connected_client):
         _, mock_conn, received = connected_client
         cb = _get_subscribe_callback(mock_conn, "update/documents")
 
@@ -332,8 +322,7 @@ class TestUpdateDocumentsDataContract:
 class TestPublishDesiredContract:
     """Verify write payloads match what the device shadow expects."""
 
-    def test_pool_value_write_shape(self, connected_client):
-        """set_pool_value("swc", 40) should produce the right shadow payload."""
+    def test_publish_desired_produces_the_shadow_payload_for_a_pool_value_write(self, connected_client):
         client, mock_conn, _ = connected_client
 
         client.publish_desired({"equipment": {"swc_0": {"swc": 40}}})
@@ -353,8 +342,7 @@ class TestPublishDesiredContract:
             },
         }
 
-    def test_heating_write_shape(self, connected_client):
-        """set_heating_value("sp", 28) should produce the right payload."""
+    def test_publish_desired_produces_the_shadow_payload_for_a_heating_write(self, connected_client):
         client, mock_conn, _ = connected_client
 
         client.publish_desired({"heating": {"sp": 28}})
@@ -374,8 +362,7 @@ class TestPublishDesiredContract:
             },
         }
 
-    def test_schedule_write_shape(self, connected_client):
-        """update_schedule should produce the right payload."""
+    def test_publish_desired_produces_the_shadow_payload_for_a_schedule_write(self, connected_client):
         client, mock_conn, _ = connected_client
 
         client.publish_desired({
