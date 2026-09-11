@@ -7,7 +7,7 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import aiohttp_client
 
 from .const import DOMAIN
-from .redact import redact
+from .redact import redact, scrub_text
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -181,7 +181,14 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
             errors["base"] = "unknown"
             return self.async_show_form(step_id="select_system", errors=errors)
-        except Exception:
-            _LOGGER.exception("Error during system selection")
+        except Exception as err:
+            # Several aiohttp exceptions (ServerTimeoutError, InvalidUrlClientError,
+            # ...) embed the full request URL in their own __str__, so the secrets
+            # in it are scrubbed at the log call rather than by exception type.
+            _LOGGER.error(
+                "Error during system selection: %s: %s",
+                type(err).__name__,
+                scrub_text(str(err), (self.auth_token, API_KEY_R)),
+            )
             errors["base"] = "unknown"
             return self.async_show_form(step_id="select_system", errors=errors)

@@ -196,3 +196,60 @@ async def test_select_system_does_not_log_any_secret_value_from_the_device_list(
         await flow.async_step_select_system()
 
     assert "auth-tok-abc123" not in caplog.text
+
+
+async def test_select_system_connection_timeout_does_not_log_the_query_string_secrets(
+    hass, monkeypatch, caplog
+):
+    # aiohttp.ServerTimeoutError is not a ClientResponseError, so it falls
+    # into the catch-all handler - its own __str__ embeds the full request
+    # URL, including the authentication_token and api_key query params.
+    leaking_url = (
+        "https://r-api.iaqualink.net/devices.json"
+        "?api_key=EOOEMOW4YR6QNB07&authentication_token=auth-tok-abc123"
+    )
+    timeout_error = aiohttp.ServerTimeoutError(f"Connection timeout to host {leaking_url}")
+    session = _FakeSession(get_response=_RaisingResponse(timeout_error))
+    monkeypatch.setattr(
+        config_flow.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+
+    flow = config_flow.ExoPoolConfigFlow()
+    flow.hass = hass
+    flow.auth_token = "auth-tok-abc123"
+    flow.user_id = 999
+
+    with caplog.at_level(logging.DEBUG):
+        await flow.async_step_select_system()
+
+    assert "auth-tok-abc123" not in caplog.text
+    assert "EOOEMOW4YR6QNB07" not in caplog.text
+
+
+async def test_select_system_arbitrary_exception_does_not_log_the_query_string_secrets(
+    hass, monkeypatch, caplog
+):
+    # Any exception type can embed the URL in its message - a fix keyed on
+    # exception class (enumerating ServerTimeoutError, InvalidUrlClientError,
+    # ...) would miss this. The scrub must apply regardless of exception type.
+    leaking_url = (
+        "https://r-api.iaqualink.net/devices.json"
+        "?api_key=EOOEMOW4YR6QNB07&authentication_token=auth-tok-abc123"
+    )
+    session = _FakeSession(
+        get_response=_RaisingResponse(RuntimeError(f"boom while fetching {leaking_url}"))
+    )
+    monkeypatch.setattr(
+        config_flow.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+
+    flow = config_flow.ExoPoolConfigFlow()
+    flow.hass = hass
+    flow.auth_token = "auth-tok-abc123"
+    flow.user_id = 999
+
+    with caplog.at_level(logging.DEBUG):
+        await flow.async_step_select_system()
+
+    assert "auth-tok-abc123" not in caplog.text
+    assert "EOOEMOW4YR6QNB07" not in caplog.text
