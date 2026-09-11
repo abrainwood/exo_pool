@@ -945,7 +945,6 @@ def scenario_setup_under_outage(container: Container, token: str, teardown: Best
     """
     ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
 
-    since = now_utc_iso()
     blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
 
     try:
