@@ -24,8 +24,6 @@ SENSITIVE_KEYS: set[str] = {
     "Authorization",
 }
 
-# redact() also treats bare "id" as sensitive; diagnostics.py's schedule
-# ids use the same key and stay out of SENSITIVE_KEYS itself.
 _API_RESPONSE_KEYS: set[str] = SENSITIVE_KEYS | {"id"}
 
 
