@@ -1,13 +1,7 @@
-"""Shared credential redaction for logs and diagnostics.
-
-Zodiac's cloud API and our own config entries name the same secrets
-differently at different points in the pipeline (entry.data uses
-snake_case like id_token; the raw login/refresh response uses
-camelCase like IdToken, nested under userPoolOAuth). One key set
-covers both so a log line anywhere in the integration redacts
-consistently.
-"""
+"""Shared credential redaction for logs and diagnostics."""
 from __future__ import annotations
+
+from typing import Iterable
 
 from homeassistant.components.diagnostics import async_redact_data
 
@@ -20,15 +14,30 @@ SENSITIVE_KEYS: set[str] = {
     "access_token",
     "api_key",
     "user_id",
+    "id",
     "IdToken",
     "RefreshToken",
     "authentication_token",
     "AccessKeyId",
     "SecretKey",
     "SessionToken",
+    "AccessToken",
+    "Authorization",
 }
 
 
-def redact(data: dict | list) -> dict | list:
+def scrub_text(text: str, secrets: Iterable[str | None]) -> str:
+    """Replace any occurrence of a known secret value in free text."""
+    for secret in secrets:
+        if secret:
+            text = text.replace(str(secret), "REDACTED")
+    return text
+
+
+def redact(data: object) -> object:
     """Return a copy of data with known-secret keys redacted, any depth."""
-    return async_redact_data(data, SENSITIVE_KEYS)
+    if isinstance(data, dict):
+        return async_redact_data(data, SENSITIVE_KEYS)
+    if isinstance(data, list) and any(isinstance(item, (dict, list)) for item in data):
+        return async_redact_data(data, SENSITIVE_KEYS)
+    return f"<redacted {type(data).__name__}, no keys to redact against>"
