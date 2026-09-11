@@ -496,28 +496,75 @@ def select_established_peer_ips(ss_output: str, port: int = 443) -> list[str]:
 # container sharing its network namespace instead.
 SIDECAR_IMAGE = "alpine:3.20"
 
+# Built once by ensure_harness_tools_image() before any outage is
+# simulated, with iptables/iproute2 already installed - so no sidecar
+# call made during or after a block ever depends on apk fetching over
+# the network that block might itself be cutting.
+HARNESS_TOOLS_IMAGE = "exo-pool-harness-tools:latest"
 
-def build_netns_sidecar_cmd(container_name: str, shell_cmd: str) -> list[str]:
+
+def build_netns_sidecar_cmd(container_name: str, shell_cmd: str, image: str = HARNESS_TOOLS_IMAGE) -> list[str]:
     return [
         "docker", "run", "--rm",
         "--network", f"container:{container_name}",
         "--cap-add", "NET_ADMIN",
-        SIDECAR_IMAGE, "sh", "-c", shell_cmd,
+        image, "sh", "-c", shell_cmd,
     ]
 
 
+def ensure_harness_tools_image(
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    base_image: str = SIDECAR_IMAGE,
+    tag: str = HARNESS_TOOLS_IMAGE,
+    timeout: float = 120.0,
+) -> str:
+    """Build `tag` (iptables + iproute2 on `base_image`) if it isn't there yet.
+
+    Runs on normal networking, before any outage is simulated - idempotent,
+    so calling this from every scenario's own capability check costs
+    nothing once the image already exists.
+    """
+    inspect = runner(["docker", "image", "inspect", tag], capture_output=True, text=True, timeout=10)
+    if inspect.returncode == 0:
+        return tag
+
+    create = runner(
+        ["docker", "create", base_image, "sh", "-c", "apk add -q iptables iproute2"],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if create.returncode != 0:
+        raise RuntimeError(f"failed to create harness-tools-image builder container: {create.stderr}")
+    builder_id = create.stdout.strip()
+    try:
+        start = runner(["docker", "start", "-a", builder_id], capture_output=True, text=True, timeout=timeout)
+        if start.returncode != 0:
+            raise RuntimeError(f"failed to install tools into builder container: {start.stderr}")
+        commit = runner(["docker", "commit", builder_id, tag], capture_output=True, text=True, timeout=timeout)
+        if commit.returncode != 0:
+            raise RuntimeError(f"failed to commit {tag}: {commit.stderr}")
+    finally:
+        runner(["docker", "rm", "-f", builder_id], capture_output=True, text=True, timeout=timeout)
+    return tag
+
+
 def iptables_rule_shell_cmd(ip: str, flag: str) -> str:
-    """flag is '-I' to insert the OUTPUT DROP rule for `ip`, '-D' to remove it."""
-    return f"apk add -q iptables && iptables {flag} OUTPUT -d {ip} -p tcp -j DROP"
+    """flag is '-I' to insert the OUTPUT DROP rule for `ip`, '-D' to remove it.
+
+    No `apk add` - runs against the prebuilt HARNESS_TOOLS_IMAGE, so this
+    never depends on a network it might itself be cutting.
+    """
+    return f"iptables {flag} OUTPUT -d {ip} -p tcp -j DROP"
 
 
 def port_block_shell_cmd(flag: str, port: int) -> str:
     """flag is '-I' to insert an OUTPUT DROP rule for every peer on `port`, '-D' to remove it.
 
     Blocks by port rather than by address - deterministic against a
-    rotating pool, unlike a per-IP rule that a fresh address dodges.
+    rotating pool, unlike a per-IP rule that a fresh address dodges. No
+    `apk add` - runs against the prebuilt HARNESS_TOOLS_IMAGE, so removing
+    this rule never depends on the network it just cut.
     """
-    return f"apk add -q iptables && iptables {flag} OUTPUT -p tcp --dport {port} -j DROP"
+    return f"iptables {flag} OUTPUT -p tcp --dport {port} -j DROP"
 
 
 # --- Outage simulation -----------------------------------------------------
@@ -561,8 +608,17 @@ def run_netns_sidecar(
 def check_net_admin_capable(
     container_name: str, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run
 ) -> bool:
-    """True if a netns sidecar can actually install and run iptables against `container_name`'s network."""
-    result = run_netns_sidecar(container_name, "apk add -q iptables && iptables -L -n", runner=runner, timeout=30.0)
+    """True if the prebuilt harness-tools image can run iptables against `container_name`'s network.
+
+    Builds the image first (idempotent, runs on normal networking, well
+    before any outage) - so later blocking calls never depend on apk
+    fetching over a network they might be cutting.
+    """
+    try:
+        ensure_harness_tools_image(runner=runner)
+    except RuntimeError:
+        return False
+    result = run_netns_sidecar(container_name, "iptables -L -n", runner=runner, timeout=30.0)
     return result.returncode == 0
 
 
@@ -572,7 +628,7 @@ def get_established_peer_ips(
     port: int = 443,
 ) -> list[str]:
     """The container's currently-established public peers on `port`, via a netns sidecar's `ss`."""
-    result = run_netns_sidecar(container_name, "apk add -q iproute2 && ss -tn state established", runner=runner, timeout=30.0)
+    result = run_netns_sidecar(container_name, "ss -tn state established", runner=runner, timeout=30.0)
     if result.returncode != 0:
         raise RuntimeError(f"failed to list established connections via netns sidecar: {result.stderr}")
     return select_established_peer_ips(result.stdout, port=port)
@@ -643,25 +699,64 @@ class IpBlockSet:
             raise RuntimeError(f"failed to remove {len(errors)} iptables DROP rule(s): {'; '.join(errors)}")
 
 
+def _default_abort(message: str) -> None:
+    print("\n" + "!" * 70)
+    print(message)
+    print("!" * 70 + "\n")
+    sys.exit(1)
+
+
+def unblock_port_or_abort(
+    container_name: str,
+    port: int,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    attempts: int = 3,
+    retry_delay: float = 5.0,
+    sleep: Callable[[float], None] = lambda s: time.sleep(s),
+    abort: Callable[[str], None] = _default_abort,
+) -> None:
+    """Retry removing the total-outage DROP rule; abort the run rather than
+    continue if it's still there after all attempts.
+
+    Unlike a hosts entry or a single blocked address, this rule severs all
+    outbound traffic on `port` - BestEffortTeardown's continue-past-failure
+    is exactly wrong here, since a run that carries on with the rule still
+    up leaves the dev container permanently unreachable on that port.
+    """
+    last_error = ""
+    for attempt in range(attempts):
+        result = run_netns_sidecar(container_name, port_block_shell_cmd("-D", port), runner=runner)
+        if result.returncode == 0:
+            print(f"Unblocked outbound TCP port {port} via netns sidecar")
+            return
+        last_error = result.stderr
+        if attempt < attempts - 1:
+            sleep(retry_delay)
+    abort(
+        f"Could not remove the port-{port} outbound DROP rule after {attempts} attempts "
+        f"({last_error}). The dev container has NO outbound TCP on this port. "
+        f"Operator action required: `docker restart {CONTAINER_NAME}` clears it."
+    )
+
+
 def block_port_total_outage(
     container_name: str,
     teardown: BestEffortTeardown,
-    verify_still_reachable: Callable[[], None],
     port: int = 443,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> None:
     """Block every outbound connection on `port`, deterministically - by
     port rather than by address, so a rotating pool can't dodge it the way
-    per-IP blocking can. `verify_still_reachable` confirms the harness's own
-    HA API access (a different port/direction entirely) survives the block,
-    rather than assuming it does; on failure this rolls the block back
-    before raising.
+    per-IP blocking can.
+
+    Before committing, proves the *unblock path itself* still works (a
+    harmless `iptables -L -n` over the same sidecar) - the property that
+    matters is not whether the harness can still reach HA (a different port
+    and direction the block never touches), but whether this block can
+    still be undone. Rolls back immediately if it can't.
     """
     def _unblock() -> None:
-        result = run_netns_sidecar(container_name, port_block_shell_cmd("-D", port), runner=runner)
-        if result.returncode != 0:
-            raise RuntimeError(f"failed to remove port-{port} DROP rule: {result.stderr}")
-        print(f"Unblocked outbound TCP port {port} via netns sidecar")
+        unblock_port_or_abort(container_name, port, runner=runner)
 
     add = run_netns_sidecar(container_name, port_block_shell_cmd("-I", port), runner=runner)
     if add.returncode != 0:
@@ -670,11 +765,13 @@ def block_port_total_outage(
 
     teardown.defer(_unblock)
 
-    try:
-        verify_still_reachable()
-    except Exception as e:
+    verify = run_netns_sidecar(container_name, "iptables -L -n", runner=runner, timeout=15.0)
+    if verify.returncode != 0:
         teardown.run()
-        raise RuntimeError(f"HA API became unreachable after blocking port {port} - rolled back: {e}") from e
+        raise RuntimeError(
+            f"could not verify the port-{port} block can be undone "
+            f"(sidecar iptables -L -n failed) - rolled back: {verify.stderr}"
+        )
 
 
 # --- Scenario precondition (unit tested) -----------------------------------
@@ -1067,9 +1164,7 @@ def scenario_setup_under_outage(container: Container, token: str, teardown: Best
     # connection can still let setup complete, so pair it with a total
     # outbound block to make the API genuinely unreachable.
     blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
-    block_port_total_outage(
-        container.name, teardown, verify_still_reachable=lambda: get_entity_state(token, mqtt_entity),
-    )
+    block_port_total_outage(container.name, teardown)
 
     try:
         reload_entry(token, entry_id)
@@ -1111,9 +1206,7 @@ def scenario_watchdog(container: Container, token: str, teardown: BestEffortTear
     ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
 
     since = now_utc_iso()
-    block_port_total_outage(
-        container.name, teardown, verify_still_reachable=lambda: get_entity_state(token, mqtt_entity),
-    )
+    block_port_total_outage(container.name, teardown)
 
     wait_for_log_pattern(
         container, _CONNECTION_INTERRUPTED_RE, since,

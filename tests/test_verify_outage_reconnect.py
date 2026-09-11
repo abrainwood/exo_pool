@@ -509,7 +509,7 @@ def test_ip_block_set_add_issues_an_insert_rule():
     block_set.add("3.226.158.32")
 
     assert len(calls) == 1
-    assert calls[0][-1] == "apk add -q iptables && iptables -I OUTPUT -d 3.226.158.32 -p tcp -j DROP"
+    assert calls[0][-1] == "iptables -I OUTPUT -d 3.226.158.32 -p tcp -j DROP"
 
 
 def test_ip_block_set_add_is_idempotent_for_an_already_blocked_ip():
@@ -558,8 +558,8 @@ def test_ip_block_set_teardown_removes_every_blocked_ip():
     teardown.run()
 
     assert sorted(calls) == [
-        "apk add -q iptables && iptables -D OUTPUT -d 3.226.158.32 -p tcp -j DROP",
-        "apk add -q iptables && iptables -D OUTPUT -d 34.206.242.80 -p tcp -j DROP",
+        "iptables -D OUTPUT -d 3.226.158.32 -p tcp -j DROP",
+        "iptables -D OUTPUT -d 34.206.242.80 -p tcp -j DROP",
     ]
 
 
@@ -581,25 +581,73 @@ def test_ip_block_set_teardown_removes_the_rest_even_if_one_ip_fails():
 
     teardown.run()
 
-    assert removed == ["apk add -q iptables && iptables -D OUTPUT -d 3.226.158.32 -p tcp -j DROP"]
+    assert removed == ["iptables -D OUTPUT -d 3.226.158.32 -p tcp -j DROP"]
 
 
-def test_block_port_total_outage_issues_the_insert_rule_and_verifies_reachable():
+def test_unblock_port_or_abort_succeeds_immediately():
     calls = []
-    verified = []
+    aborted = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv[-1])
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    harness.unblock_port_or_abort(
+        "ha-exo-pool-dev", 443, runner=fake_runner, sleep=lambda s: None, abort=aborted.append,
+    )
+
+    assert calls == ["iptables -D OUTPUT -p tcp --dport 443 -j DROP"]
+    assert aborted == []
+
+
+def test_unblock_port_or_abort_retries_then_succeeds():
+    results = iter([1, 1, 0])
+    sleeps = []
+    aborted = []
+
+    def fake_runner(argv, **kwargs):
+        rc = next(results)
+        return subprocess.CompletedProcess(args=argv, returncode=rc, stdout="", stderr="Resource busy")
+
+    harness.unblock_port_or_abort(
+        "ha-exo-pool-dev", 443, runner=fake_runner, attempts=3,
+        sleep=sleeps.append, retry_delay=5.0, abort=aborted.append,
+    )
+
+    assert sleeps == [5.0, 5.0]
+    assert aborted == []
+
+
+def test_unblock_port_or_abort_aborts_with_the_restart_command_after_all_attempts_fail():
+    def fake_runner(argv, **kwargs):
+        return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="Resource busy")
+
+    aborted = []
+
+    harness.unblock_port_or_abort(
+        "ha-exo-pool-dev", 443, runner=fake_runner, attempts=2,
+        sleep=lambda s: None, abort=aborted.append,
+    )
+
+    assert len(aborted) == 1
+    assert "docker restart ha-exo-pool-dev" in aborted[0]
+    assert "port-443" in aborted[0]
+
+
+def test_block_port_total_outage_issues_the_insert_rule_and_verifies_undo_works():
+    calls = []
 
     def fake_runner(argv, **kwargs):
         calls.append(argv[-1])
         return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
 
     teardown = harness.BestEffortTeardown()
-    harness.block_port_total_outage(
-        "ha-exo-pool-dev", teardown, verify_still_reachable=lambda: verified.append(1),
-        port=443, runner=fake_runner,
-    )
+    harness.block_port_total_outage("ha-exo-pool-dev", teardown, port=443, runner=fake_runner)
 
-    assert calls == ["apk add -q iptables && iptables -I OUTPUT -p tcp --dport 443 -j DROP"]
-    assert verified == [1]
+    assert calls == [
+        "iptables -I OUTPUT -p tcp --dport 443 -j DROP",
+        "iptables -L -n",
+    ]
 
 
 def test_block_port_total_outage_teardown_removes_the_rule():
@@ -610,36 +658,86 @@ def test_block_port_total_outage_teardown_removes_the_rule():
         return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
 
     teardown = harness.BestEffortTeardown()
-    harness.block_port_total_outage(
-        "ha-exo-pool-dev", teardown, verify_still_reachable=lambda: None, port=443, runner=fake_runner,
-    )
+    harness.block_port_total_outage("ha-exo-pool-dev", teardown, port=443, runner=fake_runner)
     calls.clear()
 
     teardown.run()
 
-    assert calls == ["apk add -q iptables && iptables -D OUTPUT -p tcp --dport 443 -j DROP"]
+    assert calls == ["iptables -D OUTPUT -p tcp --dport 443 -j DROP"]
 
 
-def test_block_port_total_outage_rolls_back_when_unreachable():
+def test_block_port_total_outage_rolls_back_when_undo_verification_fails():
     calls = []
 
     def fake_runner(argv, **kwargs):
-        calls.append(argv[-1])
+        cmd = argv[-1]
+        calls.append(cmd)
+        if cmd == "iptables -L -n":
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="Operation not permitted")
         return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
-
-    def _fail_reachability():
-        raise RuntimeError("HA API unreachable")
 
     teardown = harness.BestEffortTeardown()
     with pytest.raises(RuntimeError, match="rolled back"):
-        harness.block_port_total_outage(
-            "ha-exo-pool-dev", teardown, verify_still_reachable=_fail_reachability, port=443, runner=fake_runner,
-        )
+        harness.block_port_total_outage("ha-exo-pool-dev", teardown, port=443, runner=fake_runner)
 
     assert calls == [
-        "apk add -q iptables && iptables -I OUTPUT -p tcp --dport 443 -j DROP",
-        "apk add -q iptables && iptables -D OUTPUT -p tcp --dport 443 -j DROP",
+        "iptables -I OUTPUT -p tcp --dport 443 -j DROP",
+        "iptables -L -n",
+        "iptables -D OUTPUT -p tcp --dport 443 -j DROP",
     ]
+
+
+def test_ensure_harness_tools_image_skips_build_when_already_present():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    tag = harness.ensure_harness_tools_image(runner=fake_runner)
+
+    assert tag == harness.HARNESS_TOOLS_IMAGE
+    assert calls == [["docker", "image", "inspect", harness.HARNESS_TOOLS_IMAGE]]
+
+
+def test_ensure_harness_tools_image_builds_it_when_missing():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="No such image")
+        if argv[:2] == ["docker", "create"]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="builder123\n", stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    tag = harness.ensure_harness_tools_image(runner=fake_runner, base_image="alpine:3.20", tag="exo-pool-harness-tools:latest")
+
+    assert tag == "exo-pool-harness-tools:latest"
+    assert calls == [
+        ["docker", "image", "inspect", "exo-pool-harness-tools:latest"],
+        ["docker", "create", "alpine:3.20", "sh", "-c", "apk add -q iptables iproute2"],
+        ["docker", "start", "-a", "builder123"],
+        ["docker", "commit", "builder123", "exo-pool-harness-tools:latest"],
+        ["docker", "rm", "-f", "builder123"],
+    ]
+
+
+def test_ensure_harness_tools_image_stops_after_a_failed_create():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="No such image")
+        if argv[:2] == ["docker", "create"]:
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="daemon unreachable")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    with pytest.raises(RuntimeError, match="daemon unreachable"):
+        harness.ensure_harness_tools_image(runner=fake_runner)
+
+    assert [c[:2] for c in calls] == [["docker", "image"], ["docker", "create"]]
 
 
 def test_build_netns_sidecar_cmd_shares_the_target_containers_network():
@@ -649,32 +747,50 @@ def test_build_netns_sidecar_cmd_shares_the_target_containers_network():
         "docker", "run", "--rm",
         "--network", "container:ha-exo-pool-dev",
         "--cap-add", "NET_ADMIN",
-        harness.SIDECAR_IMAGE, "sh", "-c", "echo hi",
+        harness.HARNESS_TOOLS_IMAGE, "sh", "-c", "echo hi",
     ]
 
 
 def test_iptables_rule_shell_cmd_builds_the_insert_form():
     cmd = harness.iptables_rule_shell_cmd("10.0.0.5", "-I")
 
-    assert cmd == "apk add -q iptables && iptables -I OUTPUT -d 10.0.0.5 -p tcp -j DROP"
+    assert cmd == "iptables -I OUTPUT -d 10.0.0.5 -p tcp -j DROP"
 
 
 def test_iptables_rule_shell_cmd_builds_the_delete_form():
     cmd = harness.iptables_rule_shell_cmd("10.0.0.5", "-D")
 
-    assert cmd == "apk add -q iptables && iptables -D OUTPUT -d 10.0.0.5 -p tcp -j DROP"
+    assert cmd == "iptables -D OUTPUT -d 10.0.0.5 -p tcp -j DROP"
 
 
 def test_port_block_shell_cmd_builds_the_insert_form():
     cmd = harness.port_block_shell_cmd("-I", 443)
 
-    assert cmd == "apk add -q iptables && iptables -I OUTPUT -p tcp --dport 443 -j DROP"
+    assert cmd == "iptables -I OUTPUT -p tcp --dport 443 -j DROP"
 
 
 def test_port_block_shell_cmd_builds_the_delete_form():
     cmd = harness.port_block_shell_cmd("-D", 443)
 
-    assert cmd == "apk add -q iptables && iptables -D OUTPUT -p tcp --dport 443 -j DROP"
+    assert cmd == "iptables -D OUTPUT -p tcp --dport 443 -j DROP"
+
+
+def test_get_established_peer_ips_runs_ss_with_no_apk_install():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0,
+            stdout="State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\n"
+                   "ESTAB  0      0       172.17.0.3:52344      34.196.232.7:443\n",
+            stderr="",
+        )
+
+    peers = harness.get_established_peer_ips("ha-exo-pool-dev", runner=fake_runner)
+
+    assert peers == ["34.196.232.7"]
+    assert calls[-1][-1] == "ss -tn state established"
 
 
 def test_check_net_admin_capable_true_when_sidecar_iptables_succeeds():
@@ -687,6 +803,27 @@ def test_check_net_admin_capable_true_when_sidecar_iptables_succeeds():
 def test_check_net_admin_capable_false_when_sidecar_iptables_fails():
     def fake_runner(*args, **kwargs):
         return subprocess.CompletedProcess(args=args, returncode=127, stdout="", stderr="sh: iptables: not found")
+
+    assert harness.check_net_admin_capable("ha-exo-pool-dev", runner=fake_runner) is False
+
+
+def test_check_net_admin_capable_builds_the_image_before_probing():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    assert harness.check_net_admin_capable("ha-exo-pool-dev", runner=fake_runner) is True
+    assert calls[0] == ["docker", "image", "inspect", harness.HARNESS_TOOLS_IMAGE]
+    assert calls[-1][-1] == "iptables -L -n"
+
+
+def test_check_net_admin_capable_false_when_probe_fails_despite_image_present():
+    def fake_runner(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="Operation not permitted")
 
     assert harness.check_net_admin_capable("ha-exo-pool-dev", runner=fake_runner) is False
 

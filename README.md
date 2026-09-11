@@ -255,12 +255,25 @@ python3 scripts/verify_outage_reconnect.py
 ```
 
 All four scenarios need to block traffic and inspect connections, which
-the HA dev image has no tools for. They run a throwaway `alpine` sidecar
-(`docker run --network container:ha-exo-pool-dev --cap-add NET_ADMIN ...`)
-that shares the dev container's network namespace instead - no changes to
-the dev container itself, so no recreate needed. It does need `docker run`
-access and network access to pull the sidecar image and its
-`iptables`/`iproute2` packages. Each skips with a clear message if that's
+the HA dev image has no tools for. They run a sidecar (`docker run
+--network container:ha-exo-pool-dev --cap-add NET_ADMIN ...`) that shares
+the dev container's network namespace instead - no changes to the dev
+container itself, so no recreate needed. The sidecar uses a local image
+(built once, on normal networking, before any outage - `docker create` +
+`apk add iptables iproute2` + `docker commit`, reused after that) rather
+than installing those packages fresh on every call. That's not just an
+optimisation: the port-based total block cuts all outbound HTTPS,
+including the port `apk add` itself needs, so a sidecar call that tries to
+install packages *during* that block can't ever remove it - it fetches
+over the exact port it's supposed to be undoing. Removing the `apk add`
+dependency entirely is what makes teardown actually work. The total-block
+scenarios also verify the *removal* path specifically (a harmless
+`iptables -L -n` right after the block goes up) before relying on it, and
+if a rule still can't be removed after a few retries, the run aborts
+immediately with the exact command to run by hand
+(`docker restart ha-exo-pool-dev`) rather than continuing into a broken
+state. It does need `docker run` access and network access to build the
+image once. Each scenario skips with a clear message if that's
 unavailable; pass `--skip-watchdog` to skip the watchdog one deliberately.
 
 Every scenario is independent: before doing anything destructive it waits
