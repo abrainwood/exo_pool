@@ -2,11 +2,9 @@
 """Repeatable harness for the MQTT outage-reconnect fix (issue #2 / PR #4).
 
 Drives the `ha-exo-pool-dev` dev container through a simulated WAN outage
-and checks that the fix in PR #4 behaves as designed: the retry chain
-re-arms itself with growing backoff instead of dying after one failed
-attempt, the exo_pool MQTT-connectivity binary_sensor (resolved at runtime -
-see resolve_mqtt_entity_id()) tracks the transport honestly, and the
-interrupt watchdog forces a reconnect if resume never arrives.
+and checks that the fix in PR #4 behaves as designed. Scenario list and
+what each one asserts: see the README's "Verifying the MQTT
+outage-reconnect fix" section.
 
 Usage:
     export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
@@ -26,6 +24,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -174,6 +173,36 @@ def matches_watchdog_forced_reconnect(log_text: str) -> bool:
     return bool(_WATCHDOG_FORCED_RECONNECT_RE.search(log_text))
 
 
+_CONNECTION_RESUMED_RE = re.compile(r"MQTT connection resumed")
+
+
+def matches_connection_resumed(log_text: str) -> bool:
+    return bool(_CONNECTION_RESUMED_RE.search(log_text))
+
+
+# "after reconnect" (post-resume) vs "after connect" (initial connect()) -
+# only the former means credentials went stale mid-session.
+_RESUBSCRIBE_FAILED_AFTER_RESUME_RE = re.compile(r"All subscribes failed after reconnect")
+
+
+def matches_resubscribe_failed_after_resume(log_text: str) -> bool:
+    return bool(_RESUBSCRIBE_FAILED_AFTER_RESUME_RE.search(log_text))
+
+
+_RECONNECT_FAILED_REFRESHING_RE = re.compile(r"MQTT reconnect failed - refreshing credentials")
+
+
+def matches_reconnect_failed_refreshing(log_text: str) -> bool:
+    return bool(_RECONNECT_FAILED_REFRESHING_RE.search(log_text))
+
+
+_TRANSPORT_RECONNECTED_RE = re.compile(r"MQTT connected - REST fallback interval set to")
+
+
+def matches_transport_reconnected(log_text: str) -> bool:
+    return bool(_TRANSPORT_RECONNECTED_RE.search(log_text))
+
+
 # --- Teardown (unit tested) ----------------------------------------------
 
 
@@ -254,8 +283,16 @@ class Container:
         return filter_log_lines_since(result.stdout, since_iso)
 
 
+def should_print_tick(elapsed: float, last_print: float | None, print_interval: float) -> bool:
+    """True on the first tick (immediate), or every `print_interval` seconds after that."""
+    return last_print is None or elapsed - last_print >= print_interval
+
+
 def now_utc_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+DEFAULT_PRINT_INTERVAL = 20.0
 
 
 def wait_for_log_pattern(
@@ -264,12 +301,21 @@ def wait_for_log_pattern(
     since_iso: str,
     timeout: float,
     poll_interval: float = 3.0,
+    print_interval: float = DEFAULT_PRINT_INTERVAL,
     label: str = "log pattern",
+    on_tick: Callable[[], None] | None = None,
 ) -> str:
-    """Poll container logs since `since_iso` until `pattern` is found or `timeout` elapses."""
+    """Poll container logs since `since_iso` until `pattern` is found or `timeout` elapses.
+
+    `on_tick`, if given, runs once per poll - used to top up IP blocks that
+    might rotate out from under a wait.
+    """
     deadline = time.monotonic() + timeout
     start = time.monotonic()
+    last_print: float | None = None
     while True:
+        if on_tick is not None:
+            on_tick()
         text = container.logs_since(since_iso)
         if pattern.search(text):
             return text
@@ -279,7 +325,9 @@ def wait_for_log_pattern(
                 f"timed out after {timeout:.0f}s waiting for {label}"
             )
         elapsed = time.monotonic() - start
-        print(f"  ... waiting for {label} ({elapsed:.0f}s elapsed, {remaining:.0f}s left)")
+        if should_print_tick(elapsed, last_print, print_interval):
+            print(f"  ... waiting for {label} ({elapsed:.0f}s elapsed, {remaining:.0f}s left)")
+            last_print = elapsed
         time.sleep(min(poll_interval, remaining))
 
 
@@ -409,6 +457,26 @@ def reload_entry(token: str, entry_id: str, timeout: float = RELOAD_TIMEOUT) -> 
         raise
 
 
+# --- DNS resolution (unit tested) ------------------------------------------
+
+
+def resolve_all_ips(hostname: str, resolver: Callable = socket.getaddrinfo) -> list[str]:
+    """All distinct IPv4 addresses currently resolved for `hostname`.
+
+    Resolved via the operator's own resolver, not any container's - a
+    container's /etc/hosts can't be blackholed out from under this.
+    """
+    try:
+        results = resolver(hostname, None)
+    except OSError as e:
+        raise RuntimeError(f"could not resolve {hostname}: {e}") from e
+    ips: list[str] = []
+    for family, _type, _proto, _canon, sockaddr in results:
+        if family == socket.AF_INET and sockaddr[0] not in ips:
+            ips.append(sockaddr[0])
+    return ips
+
+
 # --- Netns sidecar (unit tested) ------------------------------------------
 
 # The HA image has no iptables/nft/ip - blocking traffic needs a throwaway
@@ -476,24 +544,51 @@ def check_net_admin_capable(
     return result.returncode == 0
 
 
-def block_iot_endpoint_tcp(container: Container, teardown: BestEffortTeardown, endpoint: str) -> None:
-    """Drop outbound TCP to `endpoint` at the IP layer via a netns sidecar (DNS still resolves)."""
-    resolved = container.exec(["getent", "hosts", endpoint])
-    if resolved.returncode != 0 or not resolved.stdout.strip():
-        raise RuntimeError(f"could not resolve {endpoint} inside {container.name}")
-    ip = resolved.stdout.split()[0]
+class IpBlockSet:
+    """Tracks iptables DROP rules added for a rotating set of IPs.
 
-    def _unblock():
-        result = run_netns_sidecar(container.name, iptables_rule_shell_cmd(ip, "-D"))
+    AWS IoT resolves to a pool of addresses that rotates, so a block must
+    be able to top up newly-seen IPs without losing track of what it's
+    already blocked, and unblock everything it ever added regardless of
+    when that was.
+    """
+
+    def __init__(
+        self,
+        container_name: str,
+        teardown: BestEffortTeardown,
+        runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    ) -> None:
+        self._container_name = container_name
+        self._runner = runner
+        self._blocked: dict[str, None] = {}
+        teardown.defer(self._unblock_all)
+
+    def add(self, ip: str) -> None:
+        if ip in self._blocked:
+            return
+        result = run_netns_sidecar(self._container_name, iptables_rule_shell_cmd(ip, "-I"), runner=self._runner)
         if result.returncode != 0:
-            raise RuntimeError(f"failed to remove iptables DROP rule for {ip}: {result.stderr}")
-        _LOGGER.info("Removed iptables DROP rule for %s via netns sidecar", ip)
+            raise RuntimeError(f"failed to add iptables DROP rule for {ip}: {result.stderr}")
+        self._blocked[ip] = None
 
-    teardown.defer(_unblock)
+    def top_up(self, ips: list[str]) -> list[str]:
+        """Add rules for any of `ips` not already blocked; returns the newly-added ones."""
+        added = [ip for ip in ips if ip not in self._blocked]
+        for ip in added:
+            self.add(ip)
+        return added
 
-    add = run_netns_sidecar(container.name, iptables_rule_shell_cmd(ip, "-I"))
-    if add.returncode != 0:
-        raise RuntimeError(f"failed to add iptables DROP rule for {ip}: {add.stderr}")
+    def _unblock_all(self) -> None:
+        errors = []
+        for ip in list(self._blocked):
+            result = run_netns_sidecar(self._container_name, iptables_rule_shell_cmd(ip, "-D"), runner=self._runner)
+            if result.returncode != 0:
+                errors.append(f"{ip}: {result.stderr}")
+            else:
+                del self._blocked[ip]
+        if errors:
+            raise RuntimeError(f"failed to remove {len(errors)} iptables DROP rule(s): {'; '.join(errors)}")
 
 
 # --- Scenarios ---------------------------------------------------------
@@ -509,6 +604,7 @@ def scenario_baseline(token: str, mqtt_entity: str) -> None:
 def _wait_for_min_retry_attempts(container: Container, since: str, min_attempts: int, timeout: float) -> list[RetryAttempt]:
     deadline = time.monotonic() + timeout
     start = time.monotonic()
+    last_print: float | None = None
     attempts: list[RetryAttempt] = []
     while True:
         attempts = parse_retry_attempts(container.logs_since(since))
@@ -518,16 +614,19 @@ def _wait_for_min_retry_attempts(container: Container, since: str, min_attempts:
         if remaining <= 0:
             return attempts
         elapsed = time.monotonic() - start
-        print(
-            f"  ... waiting for {min_attempts} retry re-arms, have {len(attempts)} "
-            f"({elapsed:.0f}s elapsed, {remaining:.0f}s left)"
-        )
+        if should_print_tick(elapsed, last_print, DEFAULT_PRINT_INTERVAL):
+            print(
+                f"  ... waiting for {min_attempts} retry re-arms, have {len(attempts)} "
+                f"({elapsed:.0f}s elapsed, {remaining:.0f}s left)"
+            )
+            last_print = elapsed
         time.sleep(min(5, remaining))
 
 
 def _wait_for_entity_state(token: str, entity_id: str, expected: str, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     start = time.monotonic()
+    last_print: float | None = None
     while True:
         state = get_entity_state(token, entity_id)
         if state == expected:
@@ -536,16 +635,19 @@ def _wait_for_entity_state(token: str, entity_id: str, expected: str, timeout: f
         if remaining <= 0:
             return False
         elapsed = time.monotonic() - start
-        print(
-            f"  ... waiting for {entity_id} to be {expected!r}, currently {state!r} "
-            f"({elapsed:.0f}s elapsed, {remaining:.0f}s left)"
-        )
+        if should_print_tick(elapsed, last_print, DEFAULT_PRINT_INTERVAL):
+            print(
+                f"  ... waiting for {entity_id} to be {expected!r}, currently {state!r} "
+                f"({elapsed:.0f}s elapsed, {remaining:.0f}s left)"
+            )
+            last_print = elapsed
         time.sleep(min(5, remaining))
 
 
 def _wait_for_entry_state_not_loaded(token: str, entry_id: str, timeout: float) -> str:
     deadline = time.monotonic() + timeout
     start = time.monotonic()
+    last_print: float | None = None
     while True:
         state = get_entry_state(token, entry_id)
         if state != "loaded":
@@ -554,30 +656,43 @@ def _wait_for_entry_state_not_loaded(token: str, entry_id: str, timeout: float) 
         if remaining <= 0:
             return state
         elapsed = time.monotonic() - start
-        print(f"  ... waiting for setup to fail under outage, still 'loaded' ({elapsed:.0f}s elapsed, {remaining:.0f}s left)")
+        if should_print_tick(elapsed, last_print, DEFAULT_PRINT_INTERVAL):
+            print(f"  ... waiting for setup to fail under outage, still 'loaded' ({elapsed:.0f}s elapsed, {remaining:.0f}s left)")
+            last_print = elapsed
         time.sleep(min(5, remaining))
 
 
 def _enter_retry_chain_from_connected(container: Container, since: str) -> None:
     """Force entry into _async_refresh_and_reconnect from an already-connected state.
 
-    Needs NET_ADMIN - callers must check check_net_admin_capable() first.
+    Blocks every currently-resolved IoT-endpoint address, topping up any
+    newly-rotated-in ones while waiting, so nothing can resume silently via
+    an address that wasn't blocked yet. Waits for the retry chain's own
+    first attempt rather than the watchdog specifically - either forcing
+    path (the watchdog, or a failed resubscribe after a quick CRT-level
+    resume) lands there, and which one fires first isn't this scenario's
+    concern. Needs NET_ADMIN - callers must check check_net_admin_capable() first.
     """
     interrupt_teardown = BestEffortTeardown()
-    block_iot_endpoint_tcp(container, interrupt_teardown, IOT_ENDPOINT)
+    block_set = IpBlockSet(container.name, interrupt_teardown)
+    for ip in resolve_all_ips(IOT_ENDPOINT):
+        block_set.add(ip)
+
+    def _top_up() -> None:
+        block_set.top_up(resolve_all_ips(IOT_ENDPOINT))
+
     try:
         wait_for_log_pattern(
             container, _CONNECTION_INTERRUPTED_RE, since,
-            timeout=60.0, label="connection interrupt",
+            timeout=60.0, label="connection interrupt", on_tick=_top_up,
         )
         wait_for_log_pattern(
-            container, _WATCHDOG_FORCED_RECONNECT_RE, since,
-            timeout=INTERRUPT_WATCHDOG_TIMEOUT + 60.0, label="watchdog-forced reconnect",
+            container, _RETRY_ATTEMPT_RE, since,
+            timeout=INTERRUPT_WATCHDOG_TIMEOUT + 60.0,
+            label="retry chain entry (watchdog or resubscribe-failure)",
+            on_tick=_top_up,
         )
     finally:
-        # Unblock now: the DNS blackhole (managed by the caller) is what
-        # keeps the forced reconnect failing from here on, so the TCP
-        # block has done its job once the watchdog has fired.
         interrupt_teardown.run()
 
 
@@ -616,7 +731,7 @@ def scenario_reconnect_from_connected(container: Container, token: str, teardown
     teardown.run()  # restore DNS - the already-scheduled retry chain keeps running on its own timer
 
     wait_for_log_pattern(
-        container, re.compile(r"MQTT connected - REST fallback interval set to"), since,
+        container, _TRANSPORT_RECONNECTED_RE, since,
         timeout=next_wait_cap * 2 + 60,
         label="reconnect after DNS recovery",
     )
@@ -639,12 +754,81 @@ def scenario_reconnect_from_connected(container: Container, token: str, teardown
 
     teardown.run()
     wait_for_log_pattern(
-        container, re.compile(r"MQTT connected - REST fallback interval set to"), reset_since,
+        container, _TRANSPORT_RECONNECTED_RE, reset_since,
         timeout=MQTT_RETRY_BASE_DELAY * 2 + 60,
         label="reconnect after second DNS recovery",
     )
     if not _wait_for_entity_state(token, mqtt_entity, "on", timeout=30.0):
         raise ScenarioFailure(f"{mqtt_entity} did not return to 'on' after the reset-check outage")
+    return True
+
+
+def scenario_interrupt_resume_recovers(container: Container, token: str, _teardown: BestEffortTeardown, mqtt_entity: str) -> bool | None:
+    """The common transient-blip path, distinct from the rare watchdog one:
+    the connection drops, the CRT resumes within seconds, the resubscribe
+    fails on stale credentials, and the fix forces a refresh to recover -
+    observed live on issue #2's actual dev box.
+
+    Blocks every currently-resolved address just long enough to force an
+    interrupt, then releases immediately so resume can proceed unobstructed -
+    there's no way to see which address a live connection is actually using
+    from outside, so blocking one at random can't guarantee the interrupt a
+    partial block is supposed to produce. A sustained full block is
+    scenario_reconnect_from_connected's and scenario_watchdog's job.
+    """
+    if not check_net_admin_capable(container.name):
+        print(
+            "SKIP interrupt-resume-recovers: could not run iptables against the "
+            "dev container's network via a netns sidecar - cannot force a brief "
+            "interrupt. Needs `docker run` access and network access to pull the "
+            "sidecar image and its iptables package."
+        )
+        return None
+
+    baseline = get_entity_state(token, mqtt_entity)
+    if baseline != "on":
+        raise ScenarioFailure(f"{mqtt_entity} is {baseline!r} before the outage, expected 'on'")
+
+    since = now_utc_iso()
+    block_teardown = BestEffortTeardown()
+    block_set = IpBlockSet(container.name, block_teardown)
+    for ip in resolve_all_ips(IOT_ENDPOINT):
+        block_set.add(ip)
+
+    try:
+        wait_for_log_pattern(
+            container, _CONNECTION_INTERRUPTED_RE, since,
+            timeout=60.0, label="connection interrupt",
+        )
+    finally:
+        block_teardown.run()  # release now - let resume proceed via any address
+    print("PASS interrupt: MQTT connection interrupted")
+
+    wait_for_log_pattern(
+        container, _CONNECTION_RESUMED_RE, since,
+        timeout=60.0, label="connection resume via another address",
+    )
+    print("PASS resume: MQTT connection resumed")
+
+    wait_for_log_pattern(
+        container, _RESUBSCRIBE_FAILED_AFTER_RESUME_RE, since,
+        timeout=30.0, label="resubscribe failure after resume",
+    )
+    print("PASS resubscribe fails after resume: credentials treated as possibly stale")
+
+    wait_for_log_pattern(
+        container, _RECONNECT_FAILED_REFRESHING_RE, since,
+        timeout=10.0, label="forced credential refresh triggered",
+    )
+    print("PASS forced credential refresh triggered")
+
+    wait_for_log_pattern(
+        container, _TRANSPORT_RECONNECTED_RE, since,
+        timeout=30.0, label="transport recovery",
+    )
+    if not _wait_for_entity_state(token, mqtt_entity, "on", timeout=30.0):
+        raise ScenarioFailure(f"{mqtt_entity} did not return to 'on' after recovery")
+    print("PASS recovery: reconnected via forced credential refresh")
     return True
 
 
@@ -697,7 +881,14 @@ def scenario_setup_under_outage(container: Container, token: str, teardown: Best
 
 
 def scenario_watchdog(container: Container, token: str, teardown: BestEffortTeardown) -> bool | None:
-    """Returns True on pass, False on failure, None if skipped (no NET_ADMIN)."""
+    """The rare path: no address in the pool works, so resume never comes and
+    the fix's own INTERRUPT_WATCHDOG_TIMEOUT has to force the reconnect itself.
+
+    Blocks every currently-resolved address, topping up any that rotate in
+    during the wait - a partial block just reproduces
+    scenario_interrupt_resume_recovers instead. Returns True on pass, False
+    on failure, None if skipped (no NET_ADMIN).
+    """
     if not check_net_admin_capable(container.name):
         print(
             "SKIP watchdog: could not run iptables against the dev container's "
@@ -708,15 +899,21 @@ def scenario_watchdog(container: Container, token: str, teardown: BestEffortTear
         return None
 
     since = now_utc_iso()
-    block_iot_endpoint_tcp(container, teardown, IOT_ENDPOINT)
+    block_set = IpBlockSet(container.name, teardown)
+    for ip in resolve_all_ips(IOT_ENDPOINT):
+        block_set.add(ip)
+
+    def _top_up() -> None:
+        block_set.top_up(resolve_all_ips(IOT_ENDPOINT))
 
     wait_for_log_pattern(
         container, _CONNECTION_INTERRUPTED_RE, since,
-        timeout=60.0, label="connection interrupt",
+        timeout=60.0, label="connection interrupt", on_tick=_top_up,
     )
     wait_for_log_pattern(
         container, _WATCHDOG_FORCED_RECONNECT_RE, since,
         timeout=INTERRUPT_WATCHDOG_TIMEOUT + 60, label="watchdog-forced reconnect",
+        on_tick=_top_up,
     )
     print("PASS watchdog: forced reconnect after interrupt with no resume")
     teardown.run()
@@ -777,6 +974,14 @@ def main() -> int:
                 results["reconnect_from_connected"] = f"FAIL: {e}"
 
             try:
+                outcome = scenario_interrupt_resume_recovers(container, token, teardown, mqtt_entity)
+                results["interrupt_resume_recovers"] = "PASS" if outcome else (
+                    "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
+                )
+            except (ScenarioFailure, AssertionError, RuntimeError) as e:
+                results["interrupt_resume_recovers"] = f"FAIL: {e}"
+
+            try:
                 scenario_setup_under_outage(container, token, teardown, entry_id, mqtt_entity)
                 results["setup_under_outage"] = "PASS"
             except (ScenarioFailure, AssertionError, RuntimeError) as e:
@@ -794,6 +999,7 @@ def main() -> int:
                     results["watchdog"] = f"FAIL: {e}"
         else:
             results["reconnect_from_connected"] = "SKIP (baseline unhealthy)"
+            results["interrupt_resume_recovers"] = "SKIP (baseline unhealthy)"
             results["setup_under_outage"] = "SKIP (baseline unhealthy)"
             results["watchdog"] = "SKIP (baseline unhealthy)"
     finally:

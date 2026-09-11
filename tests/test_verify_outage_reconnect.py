@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import socket
 import subprocess
 import sys
 
@@ -267,6 +268,180 @@ def test_reload_entry_lets_a_non_timeout_url_error_propagate(monkeypatch):
 
     with pytest.raises(urllib.error.URLError):
         harness.reload_entry("token", "entry123")
+
+
+def test_resolve_all_ips_dedupes_and_keeps_only_ipv4():
+    def fake_getaddrinfo(host, port):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("3.226.158.32", 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("3.226.158.32", 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("34.206.242.80", 0)),
+        ]
+
+    ips = harness.resolve_all_ips("a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com", resolver=fake_getaddrinfo)
+
+    assert ips == ["3.226.158.32", "34.206.242.80"]
+
+
+def test_resolve_all_ips_raises_a_clear_error_on_resolution_failure():
+    def failing_resolver(host, port):
+        raise socket.gaierror("Name or service not known")
+
+    with pytest.raises(RuntimeError, match="a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"):
+        harness.resolve_all_ips("a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com", resolver=failing_resolver)
+
+
+def test_matches_connection_resumed_on_the_resume_line():
+    log_text = (
+        "2026-09-11 09:12:29.100 INFO (MainThread) [custom_components.exo_pool.mqtt_client] "
+        "MQTT connection resumed (rc=0, session_present=False)\n"
+    )
+
+    assert harness.matches_connection_resumed(log_text) is True
+
+
+def test_matches_resubscribe_failed_after_resume_on_the_resume_path_failure():
+    log_text = (
+        "2026-09-11 09:12:50.100 WARNING (MainThread) [custom_components.exo_pool.mqtt_client] "
+        "All subscribes failed after reconnect - credentials may have expired\n"
+    )
+
+    assert harness.matches_resubscribe_failed_after_resume(log_text) is True
+
+
+def test_matches_resubscribe_failed_after_resume_ignores_the_initial_connect_failure():
+    log_text = (
+        "2026-09-11 09:00:00.100 WARNING (MainThread) [custom_components.exo_pool.mqtt_client] "
+        "All subscribes failed after connect - credentials may have expired\n"
+    )
+
+    assert harness.matches_resubscribe_failed_after_resume(log_text) is False
+
+
+def test_matches_reconnect_failed_refreshing_on_the_forced_refresh_line():
+    log_text = (
+        "2026-09-11 09:12:50.200 WARNING (MainThread) [custom_components.exo_pool.api] "
+        "MQTT reconnect failed - refreshing credentials\n"
+    )
+
+    assert harness.matches_reconnect_failed_refreshing(log_text) is True
+
+
+def test_matches_reconnect_failed_refreshing_ignores_unrelated_lines():
+    log_text = (
+        "2026-09-11 09:12:50.200 WARNING (MainThread) [custom_components.exo_pool.api] "
+        "REST fallback poll - MQTT is disconnected\n"
+    )
+
+    assert harness.matches_reconnect_failed_refreshing(log_text) is False
+
+
+def test_matches_transport_reconnected_on_the_recovery_line():
+    log_text = (
+        "2026-09-11 09:12:52.400 INFO (MainThread) [custom_components.exo_pool.api] "
+        "MQTT connected - REST fallback interval set to 1800s\n"
+    )
+
+    assert harness.matches_transport_reconnected(log_text) is True
+
+
+def test_should_print_tick_true_on_the_first_tick():
+    assert harness.should_print_tick(elapsed=0.0, last_print=None, print_interval=20.0) is True
+
+
+def test_should_print_tick_false_before_the_interval_elapses():
+    assert harness.should_print_tick(elapsed=10.0, last_print=0.0, print_interval=20.0) is False
+
+
+def test_should_print_tick_true_after_the_interval_elapses():
+    assert harness.should_print_tick(elapsed=25.0, last_print=0.0, print_interval=20.0) is True
+
+
+def test_ip_block_set_add_issues_an_insert_rule():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    block_set = harness.IpBlockSet("ha-exo-pool-dev", harness.BestEffortTeardown(), runner=fake_runner)
+    block_set.add("3.226.158.32")
+
+    assert len(calls) == 1
+    assert calls[0][-1] == "apk add -q iptables && iptables -I OUTPUT -d 3.226.158.32 -p tcp -j DROP"
+
+
+def test_ip_block_set_add_is_idempotent_for_an_already_blocked_ip():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    block_set = harness.IpBlockSet("ha-exo-pool-dev", harness.BestEffortTeardown(), runner=fake_runner)
+    block_set.add("3.226.158.32")
+    block_set.add("3.226.158.32")
+
+    assert len(calls) == 1
+
+
+def test_ip_block_set_top_up_only_adds_new_ips_and_returns_them():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv[-1])
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    block_set = harness.IpBlockSet("ha-exo-pool-dev", harness.BestEffortTeardown(), runner=fake_runner)
+    block_set.add("3.226.158.32")
+
+    added = block_set.top_up(["3.226.158.32", "34.206.242.80"])
+
+    assert added == ["34.206.242.80"]
+    assert len(calls) == 2
+
+
+def test_ip_block_set_teardown_removes_every_blocked_ip():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv[-1])
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    teardown = harness.BestEffortTeardown()
+    block_set = harness.IpBlockSet("ha-exo-pool-dev", teardown, runner=fake_runner)
+    block_set.add("3.226.158.32")
+    block_set.add("34.206.242.80")
+    calls.clear()
+
+    teardown.run()
+
+    assert sorted(calls) == [
+        "apk add -q iptables && iptables -D OUTPUT -d 3.226.158.32 -p tcp -j DROP",
+        "apk add -q iptables && iptables -D OUTPUT -d 34.206.242.80 -p tcp -j DROP",
+    ]
+
+
+def test_ip_block_set_teardown_removes_the_rest_even_if_one_ip_fails():
+    removed = []
+
+    def fake_runner(argv, **kwargs):
+        cmd = argv[-1]
+        if "-D" in cmd and "34.206.242.80" in cmd:
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="rule not found")
+        if "-D" in cmd:
+            removed.append(cmd)
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    teardown = harness.BestEffortTeardown()
+    block_set = harness.IpBlockSet("ha-exo-pool-dev", teardown, runner=fake_runner)
+    block_set.add("34.206.242.80")
+    block_set.add("3.226.158.32")
+
+    teardown.run()
+
+    assert removed == ["apk add -q iptables && iptables -D OUTPUT -d 3.226.158.32 -p tcp -j DROP"]
 
 
 def test_build_netns_sidecar_cmd_shares_the_target_containers_network():
