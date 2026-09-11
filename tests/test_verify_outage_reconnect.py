@@ -345,7 +345,7 @@ def test_wait_for_healthy_precondition_returns_immediately_when_already_met():
     sleeps = []
     reloads = []
 
-    harness.wait_for_healthy_precondition(
+    peers = harness.wait_for_healthy_precondition(
         get_sensor_state=lambda: "on",
         get_peers=lambda: ["34.196.232.7"],
         reload=lambda: reloads.append(1),
@@ -353,6 +353,7 @@ def test_wait_for_healthy_precondition_returns_immediately_when_already_met():
         sleep=sleeps.append,
     )
 
+    assert peers == ["34.196.232.7"]
     assert sleeps == []
     assert reloads == []
 
@@ -362,7 +363,7 @@ def test_wait_for_healthy_precondition_reloads_once_then_succeeds():
     peer_results = iter([[], [], ["34.196.232.7"]])
     reloads = []
 
-    harness.wait_for_healthy_precondition(
+    peers = harness.wait_for_healthy_precondition(
         get_sensor_state=lambda: next(sensor_states),
         get_peers=lambda: next(peer_results),
         reload=lambda: reloads.append(1),
@@ -370,6 +371,7 @@ def test_wait_for_healthy_precondition_reloads_once_then_succeeds():
         sleep=lambda s: None,
     )
 
+    assert peers == ["34.196.232.7"]
     assert reloads == [1]
 
 
@@ -380,6 +382,36 @@ def test_wait_for_healthy_precondition_raises_with_detail_when_never_met():
             get_peers=lambda: "no established peers on port 443 found to block; ss output was:\n192.168.65.1:8123",
             reload=lambda: None,
             max_polls=1,
+            sleep=lambda s: None,
+        )
+
+
+def test_get_peers_with_retry_returns_immediately_when_already_present():
+    sleeps = []
+
+    peers = harness.get_peers_with_retry(get_peers=lambda: ["34.196.232.7"], attempts=3, sleep=sleeps.append)
+
+    assert peers == ["34.196.232.7"]
+    assert sleeps == []
+
+
+def test_get_peers_with_retry_retries_then_succeeds():
+    results = iter(["no established peers on port 443 found to block", [], ["34.196.232.7"]])
+    sleeps = []
+
+    peers = harness.get_peers_with_retry(
+        get_peers=lambda: next(results), attempts=3, sleep=sleeps.append, retry_delay=3.0
+    )
+
+    assert peers == ["34.196.232.7"]
+    assert sleeps == [3.0, 3.0]
+
+
+def test_get_peers_with_retry_gives_up_after_all_attempts_with_detail():
+    with pytest.raises(RuntimeError, match="192.168.65.1:8123"):
+        harness.get_peers_with_retry(
+            get_peers=lambda: "no established peers on port 443 found to block; ss output was:\n192.168.65.1:8123",
+            attempts=2,
             sleep=lambda s: None,
         )
 

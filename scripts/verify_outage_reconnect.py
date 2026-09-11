@@ -569,6 +569,23 @@ def get_established_peer_ips(
     return select_established_peer_ips(result.stdout, port=port)
 
 
+def get_established_peer_ips_with_retry(
+    container_name: str,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    port: int = 443,
+    attempts: int = 3,
+    retry_delay: float = 3.0,
+) -> list[str]:
+    """get_established_peer_ips(), tolerating the peer briefly vanishing mid-reconnect."""
+    def _get_peers() -> list[str] | str:
+        try:
+            return get_established_peer_ips(container_name, runner=runner, port=port)
+        except RuntimeError as e:
+            return str(e)
+
+    return get_peers_with_retry(_get_peers, attempts=attempts, retry_delay=retry_delay)
+
+
 class IpBlockSet:
     """Tracks iptables DROP rules added for a rotating set of IPs.
 
@@ -596,6 +613,7 @@ class IpBlockSet:
         if result.returncode != 0:
             raise RuntimeError(f"failed to add iptables DROP rule for {ip}: {result.stderr}")
         self._blocked[ip] = None
+        print(f"Blocked {ip} via netns sidecar")
 
     def top_up(self, ips: list[str]) -> list[str]:
         """Add rules for any of `ips` not already blocked; returns the newly-added ones."""
@@ -635,8 +653,12 @@ def wait_for_healthy_precondition(
     max_polls: int = 12,
     sleep: Callable[[float], None] = lambda s: time.sleep(s),
     poll_interval: float = 5.0,
-) -> None:
+) -> list[str]:
     """Poll until precondition_met holds, reloading once and retrying if it never does.
+
+    Returns the validated peer list - callers should block those peers
+    directly rather than re-querying a moment later, since a fresh query can
+    race a reconnect still in flight and find nothing.
 
     `get_peers` returns either the peer list or an error-detail string (from
     a failed peer check) - either way it's surfaced in the failure message,
@@ -650,7 +672,7 @@ def wait_for_healthy_precondition(
             last_peers = get_peers()
             peers = last_peers if isinstance(last_peers, list) else None
             if precondition_met(last_sensor_state, peers):
-                return
+                return peers
             sleep(poll_interval)
         if attempt == 1:
             reload()
@@ -659,13 +681,37 @@ def wait_for_healthy_precondition(
     )
 
 
+def get_peers_with_retry(
+    get_peers: Callable[[], list[str] | str],
+    attempts: int = 3,
+    sleep: Callable[[float], None] = lambda s: time.sleep(s),
+    retry_delay: float = 3.0,
+) -> list[str]:
+    """Retry a peer lookup a few times before giving up.
+
+    A peer vanishing for one query is a normal reconnect in flight, not a
+    fatal condition - only give up once it's still gone after retrying.
+    """
+    last_result: list[str] | str = []
+    for attempt in range(attempts):
+        last_result = get_peers()
+        if isinstance(last_result, list) and last_result:
+            return last_result
+        if attempt < attempts - 1:
+            sleep(retry_delay)
+    detail = last_result if isinstance(last_result, str) else "no peers found"
+    raise RuntimeError(detail)
+
+
 def ensure_scenario_precondition(
     token: str, entry_id: str, mqtt_entity: str, container_name: str, timeout: float = 60.0
-) -> None:
+) -> list[str]:
     """Real-run wrapper: every scenario calls this before doing anything destructive.
 
     A prior scenario's failure - this run or a previous one - must not
-    silently poison the ones after it.
+    silently poison the ones after it. Returns the validated peer list - use
+    it directly for the scenario's first block rather than re-querying, since
+    a fresh query a moment later can race a reconnect still in flight.
     """
     def _get_peers() -> list[str] | str:
         try:
@@ -673,7 +719,7 @@ def ensure_scenario_precondition(
         except RuntimeError as e:
             return str(e)
 
-    wait_for_healthy_precondition(
+    return wait_for_healthy_precondition(
         get_sensor_state=lambda: get_entity_state(token, mqtt_entity),
         get_peers=_get_peers,
         reload=lambda: _reload_ignoring_timeout(token, entry_id),
@@ -757,24 +803,41 @@ def _wait_for_entry_state_not_loaded(token: str, entry_id: str, timeout: float) 
         time.sleep(min(5, remaining))
 
 
-def _enter_retry_chain_from_connected(container: Container, since: str) -> None:
+def _safe_top_up(block_set: IpBlockSet, container_name: str) -> None:
+    """Top up newly-seen peers, tolerating a transient empty state.
+
+    Once blocking has actually taken effect there may genuinely be nothing
+    established at the instant of a given poll - that's the point of the
+    block, not a failure to report.
+    """
+    try:
+        new_ips = get_established_peer_ips(container_name)
+    except RuntimeError:
+        return
+    added = block_set.top_up(new_ips)
+    if added:
+        print(f"Topped up newly-seen peer(s): {added}")
+
+
+def _enter_retry_chain_from_connected(container: Container, since: str, peers: list[str] | None = None) -> None:
     """Force entry into _async_refresh_and_reconnect from an already-connected state.
 
-    Blocks every currently-established peer address, topping up any
-    newly-rotated-in ones while waiting, so nothing can resume silently via
-    an address that wasn't blocked yet. Waits for the retry chain's own
-    first attempt rather than the watchdog specifically - either forcing
-    path (the watchdog, or a failed resubscribe after a quick CRT-level
-    resume) lands there, and which one fires first isn't this scenario's
-    concern. Needs NET_ADMIN - callers must check check_net_admin_capable() first.
+    Blocks `peers` if given (a caller-validated list, to avoid re-querying
+    and racing a reconnect in flight), else resolves its own. Tops up any
+    newly-rotated-in peers while waiting. Waits for the retry chain's own
+    first attempt rather than the watchdog specifically, since either
+    forcing path gets there. Needs NET_ADMIN - callers must check
+    check_net_admin_capable() first.
     """
+    if peers is None:
+        peers = get_established_peer_ips_with_retry(container.name)
     interrupt_teardown = BestEffortTeardown()
     block_set = IpBlockSet(container.name, interrupt_teardown)
-    for ip in get_established_peer_ips(container.name):
+    for ip in peers:
         block_set.add(ip)
 
     def _top_up() -> None:
-        block_set.top_up(get_established_peer_ips(container.name))
+        _safe_top_up(block_set, container.name)
 
     try:
         wait_for_log_pattern(
@@ -805,11 +868,11 @@ def scenario_reconnect_from_connected(container: Container, token: str, teardown
         )
         return None
 
-    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
+    peers = ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
 
     since = now_utc_iso()
     blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
-    _enter_retry_chain_from_connected(container, since)
+    _enter_retry_chain_from_connected(container, since, peers=peers)
 
     attempts = _wait_for_min_retry_attempts(container, since, min_attempts=3, timeout=210.0)
     assert_growing_backoff(attempts)
@@ -876,11 +939,11 @@ def scenario_interrupt_resume_recovers(container: Container, token: str, teardow
         )
         return None
 
-    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
+    peers = ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
 
     since = now_utc_iso()
     block_set = IpBlockSet(container.name, teardown)
-    for ip in get_established_peer_ips(container.name):
+    for ip in peers:
         block_set.add(ip)
 
     wait_for_log_pattern(
@@ -983,15 +1046,15 @@ def scenario_watchdog(container: Container, token: str, teardown: BestEffortTear
         )
         return None
 
-    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
+    peers = ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
 
     since = now_utc_iso()
     block_set = IpBlockSet(container.name, teardown)
-    for ip in get_established_peer_ips(container.name):
+    for ip in peers:
         block_set.add(ip)
 
     def _top_up() -> None:
-        block_set.top_up(get_established_peer_ips(container.name))
+        _safe_top_up(block_set, container.name)
 
     wait_for_log_pattern(
         container, _CONNECTION_INTERRUPTED_RE, since,
