@@ -9,6 +9,11 @@ services:
       - ha-exo-pool-dev-config:/config
     ports:
       - "8125:8123"
+    # Lets scripts/verify_outage_reconnect.py block traffic with iptables
+    # for its NET_ADMIN-gated scenarios; recreate the container after
+    # adding this (a plain `make restart` won't pick it up).
+    cap_add:
+      - NET_ADMIN
     stop_grace_period: 30s
     restart: unless-stopped
 

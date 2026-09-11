@@ -176,6 +176,99 @@ def test_resolve_mqtt_entity_id_rejects_multiple_matches():
         harness.resolve_mqtt_entity_id(entity_ids)
 
 
+def test_matches_connection_interrupted_on_the_interrupt_warning():
+    log_text = (
+        "2026-09-10 12:14:00.500 WARNING (MainThread) [custom_components.exo_pool.mqtt_client] "
+        "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n"
+    )
+
+    assert harness.matches_connection_interrupted(log_text) is True
+
+
+def test_matches_connection_interrupted_ignores_the_watchdog_line():
+    log_text = (
+        "2026-09-10 12:17:00.500 WARNING (MainThread) [custom_components.exo_pool.mqtt_client] "
+        "MQTT connection interrupted 180s ago with no resume - forcing reconnect\n"
+    )
+
+    assert harness.matches_connection_interrupted(log_text) is False
+
+
+def test_matches_watchdog_forced_reconnect_on_the_watchdog_line():
+    log_text = (
+        "2026-09-10 12:17:00.500 WARNING (MainThread) [custom_components.exo_pool.mqtt_client] "
+        "MQTT connection interrupted 180s ago with no resume - forcing reconnect\n"
+    )
+
+    assert harness.matches_watchdog_forced_reconnect(log_text) is True
+
+
+def test_matches_watchdog_forced_reconnect_ignores_the_interrupt_warning():
+    log_text = (
+        "2026-09-10 12:14:00.500 WARNING (MainThread) [custom_components.exo_pool.mqtt_client] "
+        "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n"
+    )
+
+    assert harness.matches_watchdog_forced_reconnect(log_text) is False
+
+
+def test_find_entry_state_returns_the_matching_entry_state():
+    entries = [
+        {"entry_id": "aaa", "domain": "exo_pool", "state": "setup_retry"},
+        {"entry_id": "bbb", "domain": "other", "state": "loaded"},
+    ]
+
+    assert harness.find_entry_state(entries, "aaa") == "setup_retry"
+
+
+def test_find_entry_state_raises_when_entry_id_not_present():
+    entries = [{"entry_id": "aaa", "domain": "exo_pool", "state": "loaded"}]
+
+    with pytest.raises(RuntimeError, match="zzz"):
+        harness.find_entry_state(entries, "zzz")
+
+
+def test_recovery_failure_message_names_the_container_and_both_restart_paths():
+    message = harness.recovery_failure_message("ha-exo-pool-dev")
+
+    assert "docker restart ha-exo-pool-dev" in message
+    assert "make restart" in message
+
+
+def test_reload_entry_translates_a_request_timeout_into_reload_timed_out(monkeypatch):
+    def _timing_out_request(*args, **kwargs):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(harness, "_ha_request", _timing_out_request)
+
+    with pytest.raises(harness.ReloadTimedOut):
+        harness.reload_entry("token", "entry123")
+
+
+def test_reload_entry_translates_a_wrapped_url_error_timeout_too(monkeypatch):
+    import urllib.error
+
+    def _wrapped_timeout_request(*args, **kwargs):
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr(harness, "_ha_request", _wrapped_timeout_request)
+
+    with pytest.raises(harness.ReloadTimedOut):
+        harness.reload_entry("token", "entry123")
+
+
+def test_reload_entry_lets_a_non_timeout_url_error_propagate(monkeypatch):
+    import urllib.error
+
+    def _connection_refused_request(*args, **kwargs):
+        raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+    monkeypatch.setattr(harness, "_ha_request", _connection_refused_request)
+
+    with pytest.raises(urllib.error.URLError):
+        harness.reload_entry("token", "entry123")
+
+
 def test_best_effort_teardown_runs_all_actions_even_if_one_raises():
     order = []
     teardown = harness.BestEffortTeardown()

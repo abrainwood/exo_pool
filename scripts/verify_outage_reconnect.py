@@ -156,6 +156,24 @@ def assert_growing_backoff(attempts: list[RetryAttempt], min_attempts: int = 3) 
             )
 
 
+# --- Interrupt/watchdog log matching (unit tested) ------------------------
+
+# The colon distinguishes the interrupt event itself from the watchdog's
+# own "interrupted Ns ago" line below, which also starts with this prefix.
+_CONNECTION_INTERRUPTED_RE = re.compile(r"MQTT connection interrupted: ")
+_WATCHDOG_FORCED_RECONNECT_RE = re.compile(
+    rf"MQTT connection interrupted {INTERRUPT_WATCHDOG_TIMEOUT}s ago with no resume"
+)
+
+
+def matches_connection_interrupted(log_text: str) -> bool:
+    return bool(_CONNECTION_INTERRUPTED_RE.search(log_text))
+
+
+def matches_watchdog_forced_reconnect(log_text: str) -> bool:
+    return bool(_WATCHDOG_FORCED_RECONNECT_RE.search(log_text))
+
+
 # --- Teardown (unit tested) ----------------------------------------------
 
 
@@ -175,6 +193,14 @@ class BestEffortTeardown:
                 action()
             except Exception:
                 _LOGGER.warning("Teardown action failed - continuing", exc_info=True)
+
+
+def recovery_failure_message(container_name: str) -> str:
+    return (
+        "The integration did NOT recover after the simulated outage. Operator "
+        f"action required: restart the dev container - `docker restart {container_name}` "
+        "or `make restart` - then verify manually that MQTT reconnects."
+    )
 
 
 # --- Scenario failure ------------------------------------------------------
@@ -313,7 +339,7 @@ def load_ha_token() -> str:
     )
 
 
-def _ha_request(method: str, path: str, token: str, data: dict | None = None) -> dict | list | None:
+def _ha_request(method: str, path: str, token: str, data: dict | None = None, timeout: float = 10.0) -> dict | list | None:
     url = f"{HA_URL}{path}"
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(
@@ -321,7 +347,7 @@ def _ha_request(method: str, path: str, token: str, data: dict | None = None) ->
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             return json.loads(raw) if raw else None
     except urllib.error.HTTPError as e:
@@ -338,6 +364,19 @@ def list_entity_ids(token: str) -> list[str]:
     return [s["entity_id"] for s in states or []]
 
 
+def find_entry_state(entries: list[dict], entry_id: str) -> str:
+    """Extract the config-entry `state` field for `entry_id` from a config_entries/entry response."""
+    for entry in entries:
+        if entry.get("entry_id") == entry_id:
+            return entry["state"]
+    raise RuntimeError(f"config entry {entry_id} not found")
+
+
+def get_entry_state(token: str, entry_id: str) -> str:
+    entries = _ha_request("GET", "/api/config/config_entries/entry", token)
+    return find_entry_state(entries or [], entry_id)
+
+
 def get_exo_pool_entry_id(token: str) -> str:
     entries = _ha_request("GET", "/api/config/config_entries/entry", token)
     for entry in entries or []:
@@ -346,8 +385,28 @@ def get_exo_pool_entry_id(token: str) -> str:
     raise RuntimeError("No exo_pool config entry found on the dev instance")
 
 
-def reload_entry(token: str, entry_id: str) -> None:
-    _ha_request("POST", f"/api/config/config_entries/entry/{entry_id}/reload", token)
+# HA's reload endpoint blocks until setup finishes or fails. Under a
+# simulated outage, setup's own internal retries can run well past a
+# typical API timeout - this is generous on purpose.
+RELOAD_TIMEOUT = 90.0
+
+
+class ReloadTimedOut(Exception):
+    """Raised when a config-entry reload doesn't return before RELOAD_TIMEOUT.
+
+    An expected outcome under a simulated outage, not a harness error.
+    """
+
+
+def reload_entry(token: str, entry_id: str, timeout: float = RELOAD_TIMEOUT) -> None:
+    try:
+        _ha_request("POST", f"/api/config/config_entries/entry/{entry_id}/reload", token, timeout=timeout)
+    except TimeoutError as e:
+        raise ReloadTimedOut(f"reload of entry {entry_id} did not return within {timeout:.0f}s") from e
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise ReloadTimedOut(f"reload of entry {entry_id} did not return within {timeout:.0f}s") from e
+        raise
 
 
 # --- Outage simulation -----------------------------------------------------
@@ -436,29 +495,82 @@ def _wait_for_min_retry_attempts(container: Container, since: str, min_attempts:
         time.sleep(min(5, remaining))
 
 
-def _assert_backoff_reset_to_base(container: Container, token: str, entry_id: str, teardown: BestEffortTeardown) -> RetryAttempt:
-    since = now_utc_iso()
-    blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
-    reload_entry(token, entry_id)
-    wait_for_log_pattern(
-        container, _RETRY_ATTEMPT_RE, since,
-        timeout=60.0, label="post-recovery retry attempt",
-    )
-    attempts = parse_retry_attempts(container.logs_since(since))
-    if not attempts or attempts[0].delay > MQTT_RETRY_BASE_DELAY * 1.5:
-        raise ScenarioFailure(
-            f"backoff did not reset to base after recovery: first post-recovery "
-            f"attempt was {attempts[0] if attempts else 'missing'}"
+def _wait_for_entity_state(token: str, entity_id: str, expected: str, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    start = time.monotonic()
+    while True:
+        state = get_entity_state(token, entity_id)
+        if state == expected:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        elapsed = time.monotonic() - start
+        print(
+            f"  ... waiting for {entity_id} to be {expected!r}, currently {state!r} "
+            f"({elapsed:.0f}s elapsed, {remaining:.0f}s left)"
         )
-    return attempts[0]
+        time.sleep(min(5, remaining))
 
 
-def scenario_outage_and_recovery(container: Container, token: str, teardown: BestEffortTeardown, mqtt_entity: str) -> None:
-    entry_id = get_exo_pool_entry_id(token)
+def _wait_for_entry_state_not_loaded(token: str, entry_id: str, timeout: float) -> str:
+    deadline = time.monotonic() + timeout
+    start = time.monotonic()
+    while True:
+        state = get_entry_state(token, entry_id)
+        if state != "loaded":
+            return state
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return state
+        elapsed = time.monotonic() - start
+        print(f"  ... waiting for setup to fail under outage, still 'loaded' ({elapsed:.0f}s elapsed, {remaining:.0f}s left)")
+        time.sleep(min(5, remaining))
+
+
+def _enter_retry_chain_from_connected(container: Container, since: str) -> None:
+    """Force entry into _async_refresh_and_reconnect from an already-connected state.
+
+    Needs NET_ADMIN - callers must check check_net_admin_capable() first.
+    """
+    interrupt_teardown = BestEffortTeardown()
+    block_iot_endpoint_tcp(container, interrupt_teardown, IOT_ENDPOINT)
+    try:
+        wait_for_log_pattern(
+            container, _CONNECTION_INTERRUPTED_RE, since,
+            timeout=60.0, label="connection interrupt",
+        )
+        wait_for_log_pattern(
+            container, _WATCHDOG_FORCED_RECONNECT_RE, since,
+            timeout=INTERRUPT_WATCHDOG_TIMEOUT + 60.0, label="watchdog-forced reconnect",
+        )
+    finally:
+        # Unblock now: the DNS blackhole (managed by the caller) is what
+        # keeps the forced reconnect failing from here on, so the TCP
+        # block has done its job once the watchdog has fired.
+        interrupt_teardown.run()
+
+
+def scenario_reconnect_from_connected(container: Container, token: str, teardown: BestEffortTeardown, mqtt_entity: str) -> bool | None:
+    """Issue #2's actual reproduction: MQTT is connected, the network dies
+    underneath it, and the retry chain must re-arm and keep going."""
+    if not check_net_admin_capable(container):
+        print(
+            "SKIP reconnect-from-connected: container lacks NET_ADMIN (or iptables) - "
+            "cannot force an already-established MQTT connection to interrupt, and "
+            "the fix's own credential-refresh timer is up to ~55 minutes away, too "
+            "long to wait on. Run with cap-add=NET_ADMIN on the dev container "
+            "(see docker-compose.dev.yml) to exercise this scenario."
+        )
+        return None
+
+    baseline = get_entity_state(token, mqtt_entity)
+    if baseline != "on":
+        raise ScenarioFailure(f"{mqtt_entity} is {baseline!r} before the outage, expected 'on'")
+
     since = now_utc_iso()
-
     blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
-    reload_entry(token, entry_id)
+    _enter_retry_chain_from_connected(container, since)
 
     attempts = _wait_for_min_retry_attempts(container, since, min_attempts=3, timeout=210.0)
     assert_growing_backoff(attempts)
@@ -470,21 +582,87 @@ def scenario_outage_and_recovery(container: Container, token: str, teardown: Bes
     print(f"PASS sensor flip: {mqtt_entity} is off during outage")
 
     next_wait_cap = attempts[-1].delay if attempts else MQTT_RETRY_BASE_DELAY
-    teardown.run()
+    teardown.run()  # restore DNS - the already-scheduled retry chain keeps running on its own timer
 
     wait_for_log_pattern(
         container, re.compile(r"MQTT connected - REST fallback interval set to"), since,
         timeout=next_wait_cap * 2 + 60,
         label="reconnect after DNS recovery",
     )
-    recovered_state = get_entity_state(token, mqtt_entity)
-    if recovered_state != "on":
-        raise ScenarioFailure(f"{mqtt_entity} did not return to 'on' after recovery (state={recovered_state!r})")
+    if not _wait_for_entity_state(token, mqtt_entity, "on", timeout=30.0):
+        raise ScenarioFailure(f"{mqtt_entity} did not return to 'on' after recovery")
     print("PASS recovery: reconnected and sensor back on")
 
-    reset_attempt = _assert_backoff_reset_to_base(container, token, entry_id, teardown)
-    print(f"PASS backoff reset to base: {reset_attempt}")
+    # _reset_mqtt_retry_backoff doesn't log, so proving it fired means
+    # forcing one more failure and reading the first delay back off it.
+    reset_since = now_utc_iso()
+    blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
+    _enter_retry_chain_from_connected(container, reset_since)
+    reset_attempts = _wait_for_min_retry_attempts(container, reset_since, min_attempts=1, timeout=60.0)
+    if not reset_attempts or reset_attempts[0].delay > MQTT_RETRY_BASE_DELAY * 1.5:
+        raise ScenarioFailure(
+            f"backoff did not reset to base after recovery: first post-recovery "
+            f"attempt was {reset_attempts[0] if reset_attempts else 'missing'}"
+        )
+    print(f"PASS backoff reset to base: {reset_attempts[0]}")
+
     teardown.run()
+    wait_for_log_pattern(
+        container, re.compile(r"MQTT connected - REST fallback interval set to"), reset_since,
+        timeout=MQTT_RETRY_BASE_DELAY * 2 + 60,
+        label="reconnect after second DNS recovery",
+    )
+    if not _wait_for_entity_state(token, mqtt_entity, "on", timeout=30.0):
+        raise ScenarioFailure(f"{mqtt_entity} did not return to 'on' after the reset-check outage")
+    return True
+
+
+def _ensure_recovered(token: str, entry_id: str, mqtt_entity: str) -> bool:
+    """Land the integration back in a working state, reloading if needed.
+
+    Called unconditionally at the end of every run, not just on scenario
+    success - a harness that can leave the integration dead is worse than
+    no harness.
+    """
+    if _wait_for_entity_state(token, mqtt_entity, "on", timeout=30.0):
+        return True
+    for attempt in (1, 2):
+        try:
+            reload_entry(token, entry_id)
+        except ReloadTimedOut:
+            pass
+        if _wait_for_entity_state(token, mqtt_entity, "on", timeout=120.0):
+            return True
+    return False
+
+
+def scenario_setup_under_outage(container: Container, token: str, teardown: BestEffortTeardown, entry_id: str, mqtt_entity: str) -> None:
+    """Pins what happens when the entry is reloaded while the network is down.
+
+    This is a different code path from scenario_reconnect_from_connected: a
+    reload re-runs setup (get_coordinator -> _connect_mqtt), never
+    _async_refresh_and_reconnect, so it can't be used to test the fix's
+    retry chain - only to pin setup's own behaviour under an outage.
+    """
+    since = now_utc_iso()
+    blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
+
+    try:
+        reload_entry(token, entry_id)
+        outcome = "the reload call returned"
+    except ReloadTimedOut:
+        outcome = "the reload call timed out"
+    print(f"{outcome} - checking the entry's actual state under the outage")
+
+    entry_state = _wait_for_entry_state_not_loaded(token, entry_id, timeout=RELOAD_TIMEOUT)
+    if entry_state == "loaded":
+        raise ScenarioFailure("setup succeeded despite the simulated outage - expected it to fail")
+    print(f"PASS setup fails under outage: entry state is {entry_state!r}")
+
+    teardown.run()
+    if not _ensure_recovered(token, entry_id, mqtt_entity):
+        raise ScenarioFailure(recovery_failure_message(CONTAINER_NAME))
+    print("PASS recovery: entry reloaded and MQTT back on after DNS restored")
 
 
 def scenario_watchdog(container: Container, token: str, teardown: BestEffortTeardown) -> bool | None:
@@ -501,15 +679,12 @@ def scenario_watchdog(container: Container, token: str, teardown: BestEffortTear
     block_iot_endpoint_tcp(container, teardown, IOT_ENDPOINT)
 
     wait_for_log_pattern(
-        container, re.compile(r"MQTT connection interrupted"), since,
+        container, _CONNECTION_INTERRUPTED_RE, since,
         timeout=60.0, label="connection interrupt",
     )
     wait_for_log_pattern(
-        container,
-        re.compile(rf"MQTT connection interrupted {INTERRUPT_WATCHDOG_TIMEOUT}s ago with no resume"),
-        since,
-        timeout=INTERRUPT_WATCHDOG_TIMEOUT + 60,
-        label="watchdog-forced reconnect",
+        container, _WATCHDOG_FORCED_RECONNECT_RE, since,
+        timeout=INTERRUPT_WATCHDOG_TIMEOUT + 60, label="watchdog-forced reconnect",
     )
     print("PASS watchdog: forced reconnect after interrupt with no resume")
     teardown.run()
@@ -537,8 +712,9 @@ def main() -> int:
 
     try:
         mqtt_entity = resolve_mqtt_entity_id(list_entity_ids(token))
+        entry_id = get_exo_pool_entry_id(token)
     except (MqttEntityResolutionError, RuntimeError) as e:
-        print(f"FATAL: could not resolve the exo_pool MQTT-connectivity entity: {e}")
+        print(f"FATAL: could not resolve the exo_pool entity/entry: {e}")
         return 1
 
     results: dict[str, str] = {}
@@ -561,10 +737,18 @@ def main() -> int:
 
         if results["baseline"] == "PASS":
             try:
-                scenario_outage_and_recovery(container, token, teardown, mqtt_entity)
-                results["outage_and_recovery"] = "PASS"
+                outcome = scenario_reconnect_from_connected(container, token, teardown, mqtt_entity)
+                results["reconnect_from_connected"] = "PASS" if outcome else (
+                    "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
+                )
             except (ScenarioFailure, AssertionError, RuntimeError) as e:
-                results["outage_and_recovery"] = f"FAIL: {e}"
+                results["reconnect_from_connected"] = f"FAIL: {e}"
+
+            try:
+                scenario_setup_under_outage(container, token, teardown, entry_id, mqtt_entity)
+                results["setup_under_outage"] = "PASS"
+            except (ScenarioFailure, AssertionError, RuntimeError) as e:
+                results["setup_under_outage"] = f"FAIL: {e}"
 
             if args.skip_watchdog:
                 results["watchdog"] = "SKIP (--skip-watchdog)"
@@ -577,10 +761,18 @@ def main() -> int:
                 except (ScenarioFailure, AssertionError, RuntimeError) as e:
                     results["watchdog"] = f"FAIL: {e}"
         else:
-            results["outage_and_recovery"] = "SKIP (baseline unhealthy)"
+            results["reconnect_from_connected"] = "SKIP (baseline unhealthy)"
+            results["setup_under_outage"] = "SKIP (baseline unhealthy)"
             results["watchdog"] = "SKIP (baseline unhealthy)"
     finally:
         teardown.run()
+        if _ensure_recovered(token, entry_id, mqtt_entity):
+            results["recovery"] = "PASS"
+        else:
+            print("\n" + "!" * 70)
+            print(recovery_failure_message(CONTAINER_NAME))
+            print("!" * 70 + "\n")
+            results["recovery"] = "FAIL"
 
     print("\n--- Summary ---")
     failed = False

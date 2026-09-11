@@ -210,8 +210,16 @@ Tests are isolated from Home Assistant - no HA installation required to run them
 ### Verifying the MQTT outage-reconnect fix
 
 `scripts/verify_outage_reconnect.py` drives the running dev container through
-a simulated WAN outage and checks the retry/backoff/watchdog behaviour end to
-end - only ever against `ha-exo-pool-dev` on port 8125, never a live instance.
+a simulated WAN outage - only ever against `ha-exo-pool-dev` on port 8125,
+never a live instance. It runs three scenarios:
+
+- **reconnect-from-connected** (issue #2's actual reproduction): MQTT is
+  connected, the network dies underneath it, and the fix's retry chain must
+  re-arm with growing backoff and recover.
+- **setup-under-outage**: the config entry is reloaded while the network is
+  down - a different code path (setup, not the reconnect chain) - and pins
+  what that does, including recovery once the outage clears.
+- **watchdog**: an interrupt with no resume forces a reconnect after 180s.
 
 ```bash
 export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
@@ -220,9 +228,17 @@ export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
 python3 scripts/verify_outage_reconnect.py
 ```
 
-The watchdog scenario needs `NET_ADMIN` on the container to block traffic
-with iptables; it's skipped with a clear message if that's unavailable, or
-pass `--skip-watchdog` to skip it deliberately.
+The reconnect-from-connected and watchdog scenarios need `NET_ADMIN` on the
+container to block traffic with iptables - already set in
+`docker-compose.dev.yml`, but since `cap_add` only applies at container
+creation, run `docker compose -f docker-compose.dev.yml up -d --force-recreate`
+(not just `make restart`) to pick it up on an existing dev container. Both
+scenarios skip with a clear message if it's unavailable; pass `--skip-watchdog`
+to skip the watchdog one deliberately.
+
+The harness guarantees the integration is left working when it exits,
+reloading the entry if needed - if it can't get MQTT back on, it says so
+loudly and tells you to restart the dev container.
 
 ---
 
