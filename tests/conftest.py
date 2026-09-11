@@ -11,21 +11,39 @@ import pytest
 # Stub out the homeassistant package so mqtt_client.py can be imported
 # without a full HA installation. mqtt_client.py itself has no HA deps,
 # but importing via custom_components.exo_pool triggers __init__.py which does.
-# We pre-register the mqtt_client module directly to short-circuit that.
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
-_mqtt_spec = importlib.util.spec_from_file_location(
-    "custom_components.exo_pool.mqtt_client",
-    _REPO_ROOT / "custom_components" / "exo_pool" / "mqtt_client.py",
-)
-_mqtt_mod = importlib.util.module_from_spec(_mqtt_spec)
 
-# Ensure parent packages exist in sys.modules
 for pkg in ("custom_components", "custom_components.exo_pool"):
     if pkg not in sys.modules:
         sys.modules[pkg] = types.ModuleType(pkg)
 
-sys.modules["custom_components.exo_pool.mqtt_client"] = _mqtt_mod
-_mqtt_spec.loader.exec_module(_mqtt_mod)
+# Give the exo_pool stub a real __path__ so that a module loaded standalone
+# below (e.g. api.py) can still resolve its own relative imports of sibling
+# modules (e.g. `from .redact import redact`) via normal package lookup.
+sys.modules["custom_components.exo_pool"].__path__ = [
+    str(_REPO_ROOT / "custom_components" / "exo_pool")
+]
+
+
+def load_exo_pool_module(name: str):
+    """Load a custom_components.exo_pool submodule directly.
+
+    custom_components.exo_pool is the fake stub package registered above, so
+    its __init__ can't be reached through a normal `from .foo import bar`.
+    """
+    full_name = f"custom_components.exo_pool.{name}"
+    if full_name in sys.modules:
+        return sys.modules[full_name]
+    spec = importlib.util.spec_from_file_location(
+        full_name, _REPO_ROOT / "custom_components" / "exo_pool" / f"{name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[full_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+load_exo_pool_module("mqtt_client")
 
 
 SAMPLE_CREDENTIALS = {
@@ -39,6 +57,12 @@ SAMPLE_CREDENTIALS = {
 SAMPLE_SERIAL = "JT00000000"
 IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
 IOT_REGION = "us-east-1"
+
+
+@pytest.fixture(autouse=True)
+def _fast_subscribe(monkeypatch):
+    """Skip the real per-topic subscribe pacing delay in tests."""
+    monkeypatch.setattr(load_exo_pool_module("mqtt_client"), "_SUBSCRIBE_DELAY", 0)
 
 
 @pytest.fixture
@@ -69,7 +93,17 @@ def mock_mqtt_connection():
 
 @pytest.fixture
 def mock_event_loop():
-    """Mock the HA event loop for thread-safe callback bridging."""
+    """Mock HA event loop - call_soon_threadsafe executes its callback inline."""
+    from unittest.mock import MagicMock
+
+    loop = MagicMock()
+    loop.call_soon_threadsafe = MagicMock(side_effect=lambda fn, *args: fn(*args))
+    return loop
+
+
+@pytest.fixture
+def mock_event_loop_deferred():
+    """Mock HA event loop - call_soon_threadsafe only records the call."""
     from unittest.mock import MagicMock
 
     loop = MagicMock()
@@ -85,7 +119,7 @@ def build_client(mock_mqtt_connection, mock_event_loop):
 
     def _build(**kwargs):
         client = ExoMqttClient(
-            loop=mock_event_loop,
+            loop=kwargs.get("loop", mock_event_loop),
             endpoint=kwargs.get("endpoint", IOT_ENDPOINT),
             region=kwargs.get("region", IOT_REGION),
             serial=kwargs.get("serial", SAMPLE_SERIAL),

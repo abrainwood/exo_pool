@@ -87,6 +87,45 @@ class TestConnect:
         # Should have disconnected the old connection first
         assert mock_mqtt_connection.disconnect.call_count == 1
 
+    def test_connect_with_all_subscribes_failing_reports_not_connected(
+        self, build_client, mock_mqtt_connection
+    ):
+        sub_future = MagicMock()
+        sub_future.result.side_effect = Exception("Forbidden")
+        mock_mqtt_connection.subscribe.return_value = (sub_future, 1)
+        client = build_client()
+
+        with pytest.raises(ConnectionError):
+            client.connect(SAMPLE_CREDENTIALS)
+
+        assert client.connected is False
+
+    def test_connect_with_all_subscribes_failing_calls_reconnect_failed_callback(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        reconnect_cb = MagicMock()
+        sub_future = MagicMock()
+        sub_future.result.side_effect = Exception("Forbidden")
+        mock_mqtt_connection.subscribe.return_value = (sub_future, 1)
+        client = build_client()
+        client.set_reconnect_failed_callback(reconnect_cb)
+
+        with pytest.raises(ConnectionError):
+            client.connect(SAMPLE_CREDENTIALS)
+
+        mock_event_loop.call_soon_threadsafe.assert_any_call(reconnect_cb)
+
+    def test_connect_with_all_subscribes_failing_raises(
+        self, build_client, mock_mqtt_connection
+    ):
+        sub_future = MagicMock()
+        sub_future.result.side_effect = Exception("Forbidden")
+        mock_mqtt_connection.subscribe.return_value = (sub_future, 1)
+        client = build_client()
+
+        with pytest.raises(ConnectionError):
+            client.connect(SAMPLE_CREDENTIALS)
+
 
 class TestDisconnect:
     """Disconnect tests."""
@@ -151,17 +190,9 @@ class TestShadowCallback:
             retain=False,
         )
 
-        # Should bridge to HA event loop, not call directly
-        mock_event_loop.call_soon_threadsafe.assert_called()
-        # Extract the callback and args passed to call_soon_threadsafe
-        bridged_call = mock_event_loop.call_soon_threadsafe.call_args
-        bridged_fn = bridged_call.args[0]
-        bridged_args = bridged_call.args[1:]
-
-        # Execute the bridged callback
-        bridged_fn(*bridged_args)
-
-        # Now our shadow callback should have received the reported state
+        # Bridged via call_soon_threadsafe (not called directly), which the
+        # fixture executes immediately so the callback has already run.
+        mock_event_loop.call_soon_threadsafe.assert_called_with(callback, reported_state)
         callback.assert_called_once_with(reported_state)
 
     def test_shadow_callback_invoked_on_get_accepted(
@@ -198,11 +229,7 @@ class TestShadowCallback:
             retain=False,
         )
 
-        mock_event_loop.call_soon_threadsafe.assert_called()
-        bridged_fn = mock_event_loop.call_soon_threadsafe.call_args.args[0]
-        bridged_args = mock_event_loop.call_soon_threadsafe.call_args.args[1:]
-        bridged_fn(*bridged_args)
-
+        mock_event_loop.call_soon_threadsafe.assert_called_with(callback, reported_state)
         callback.assert_called_once_with(reported_state)
 
     def test_no_callback_set_does_not_bridge(
@@ -436,6 +463,163 @@ class TestReconnection:
         mock_event_loop.call_soon_threadsafe.assert_called_with(reconnect_cb)
 
 
+class TestInterruptWatchdog:
+    def test_interrupt_arms_a_watchdog_timer(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        client = build_client()
+        client.connect(SAMPLE_CREDENTIALS)
+        initial_call_later_count = mock_event_loop.call_later.call_count
+
+        client._on_connection_interrupted(
+            connection=mock_mqtt_connection, error=Exception("network down")
+        )
+
+        assert mock_event_loop.call_later.call_count > initial_call_later_count
+
+    def test_watchdog_firing_invokes_the_registered_callback(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        watchdog_cb = MagicMock()
+        client = build_client()
+        client.set_interrupted_watchdog_callback(watchdog_cb)
+        client.connect(SAMPLE_CREDENTIALS)
+
+        client._on_connection_interrupted(
+            connection=mock_mqtt_connection, error=Exception("network down")
+        )
+
+        # Find the watchdog's call_later registration and fire it, simulating
+        # the timeout elapsing with no _on_connection_resumed in between.
+        from custom_components.exo_pool.mqtt_client import (
+            _INTERRUPT_WATCHDOG_TIMEOUT,
+        )
+
+        watchdog_call = next(
+            c
+            for c in mock_event_loop.call_later.call_args_list
+            if c.args[0] == _INTERRUPT_WATCHDOG_TIMEOUT
+        )
+        fire = watchdog_call.args[1]
+        fire()
+
+        watchdog_cb.assert_called_once()
+
+    def test_resume_before_timeout_disarms_the_watchdog(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        watchdog_cb = MagicMock()
+        mock_handle = MagicMock()
+        mock_event_loop.call_later.return_value = mock_handle
+        client = build_client()
+        client.set_interrupted_watchdog_callback(watchdog_cb)
+        client.connect(SAMPLE_CREDENTIALS)
+
+        client._on_connection_interrupted(
+            connection=mock_mqtt_connection, error=Exception("blip")
+        )
+        client._on_connection_resumed(
+            connection=mock_mqtt_connection, return_code=0, session_present=False
+        )
+
+        mock_handle.cancel.assert_called()
+
+    def test_watchdog_firing_after_a_resume_race_does_not_invoke_the_callback(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        watchdog_cb = MagicMock()
+        client = build_client()
+        client.set_interrupted_watchdog_callback(watchdog_cb)
+        client.connect(SAMPLE_CREDENTIALS)
+
+        client._on_connection_interrupted(
+            connection=mock_mqtt_connection, error=Exception("blip")
+        )
+        client._on_connection_resumed(
+            connection=mock_mqtt_connection, return_code=0, session_present=False
+        )
+        # Simulate the disarm losing the race: the timer still fires once
+        # after resume already restored a healthy connection.
+        client._watchdog_fire()
+
+        watchdog_cb.assert_not_called()
+
+    def test_disconnect_after_interrupt_disarms_the_watchdog(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        heartbeat_handle = MagicMock()
+        watchdog_handle = MagicMock()
+        mock_event_loop.call_later.side_effect = [heartbeat_handle, watchdog_handle]
+        client = build_client()
+        client.connect(SAMPLE_CREDENTIALS)
+
+        client._on_connection_interrupted(
+            connection=mock_mqtt_connection, error=Exception("blip")
+        )
+        client.disconnect()
+
+        watchdog_handle.cancel.assert_called()
+
+    def test_arming_never_touches_call_later_directly_from_the_crt_thread(
+        self, build_client, mock_mqtt_connection, mock_event_loop_deferred
+    ):
+        client = build_client()
+        client.connect(SAMPLE_CREDENTIALS)
+        # Swap to the non-executing loop double for the interrupt itself, so
+        # the timer mutation's call_soon_threadsafe gating is observable.
+        client._loop = mock_event_loop_deferred
+
+        client._on_connection_interrupted(
+            connection=mock_mqtt_connection, error=Exception("blip")
+        )
+
+        mock_event_loop_deferred.call_later.assert_not_called()
+        mock_event_loop_deferred.call_soon_threadsafe.assert_called_with(
+            client._arm_watchdog_on_loop
+        )
+
+
+class TestConnectionStateChanged:
+    def test_connect_success_notifies_the_state_changed_callback(
+        self, build_client, mock_event_loop
+    ):
+        state_cb = MagicMock()
+        client = build_client()
+        client.set_state_changed_callback(state_cb)
+
+        client.connect(SAMPLE_CREDENTIALS)
+
+        mock_event_loop.call_soon_threadsafe.assert_any_call(state_cb, True)
+
+    def test_interrupt_notifies_the_state_changed_callback_with_false(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        state_cb = MagicMock()
+        client = build_client()
+        client.set_state_changed_callback(state_cb)
+        client.connect(SAMPLE_CREDENTIALS)
+        mock_event_loop.call_soon_threadsafe.reset_mock()
+
+        client._on_connection_interrupted(
+            connection=mock_mqtt_connection, error=Exception("blip")
+        )
+
+        mock_event_loop.call_soon_threadsafe.assert_any_call(state_cb, False)
+
+    def test_disconnect_notifies_the_state_changed_callback_with_false(
+        self, build_client, mock_event_loop
+    ):
+        state_cb = MagicMock()
+        client = build_client()
+        client.set_state_changed_callback(state_cb)
+        client.connect(SAMPLE_CREDENTIALS)
+        mock_event_loop.call_soon_threadsafe.reset_mock()
+
+        client.disconnect()
+
+        mock_event_loop.call_soon_threadsafe.assert_any_call(state_cb, False)
+
+
 class TestHeartbeat:
     """Heartbeat (periodic shadow/get) tests."""
 
@@ -450,6 +634,21 @@ class TestHeartbeat:
         from custom_components.exo_pool.mqtt_client import _HEARTBEAT_INTERVAL
 
         assert interval == _HEARTBEAT_INTERVAL
+
+    def test_starting_never_touches_call_later_directly_off_the_loop_thread(
+        self, build_client, mock_event_loop_deferred
+    ):
+        # connect() runs the blocking handshake on an executor thread in
+        # production - prove the heartbeat timer is armed via
+        # call_soon_threadsafe rather than call_later called inline there.
+        client = build_client(loop=mock_event_loop_deferred)
+
+        client.connect(SAMPLE_CREDENTIALS)
+
+        mock_event_loop_deferred.call_later.assert_not_called()
+        mock_event_loop_deferred.call_soon_threadsafe.assert_any_call(
+            client._start_heartbeat_on_loop
+        )
 
     def test_heartbeat_tick_requests_shadow(
         self, build_client, mock_mqtt_connection

@@ -6,12 +6,15 @@ from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers import aiohttp_client
-from datetime import timedelta
+from datetime import datetime, timedelta
 import aiohttp
 import async_timeout
 import logging
+import json
 import time
 import asyncio
+
+from .redact import redact
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,6 +64,17 @@ def _log_response_headers(
         _LOGGER.info("%s rate-limit headers found: %s", label, rate_headers)
 
 
+def _redact_response_body(body: str) -> str | dict | list:
+    """Return a loggable form of a response body with secret keys redacted."""
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return f"<non-JSON body, {len(body)} chars>"
+    if isinstance(parsed, (dict, list)):
+        return redact(parsed)
+    return "<non-object JSON body>"
+
+
 # API endpoints and keys from config_flow.py and REST sensors
 LOGIN_URL = "https://prod.zodiac-io.com/users/v1/login"
 REFRESH_URL = "https://prod.zodiac-io.com/users/v1/refresh"
@@ -80,7 +94,16 @@ ERROR_CODES = {
 
 # Class-level flag to track authentication status
 _authentication_failed = False
-_last_auth_error = None
+_last_auth_error = None  # raw - only for the api.py:420-style literal match
+_last_auth_error_redacted = None  # safe for external surfaces (attrs, diagnostics)
+
+
+def _record_auth_error(raw: str, redacted=None) -> None:
+    """Set the private raw and public redacted auth-error state together."""
+    global _last_auth_error, _last_auth_error_redacted
+    _last_auth_error = raw
+    _last_auth_error_redacted = raw if redacted is None else redacted
+
 
 # Domain constant
 DOMAIN = "exo_pool"
@@ -108,6 +131,9 @@ IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
 IOT_REGION = "us-east-1"
 MQTT_CREDENTIAL_REFRESH_BUFFER = 300  # refresh 5 min before expiry
 REST_FALLBACK_INTERVAL = 3600  # 1 hour REST poll - last resort when MQTT is dead
+MQTT_RETRY_BASE_DELAY = 30.0
+MQTT_RETRY_MAX_DELAY = 900.0
+MQTT_RETRY_JITTER_FRACTION = 0.2
 
 
 async def _async_rate_limit(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -355,9 +381,9 @@ def _get_write_manager(hass: HomeAssistant, entry: ConfigEntry) -> _WriteManager
 
 async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
     """Fetch data from the Exo Pool API, handling token refresh."""
-    global _authentication_failed, _last_auth_error
+    global _authentication_failed
     _authentication_failed = False  # Reset flag
-    _last_auth_error = None
+    _record_auth_error(None)
     store = _get_entry_store(hass, entry)
     no_read_until = store.get("no_read_until")
     if no_read_until and time.monotonic() < no_read_until:
@@ -413,7 +439,7 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
             await _full_login(hass, entry, session)
 
         id_token = entry.data.get("id_token")  # Update after refresh/login
-        _LOGGER.debug("Authentication token refreshed: %s", id_token[:10] + "...")
+        _LOGGER.debug("Authentication token refreshed")
 
     # Fetch device data
     headers = {
@@ -434,7 +460,10 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
                 error_text
             )
             if is_rate_limited:
-                _LOGGER.warning("Rate limited fetching device data: %s", error_text)
+                _LOGGER.warning(
+                    "Rate limited fetching device data: %s",
+                    _redact_response_body(error_text),
+                )
                 coordinator = (
                     hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinator")
                 )
@@ -506,12 +535,15 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
                     return coordinator.data or {}
                 return {}
 
-            _LOGGER.error("Failed to fetch device data: %s", error_text)
+            redacted_error = _redact_response_body(error_text)
+            _LOGGER.error("Failed to fetch device data: %s", redacted_error)
+            # Matched against the raw text - the exact literal Zodiac sends
+            # for an expired token, not something redact() can produce.
             if "The incoming token has expired" in error_text:
-                _last_auth_error = error_text
-            raise UpdateFailed(f"Device data fetch failed: {error_text}")
+                _record_auth_error(error_text, redacted_error)
+            raise UpdateFailed(f"Device data fetch failed: {redacted_error}")
         data = await response.json()
-        _LOGGER.debug("Device data: %s", data)
+        _LOGGER.debug("Device data: %s", redact(data))
         reported = data.get("state", {}).get("reported", {})
         coordinator = (
             hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinator")
@@ -547,23 +579,21 @@ async def _full_login(
         "email": entry.data["email"],
         "password": entry.data["password"],
     }
-    _LOGGER.debug("Login payload: %s", {**payload, "password": "REDACTED"})
+    _LOGGER.debug("Login payload: %s", redact(payload))
     await _async_rate_limit(hass, entry)
     async with session.post(LOGIN_URL, json=payload, headers=headers) as response:
         _LOGGER.debug("Login response status: %s", response.status)
         _log_response_headers(response, label="Login")
         if response.status != 200:
             error_text = await response.text()
-            _LOGGER.error("Failed to authenticate: %s", error_text)
-            global _authentication_failed, _last_auth_error
+            redacted_error = _redact_response_body(error_text)
+            _LOGGER.error("Failed to authenticate: %s", redacted_error)
+            global _authentication_failed
             _authentication_failed = True
-            _last_auth_error = error_text
-            raise Exception(f"Authentication failed: {error_text}")
+            _record_auth_error(error_text, redacted_error)
+            raise Exception(f"Authentication failed: {redacted_error}")
         data = await response.json()
-        _LOGGER.debug(
-            "Login response data: %s",
-            {k: v if k != "id_token" else v[:10] + "..." for k, v in data.items()},
-        )
+        _LOGGER.debug("Login response data: %s", redact(data))
         id_token = data.get("userPoolOAuth", {}).get("IdToken")
         refresh_token = data.get("userPoolOAuth", {}).get("RefreshToken")
         auth_token = data.get("authentication_token")
@@ -572,14 +602,14 @@ async def _full_login(
             "ExpiresIn", 3600
         )  # Default to 1 hour if not present
         if not id_token:
-            _LOGGER.error("No userPoolOAuth.IdToken in response: %s", data)
+            _LOGGER.error("No userPoolOAuth.IdToken in response: %s", redact(data))
             _authentication_failed = True
-            _last_auth_error = "No userPoolOAuth.IdToken received"
+            _record_auth_error("No userPoolOAuth.IdToken received")
             raise Exception("No userPoolOAuth.IdToken received")
         if not auth_token:
-            _LOGGER.error("No authentication_token in response: %s", data)
+            _LOGGER.error("No authentication_token in response: %s", redact(data))
             _authentication_failed = True
-            _last_auth_error = "No authentication_token received"
+            _record_auth_error("No authentication_token received")
             raise Exception("No authentication_token received")
         update_data = {
             **entry.data,
@@ -605,20 +635,17 @@ async def _refresh_token(
         "email": entry.data["email"],
         "refresh_token": entry.data["refresh_token"],
     }
-    _LOGGER.debug("Refresh token payload: %s", {**payload, "refresh_token": "REDACTED"})
+    _LOGGER.debug("Refresh token payload: %s", redact(payload))
     await _async_rate_limit(hass, entry)
     async with session.post(REFRESH_URL, json=payload, headers=headers) as response:
         _LOGGER.debug("Refresh response status: %s", response.status)
         _log_response_headers(response, label="Token refresh")
         if response.status != 200:
             error_text = await response.text()
-            _LOGGER.error("Failed to refresh token: %s", error_text)
+            _LOGGER.error("Failed to refresh token: %s", _redact_response_body(error_text))
             return False
         data = await response.json()
-        _LOGGER.debug(
-            "Refresh response data: %s",
-            {k: v if k != "id_token" else v[:10] + "..." for k, v in data.items()},
-        )
+        _LOGGER.debug("Refresh response data: %s", redact(data))
         id_token = data.get("userPoolOAuth", {}).get("IdToken")
         refresh_token = data.get("userPoolOAuth", {}).get(
             "RefreshToken"
@@ -627,7 +654,9 @@ async def _refresh_token(
         user_id = data.get("id")
         expires_in = data.get("userPoolOAuth", {}).get("ExpiresIn", 3600)
         if not id_token:
-            _LOGGER.error("No userPoolOAuth.IdToken in refresh response: %s", data)
+            _LOGGER.error(
+                "No userPoolOAuth.IdToken in refresh response: %s", redact(data)
+            )
             return False
         update_data = {
             **entry.data,
@@ -831,23 +860,27 @@ async def _execute_write_rest(
             hass, entry, session, url, payload, headers, item.key
         )
     if response_status == 429:
-        _LOGGER.warning("Rate limited during write %s: %s", item.key, response_text)
+        redacted_body = _redact_response_body(response_text)
+        _LOGGER.warning(
+            "Rate limited during write %s: %s", item.key, redacted_body
+        )
         _set_cooldown(
             hass,
             entry,
             _get_configured_interval_seconds(entry),
             reason="write_429",
         )
-        raise Exception(f"Rate limited for write {item.key}: {response_text}")
+        raise Exception(f"Rate limited for write {item.key}: {redacted_body}")
     if response_status != 200:
+        redacted_body = _redact_response_body(response_text)
         _LOGGER.error(
             "Write failed for %s: %s (Status: %s)",
             item.key,
-            response_text,
+            redacted_body,
             response_status,
         )
         raise Exception(
-            f"Write failed for {item.key}: {response_text} (Status: {response_status})"
+            f"Write failed for {item.key}: {redacted_body} (Status: {response_status})"
         )
 
 
@@ -894,25 +927,132 @@ async def _post_write(
             "Write response for %s: %s %s",
             item_key,
             response.status,
-            response_text,
+            _redact_response_body(response_text),
         )
         return response.status, response_text
 
 
+def _entry_is_loaded(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    return entry.entry_id in hass.data.get(DOMAIN, {})
+
+
+def _aws_credentials_need_refresh(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    credentials = _get_entry_store(hass, entry).get("aws_credentials")
+    if not credentials:
+        return True
+    expiration_str = credentials.get("Expiration", "")
+    if not expiration_str:
+        return True
+    try:
+        expires_at = datetime.fromisoformat(
+            expiration_str.replace("Z", "+00:00")
+        ).timestamp()
+    except (ValueError, TypeError):
+        return True
+    return time.time() > expires_at - MQTT_CREDENTIAL_REFRESH_BUFFER
+
+
 async def _async_refresh_and_reconnect(
-    hass: HomeAssistant, entry: ConfigEntry
+    hass: HomeAssistant, entry: ConfigEntry, *, force_credential_refresh: bool = False
 ) -> None:
     """Refresh AWS credentials and reconnect MQTT.
 
-    Called when MQTT reconnect fails due to expired credentials,
-    or proactively by the credential refresh timer.
+    Called when MQTT reconnect fails due to expired credentials, or
+    proactively by the credential refresh timer.
     """
+    if not _entry_is_loaded(hass, entry):
+        return
+
+    store = _get_entry_store(hass, entry)
+    connected = False
+    error: Exception | None = None
     try:
-        session = aiohttp_client.async_get_clientsession(hass)
-        await _refresh_authentication(hass, entry, session)
-        await hass.async_add_executor_job(_connect_mqtt, hass, entry)
-    except Exception:
-        _LOGGER.warning("MQTT credential refresh and reconnect failed", exc_info=True)
+        if force_credential_refresh or _aws_credentials_need_refresh(hass, entry):
+            session = aiohttp_client.async_get_clientsession(hass)
+            await _refresh_authentication(hass, entry, session)
+        connected = await hass.async_add_executor_job(_connect_mqtt, hass, entry)
+    except Exception as err:
+        error = err
+
+    if not _entry_is_loaded(hass, entry):
+        return
+
+    if connected:
+        _reset_mqtt_retry_backoff(hass, entry)
+        return
+
+    attempt = store.get("mqtt_retry_attempts", 0) + 1
+    store["mqtt_retry_attempts"] = attempt
+    next_delay = store.get("mqtt_retry_delay", MQTT_RETRY_BASE_DELAY)
+    detail = f": {error}" if error is not None else ""
+    _LOGGER.warning(
+        "MQTT reconnect attempt %d to %s failed%s - retrying in ~%.0fs",
+        attempt,
+        IOT_ENDPOINT,
+        detail,
+        next_delay,
+    )
+    _schedule_mqtt_retry(hass, entry)
+
+
+def _reset_mqtt_retry_backoff(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reset the MQTT reconnect backoff to base after a successful attempt."""
+    store = _get_entry_store(hass, entry)
+    store["mqtt_retry_delay"] = MQTT_RETRY_BASE_DELAY
+    store["mqtt_retry_attempts"] = 0
+    store["mqtt_retry_sleeping"] = False
+    task = store.pop("mqtt_retry_task", None)
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
+
+
+def _schedule_mqtt_retry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Arm the next bounded exponential-backoff MQTT reconnect attempt."""
+    if not _entry_is_loaded(hass, entry):
+        return
+    store = _get_entry_store(hass, entry)
+    delay = store.get("mqtt_retry_delay", MQTT_RETRY_BASE_DELAY)
+    jitter_span = delay * MQTT_RETRY_JITTER_FRACTION
+    sleep_for = min(
+        delay + random.uniform(-jitter_span, jitter_span), MQTT_RETRY_MAX_DELAY
+    )
+    store["mqtt_retry_delay"] = min(delay * 2, MQTT_RETRY_MAX_DELAY)
+
+    task = store.get("mqtt_retry_task")
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
+
+    async def _retry_later() -> None:
+        store["mqtt_retry_sleeping"] = True
+        try:
+            await asyncio.sleep(sleep_for)
+        finally:
+            store["mqtt_retry_sleeping"] = False
+        if not _entry_is_loaded(hass, entry):
+            return
+        _LOGGER.info("Retrying MQTT reconnect after %.0fs backoff", sleep_for)
+        await _async_refresh_and_reconnect(hass, entry)
+
+    store["mqtt_retry_task"] = hass.async_create_background_task(
+        _retry_later(), name="exo_pool_mqtt_retry"
+    )
+
+
+def _trigger_mqtt_reconnect(hass: HomeAssistant, entry: ConfigEntry, *, name: str) -> None:
+    """Reconnect now with fresh credentials, preempting a sleeping backoff but not a running attempt."""
+    if not _entry_is_loaded(hass, entry):
+        return
+    store = _get_entry_store(hass, entry)
+    task = store.get("mqtt_retry_task")
+    if task is not None and not task.done():
+        if not store.get("mqtt_retry_sleeping"):
+            return
+        _LOGGER.info("Preempting a sleeping MQTT retry backoff for %s", name)
+        task.cancel()
+    store["mqtt_retry_task"] = hass.async_create_background_task(
+        _async_refresh_and_reconnect(hass, entry, force_credential_refresh=True),
+        name=name,
+    )
 
 
 def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -969,15 +1109,24 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     mqtt_client.set_shadow_callback(_on_shadow_update)
 
+    def _on_mqtt_state_changed(_connected: bool) -> None:
+        """Called on HA event loop when the transport connected state flips."""
+        coordinator.async_update_listeners()
+
+    mqtt_client.set_state_changed_callback(_on_mqtt_state_changed)
+
     def _on_reconnect_failed() -> None:
         """Called on HA event loop when MQTT re-subscribe fails (stale credentials)."""
         _LOGGER.warning("MQTT reconnect failed - refreshing credentials")
-        hass.async_create_background_task(
-            _async_refresh_and_reconnect(hass, entry),
-            name="exo_pool_reconnect_refresh",
-        )
+        _trigger_mqtt_reconnect(hass, entry, name="exo_pool_reconnect_refresh")
 
     mqtt_client.set_reconnect_failed_callback(_on_reconnect_failed)
+
+    def _on_watchdog_fire() -> None:
+        """Called on HA event loop when interrupt->resume takes too long."""
+        _trigger_mqtt_reconnect(hass, entry, name="exo_pool_watchdog_reconnect")
+
+    mqtt_client.set_interrupted_watchdog_callback(_on_watchdog_fire)
 
     try:
         mqtt_client.connect(credentials)
@@ -1015,8 +1164,6 @@ def _schedule_credential_refresh(hass: HomeAssistant, entry: ConfigEntry) -> Non
     if not expiration_str:
         return
 
-    from datetime import datetime, timezone
-
     try:
         expires_at = datetime.fromisoformat(
             expiration_str.replace("Z", "+00:00")
@@ -1052,12 +1199,21 @@ def cleanup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         try:
             mqtt_client.disconnect()
         except Exception:
-            _LOGGER.debug("Error disconnecting MQTT during cleanup", exc_info=True)
+            _LOGGER.warning("Error disconnecting MQTT during cleanup", exc_info=True)
 
     # Cancel scheduled tasks
-    for task_key in ("credential_refresh_task", "debounce_refresh_task", "boost_task"):
+    for task_key in (
+        "credential_refresh_task",
+        "debounce_refresh_task",
+        "boost_task",
+        "mqtt_retry_task",
+    ):
         if task := store.get(task_key):
             task.cancel()
+
+
+def get_mqtt_client(hass: HomeAssistant, entry: ConfigEntry):
+    return _get_entry_store(hass, entry).get("mqtt_client")
 
 
 async def get_coordinator(hass: HomeAssistant, entry: ConfigEntry):

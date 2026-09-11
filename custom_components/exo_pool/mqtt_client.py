@@ -37,6 +37,7 @@ _CONNECT_TIMEOUT = 10
 _DISCONNECT_TIMEOUT = 5
 _SUBSCRIBE_DELAY = 0.3
 _HEARTBEAT_INTERVAL = 900  # 15 min shadow refresh via MQTT
+_INTERRUPT_WATCHDOG_TIMEOUT = 180
 
 
 class ExoMqttClient:
@@ -62,7 +63,10 @@ class ExoMqttClient:
         self._connected = False
         self._shadow_callback: Callable[[dict], None] | None = None
         self._reconnect_failed_callback: Callable[[], None] | None = None
+        self._interrupted_watchdog_callback: Callable[[], None] | None = None
+        self._state_changed_callback: Callable[[bool], None] | None = None
         self._heartbeat_cancel: Callable | None = None
+        self._watchdog_cancel: Callable | None = None
 
         # CRT resources - created once, reused across reconnections
         self._event_loop_group = io.EventLoopGroup(1)
@@ -92,6 +96,19 @@ class ExoMqttClient:
         """
         self._reconnect_failed_callback = callback
 
+    def set_state_changed_callback(self, callback: Callable[[bool], None]) -> None:
+        """Register a callback invoked whenever the transport connected state flips.
+
+        Invoked on the event loop passed to the constructor, on connect,
+        disconnect, interrupt and resume.
+        """
+        self._state_changed_callback = callback
+
+    def _set_connected(self, value: bool) -> None:
+        self._connected = value
+        if self._state_changed_callback is not None:
+            self._loop.call_soon_threadsafe(self._state_changed_callback, value)
+
     def connect(self, credentials: dict) -> None:
         """Connect to AWS IoT and subscribe to shadow topics.
 
@@ -103,23 +120,34 @@ class ExoMqttClient:
 
         self._connection = self._build_connection(credentials)
         self._connection.connect().result(timeout=_CONNECT_TIMEOUT)
-        self._connected = True
         _LOGGER.info("MQTT connected to %s for device %s", self._endpoint, self._serial)
 
-        self._subscribe_shadow_topics()
-        self._request_shadow()
-        self._start_heartbeat()
+        if self._subscribe_shadow_topics():
+            self._set_connected(True)
+            self._request_shadow()
+            self._start_heartbeat()
+        else:
+            _LOGGER.warning(
+                "All subscribes failed after connect - credentials may have expired"
+            )
+            self._set_connected(False)
+            if self._reconnect_failed_callback is not None:
+                self._loop.call_soon_threadsafe(self._reconnect_failed_callback)
+            raise ConnectionError(
+                "All shadow subscribes failed after connect - credentials may have expired"
+            )
 
     def disconnect(self) -> None:
         """Disconnect from AWS IoT."""
         self._stop_heartbeat()
+        self._disarm_watchdog()
         if self._connection is not None:
             try:
                 self._connection.disconnect().result(timeout=_DISCONNECT_TIMEOUT)
             except Exception:
-                _LOGGER.debug("MQTT disconnect error (ignored)", exc_info=True)
+                _LOGGER.warning("MQTT disconnect error (ignored)", exc_info=True)
             self._connection = None
-        self._connected = False
+        self._set_connected(False)
 
     def publish_desired(self, desired: dict) -> None:
         """Publish a desired state change to the device shadow.
@@ -192,14 +220,18 @@ class ExoMqttClient:
 
     def _start_heartbeat(self) -> None:
         """Start periodic shadow/get to keep coordinator data fresh."""
-        self._stop_heartbeat()
-        handle = self._loop.call_later(
-            _HEARTBEAT_INTERVAL, self._heartbeat_tick
-        )
+        self._loop.call_soon_threadsafe(self._start_heartbeat_on_loop)
+
+    def _start_heartbeat_on_loop(self) -> None:
+        self._stop_heartbeat_on_loop()
+        handle = self._loop.call_later(_HEARTBEAT_INTERVAL, self._heartbeat_tick)
         self._heartbeat_cancel = handle.cancel
 
     def _stop_heartbeat(self) -> None:
         """Cancel the heartbeat timer."""
+        self._loop.call_soon_threadsafe(self._stop_heartbeat_on_loop)
+
+    def _stop_heartbeat_on_loop(self) -> None:
         if self._heartbeat_cancel is not None:
             self._heartbeat_cancel()
             self._heartbeat_cancel = None
@@ -244,10 +276,45 @@ class ExoMqttClient:
         # update/accepted and update/delta don't carry the full reported state
         return None
 
+    def set_interrupted_watchdog_callback(self, callback: Callable[[], None]) -> None:
+        """Register a callback invoked when resume doesn't follow an interrupt in time.
+
+        Armed on every connection interrupt and disarmed on resume.
+        """
+        self._interrupted_watchdog_callback = callback
+
+    def _arm_watchdog(self) -> None:
+        self._loop.call_soon_threadsafe(self._arm_watchdog_on_loop)
+
+    def _arm_watchdog_on_loop(self) -> None:
+        self._disarm_watchdog_on_loop()
+        handle = self._loop.call_later(_INTERRUPT_WATCHDOG_TIMEOUT, self._watchdog_fire)
+        self._watchdog_cancel = handle.cancel
+
+    def _disarm_watchdog(self) -> None:
+        self._loop.call_soon_threadsafe(self._disarm_watchdog_on_loop)
+
+    def _disarm_watchdog_on_loop(self) -> None:
+        if self._watchdog_cancel is not None:
+            self._watchdog_cancel()
+            self._watchdog_cancel = None
+
+    def _watchdog_fire(self) -> None:
+        self._watchdog_cancel = None
+        if self._connected:
+            return
+        _LOGGER.warning(
+            "MQTT connection interrupted %ss ago with no resume - forcing reconnect",
+            _INTERRUPT_WATCHDOG_TIMEOUT,
+        )
+        if self._interrupted_watchdog_callback is not None:
+            self._interrupted_watchdog_callback()
+
     def _on_connection_interrupted(self, connection, error, **kwargs):
         """Called by CRT when the connection drops."""
-        self._connected = False
+        self._set_connected(False)
         _LOGGER.warning("MQTT connection interrupted: %s", error)
+        self._arm_watchdog()
 
     def _on_connection_resumed(self, connection, return_code, session_present, **kwargs):
         """Called by CRT when the connection is re-established."""
@@ -256,7 +323,8 @@ class ExoMqttClient:
             return_code,
             session_present,
         )
-        self._connected = True
+        self._disarm_watchdog()
+        self._set_connected(True)
         # Re-subscribe since we use clean_session=True
         if self._subscribe_shadow_topics():
             self._request_shadow()
@@ -264,7 +332,7 @@ class ExoMqttClient:
             _LOGGER.warning(
                 "All subscribes failed after reconnect - credentials may have expired"
             )
-            self._connected = False
+            self._set_connected(False)
             if self._reconnect_failed_callback is not None:
                 self._loop.call_soon_threadsafe(self._reconnect_failed_callback)
 
