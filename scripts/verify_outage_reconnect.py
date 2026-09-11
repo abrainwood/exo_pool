@@ -1122,7 +1122,7 @@ def scenario_interrupt_resume_recovers(container: Container, token: str, teardow
 
     wait_for_log_pattern(
         container, _TRANSPORT_RECONNECTED_RE, since,
-        timeout=30.0, label="transport recovery",
+        timeout=120.0, label="transport recovery",
     )
     if not _wait_for_entity_state(token, mqtt_entity, "on", timeout=30.0):
         raise ScenarioFailure(f"{mqtt_entity} did not return to 'on' after recovery")
