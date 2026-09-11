@@ -20,4 +20,4 @@ custom_components/exo_pool/home-assistant*
 
 # HA writes these into the component dir; never track them
 *.log
-*.log.[0-9]
+*.log.*
