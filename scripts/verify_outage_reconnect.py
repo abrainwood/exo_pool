@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
-"""Repeatable harness for the MQTT outage-reconnect fix (issue #2 / PR #4).
+"""Drives the dev container through a simulated MQTT WAN outage.
 
-Drives the `ha-exo-pool-dev` dev container through a simulated WAN outage
-and checks that the fix in PR #4 behaves as designed: the retry chain
-re-arms itself with growing backoff instead of dying after one failed
-attempt, the exo_pool MQTT-connectivity binary_sensor (resolved at runtime -
-see resolve_mqtt_entity_id()) tracks the transport honestly, and the
-interrupt watchdog forces a reconnect if resume never arrives.
+See the README's "Verifying the MQTT outage-reconnect fix" section for
+the scenario list and what each one asserts. Requires the dev container
+from `make dev` to be running and the exo_pool integration configured.
 
 Usage:
     export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
     # Create one at http://localhost:8125/profile/security (dev / devdevdev),
     # or reuse the token scripts/dev-setup.py already saved to .dev-token.
     python3 scripts/verify_outage_reconnect.py [--skip-watchdog]
-
-Requires the dev container from `make dev` to be running and the exo_pool
-integration already configured in it. Never touches anything but the dev
-container on port 8125 - see assert_dev_instance_url().
 """
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import logging
 import os
@@ -156,6 +150,54 @@ def assert_growing_backoff(attempts: list[RetryAttempt], min_attempts: int = 3) 
             )
 
 
+# --- Interrupt/watchdog log matching (unit tested) ------------------------
+
+# The colon distinguishes the interrupt event itself from the watchdog's
+# own "interrupted Ns ago" line below, which also starts with this prefix.
+_CONNECTION_INTERRUPTED_RE = re.compile(r"MQTT connection interrupted: ")
+_WATCHDOG_FORCED_RECONNECT_RE = re.compile(
+    rf"MQTT connection interrupted {INTERRUPT_WATCHDOG_TIMEOUT}s ago with no resume"
+)
+
+
+def matches_connection_interrupted(log_text: str) -> bool:
+    return bool(_CONNECTION_INTERRUPTED_RE.search(log_text))
+
+
+def matches_watchdog_forced_reconnect(log_text: str) -> bool:
+    return bool(_WATCHDOG_FORCED_RECONNECT_RE.search(log_text))
+
+
+_CONNECTION_RESUMED_RE = re.compile(r"MQTT connection resumed")
+
+
+def matches_connection_resumed(log_text: str) -> bool:
+    return bool(_CONNECTION_RESUMED_RE.search(log_text))
+
+
+# "after reconnect" (post-resume) vs "after connect" (initial connect()) -
+# only the former means credentials went stale mid-session.
+_RESUBSCRIBE_FAILED_AFTER_RESUME_RE = re.compile(r"All subscribes failed after reconnect")
+
+
+def matches_resubscribe_failed_after_resume(log_text: str) -> bool:
+    return bool(_RESUBSCRIBE_FAILED_AFTER_RESUME_RE.search(log_text))
+
+
+_RECONNECT_FAILED_REFRESHING_RE = re.compile(r"MQTT reconnect failed - refreshing credentials")
+
+
+def matches_reconnect_failed_refreshing(log_text: str) -> bool:
+    return bool(_RECONNECT_FAILED_REFRESHING_RE.search(log_text))
+
+
+_TRANSPORT_RECONNECTED_RE = re.compile(r"MQTT connected - REST fallback interval set to")
+
+
+def matches_transport_reconnected(log_text: str) -> bool:
+    return bool(_TRANSPORT_RECONNECTED_RE.search(log_text))
+
+
 # --- Teardown (unit tested) ----------------------------------------------
 
 
@@ -175,6 +217,24 @@ class BestEffortTeardown:
                 action()
             except Exception:
                 _LOGGER.warning("Teardown action failed - continuing", exc_info=True)
+
+
+def harness_image_failure_message(error: str) -> str:
+    """Message for when the one-time harness-tools image build fails before any scenario runs.
+
+    Must read as a clear pre-flight problem, not surface later as a
+    confusing per-scenario "pull access denied" precondition failure from
+    whichever scenario happens to need the sidecar first.
+    """
+    return f"FATAL: could not prepare the harness tools image (needed by every blocking scenario): {error}"
+
+
+def recovery_failure_message(container_name: str) -> str:
+    return (
+        "The integration did NOT recover after the simulated outage. Operator "
+        f"action required: restart the dev container - `docker restart {container_name}` "
+        "or `make restart` - then verify manually that MQTT reconnects."
+    )
 
 
 # --- Scenario failure ------------------------------------------------------
@@ -228,8 +288,16 @@ class Container:
         return filter_log_lines_since(result.stdout, since_iso)
 
 
+def should_print_tick(elapsed: float, last_print: float | None, print_interval: float) -> bool:
+    """True on the first tick (immediate), or every `print_interval` seconds after that."""
+    return last_print is None or elapsed - last_print >= print_interval
+
+
 def now_utc_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+DEFAULT_PRINT_INTERVAL = 20.0
 
 
 def wait_for_log_pattern(
@@ -238,12 +306,21 @@ def wait_for_log_pattern(
     since_iso: str,
     timeout: float,
     poll_interval: float = 3.0,
+    print_interval: float = DEFAULT_PRINT_INTERVAL,
     label: str = "log pattern",
+    on_tick: Callable[[], None] | None = None,
 ) -> str:
-    """Poll container logs since `since_iso` until `pattern` is found or `timeout` elapses."""
+    """Poll container logs since `since_iso` until `pattern` is found or `timeout` elapses.
+
+    `on_tick`, if given, runs once per poll - used to top up IP blocks that
+    might rotate out from under a wait.
+    """
     deadline = time.monotonic() + timeout
     start = time.monotonic()
+    last_print: float | None = None
     while True:
+        if on_tick is not None:
+            on_tick()
         text = container.logs_since(since_iso)
         if pattern.search(text):
             return text
@@ -253,7 +330,9 @@ def wait_for_log_pattern(
                 f"timed out after {timeout:.0f}s waiting for {label}"
             )
         elapsed = time.monotonic() - start
-        print(f"  ... waiting for {label} ({elapsed:.0f}s elapsed, {remaining:.0f}s left)")
+        if should_print_tick(elapsed, last_print, print_interval):
+            print(f"  ... waiting for {label} ({elapsed:.0f}s elapsed, {remaining:.0f}s left)")
+            last_print = elapsed
         time.sleep(min(poll_interval, remaining))
 
 
@@ -313,7 +392,7 @@ def load_ha_token() -> str:
     )
 
 
-def _ha_request(method: str, path: str, token: str, data: dict | None = None) -> dict | list | None:
+def _ha_request(method: str, path: str, token: str, data: dict | None = None, timeout: float = 10.0) -> dict | list | None:
     url = f"{HA_URL}{path}"
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(
@@ -321,7 +400,7 @@ def _ha_request(method: str, path: str, token: str, data: dict | None = None) ->
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             return json.loads(raw) if raw else None
     except urllib.error.HTTPError as e:
@@ -338,6 +417,19 @@ def list_entity_ids(token: str) -> list[str]:
     return [s["entity_id"] for s in states or []]
 
 
+def find_entry_state(entries: list[dict], entry_id: str) -> str:
+    """Extract the config-entry `state` field for `entry_id` from a config_entries/entry response."""
+    for entry in entries:
+        if entry.get("entry_id") == entry_id:
+            return entry["state"]
+    raise RuntimeError(f"config entry {entry_id} not found")
+
+
+def get_entry_state(token: str, entry_id: str) -> str:
+    entries = _ha_request("GET", "/api/config/config_entries/entry", token)
+    return find_entry_state(entries or [], entry_id)
+
+
 def get_exo_pool_entry_id(token: str) -> str:
     entries = _ha_request("GET", "/api/config/config_entries/entry", token)
     for entry in entries or []:
@@ -346,8 +438,138 @@ def get_exo_pool_entry_id(token: str) -> str:
     raise RuntimeError("No exo_pool config entry found on the dev instance")
 
 
-def reload_entry(token: str, entry_id: str) -> None:
-    _ha_request("POST", f"/api/config/config_entries/entry/{entry_id}/reload", token)
+# HA's reload endpoint blocks until setup finishes or fails. Under a
+# simulated outage, setup's own internal retries can run well past a
+# typical API timeout - this is generous on purpose.
+RELOAD_TIMEOUT = 90.0
+
+
+class ReloadTimedOut(Exception):
+    """Raised when a config-entry reload doesn't return before RELOAD_TIMEOUT.
+
+    An expected outcome under a simulated outage, not a harness error.
+    """
+
+
+def reload_entry(token: str, entry_id: str, timeout: float = RELOAD_TIMEOUT) -> None:
+    try:
+        _ha_request("POST", f"/api/config/config_entries/entry/{entry_id}/reload", token, timeout=timeout)
+    except TimeoutError as e:
+        raise ReloadTimedOut(f"reload of entry {entry_id} did not return within {timeout:.0f}s") from e
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise ReloadTimedOut(f"reload of entry {entry_id} did not return within {timeout:.0f}s") from e
+        raise
+
+
+# --- Established-peer selection (unit tested) ------------------------------
+
+_SS_PEER_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d+)\s*$")
+
+
+def select_established_peer_ips(ss_output: str, port: int = 443) -> list[str]:
+    """Public IPv4 peers on `port` from `ss -tn state established` output.
+
+    The DNS-resolved pool for a rotating cloud endpoint routinely doesn't
+    contain the address a live connection is actually pinned to, so the
+    block list has to come from the real established connections instead.
+    """
+    peers: list[str] = []
+    for line in ss_output.splitlines():
+        match = _SS_PEER_RE.search(line)
+        if not match:
+            continue
+        ip, peer_port = match.group(1), int(match.group(2))
+        if peer_port != port:
+            continue
+        addr = ipaddress.ip_address(ip)
+        if addr.is_loopback or addr.is_private:
+            continue
+        if ip not in peers:
+            peers.append(ip)
+    if not peers:
+        raise RuntimeError(
+            f"no established peers on port {port} found to block; ss output was:\n"
+            f"{ss_output.strip() or '(empty)'}"
+        )
+    return peers
+
+
+# --- Netns sidecar (unit tested) ------------------------------------------
+
+# The HA image has no iptables/nft/ip - blocking traffic needs a throwaway
+# container sharing its network namespace instead.
+SIDECAR_IMAGE = "alpine:3.20"
+
+# Built once by ensure_harness_tools_image() before any outage is
+# simulated, with iptables/iproute2 already installed - so no sidecar
+# call made during or after a block ever depends on apk fetching over
+# the network that block might itself be cutting.
+HARNESS_TOOLS_IMAGE = "exo-pool-harness-tools:latest"
+
+
+def build_netns_sidecar_cmd(container_name: str, shell_cmd: str, image: str = HARNESS_TOOLS_IMAGE) -> list[str]:
+    return [
+        "docker", "run", "--rm",
+        "--network", f"container:{container_name}",
+        "--cap-add", "NET_ADMIN",
+        image, "sh", "-c", shell_cmd,
+    ]
+
+
+def ensure_harness_tools_image(
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    base_image: str = SIDECAR_IMAGE,
+    tag: str = HARNESS_TOOLS_IMAGE,
+    timeout: float = 120.0,
+) -> str:
+    """Build `tag` (iptables + iproute2 on `base_image`) if it isn't there yet.
+
+    Runs on normal networking, before any outage is simulated - idempotent,
+    so calling this from every scenario's own capability check costs
+    nothing once the image already exists.
+    """
+    inspect = runner(["docker", "image", "inspect", tag], capture_output=True, text=True, timeout=10)
+    if inspect.returncode == 0:
+        return tag
+
+    create = runner(
+        ["docker", "create", base_image, "sh", "-c", "apk add -q iptables iproute2"],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if create.returncode != 0:
+        raise RuntimeError(f"failed to create harness-tools-image builder container: {create.stderr}")
+    builder_id = create.stdout.strip()
+    try:
+        start = runner(["docker", "start", "-a", builder_id], capture_output=True, text=True, timeout=timeout)
+        if start.returncode != 0:
+            raise RuntimeError(f"failed to install tools into builder container: {start.stderr}")
+        commit = runner(["docker", "commit", builder_id, tag], capture_output=True, text=True, timeout=timeout)
+        if commit.returncode != 0:
+            raise RuntimeError(f"failed to commit {tag}: {commit.stderr}")
+    finally:
+        runner(["docker", "rm", "-f", builder_id], capture_output=True, text=True, timeout=timeout)
+    return tag
+
+
+def iptables_rule_shell_cmd(ip: str, flag: str) -> str:
+    """flag is '-I' to insert the OUTPUT DROP rule for `ip`, '-D' to remove it.
+
+    No `apk add` - runs against the prebuilt HARNESS_TOOLS_IMAGE, so this
+    never depends on a network it might itself be cutting.
+    """
+    return f"iptables {flag} OUTPUT -d {ip} -p tcp -j DROP"
+
+
+def port_block_shell_cmd(flag: str, port: int) -> str:
+    """flag is '-I' to insert an OUTPUT DROP rule for every peer on `port`, '-D' to remove it.
+
+    Blocks by port rather than by address - deterministic against a
+    rotating pool, unlike a per-IP rule that a fresh address dodges. No
+    `apk add` - runs against the prebuilt HARNESS_TOOLS_IMAGE, so removing
+    this rule never depends on the network it just cut.
+    """
+    return f"iptables {flag} OUTPUT -p tcp --dport {port} -j DROP"
 
 
 # --- Outage simulation -----------------------------------------------------
@@ -379,47 +601,296 @@ def blackhole_hosts(container: Container, teardown: BestEffortTeardown, hostname
         raise RuntimeError(f"failed to blackhole hosts in {container.name}: {append.stderr}")
 
 
-def check_net_admin_capable(container: Container) -> bool:
-    """True if the container can actually run iptables (NET_ADMIN present)."""
-    result = container.exec(["iptables", "-L", "-n"], timeout=10)
+def run_netns_sidecar(
+    container_name: str,
+    shell_cmd: str,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    timeout: float = 60.0,
+) -> subprocess.CompletedProcess:
+    return runner(build_netns_sidecar_cmd(container_name, shell_cmd), capture_output=True, text=True, timeout=timeout)
+
+
+def check_net_admin_capable(
+    container_name: str, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run
+) -> bool:
+    """True if the prebuilt harness-tools image can run iptables against `container_name`'s network.
+
+    Builds the image first (idempotent, runs on normal networking, well
+    before any outage) - so later blocking calls never depend on apk
+    fetching over a network they might be cutting.
+    """
+    try:
+        ensure_harness_tools_image(runner=runner)
+    except RuntimeError:
+        return False
+    result = run_netns_sidecar(container_name, "iptables -L -n", runner=runner, timeout=30.0)
     return result.returncode == 0
 
 
-def block_iot_endpoint_tcp(container: Container, teardown: BestEffortTeardown, endpoint: str) -> None:
-    """Drop outbound TCP to `endpoint` at the IP layer (DNS still resolves)."""
-    resolved = container.exec(["getent", "hosts", endpoint])
-    if resolved.returncode != 0 or not resolved.stdout.strip():
-        raise RuntimeError(f"could not resolve {endpoint} inside {container.name}")
-    ip = resolved.stdout.split()[0]
+def get_established_peer_ips(
+    container_name: str,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    port: int = 443,
+) -> list[str]:
+    """The container's currently-established public peers on `port`, via a netns sidecar's `ss`."""
+    result = run_netns_sidecar(container_name, "ss -tn state established", runner=runner, timeout=30.0)
+    if result.returncode != 0:
+        raise RuntimeError(f"failed to list established connections via netns sidecar: {result.stderr}")
+    return select_established_peer_ips(result.stdout, port=port)
 
-    rule = ["-I", "OUTPUT", "-d", ip, "-p", "tcp", "-j", "DROP"]
 
-    def _unblock():
-        result = container.exec(["iptables", "-D", *rule[1:]])
+def get_established_peer_ips_with_retry(
+    container_name: str,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    port: int = 443,
+    attempts: int = 3,
+    retry_delay: float = 3.0,
+) -> list[str]:
+    """get_established_peer_ips(), tolerating the peer briefly vanishing mid-reconnect."""
+    def _get_peers() -> list[str] | str:
+        try:
+            return get_established_peer_ips(container_name, runner=runner, port=port)
+        except RuntimeError as e:
+            return str(e)
+
+    return get_peers_with_retry(_get_peers, attempts=attempts, retry_delay=retry_delay)
+
+
+class IpBlockSet:
+    """Tracks iptables DROP rules added for a rotating set of IPs.
+
+    AWS IoT resolves to a pool of addresses that rotates, so a block must
+    be able to top up newly-seen IPs without losing track of what it's
+    already blocked, and unblock everything it ever added regardless of
+    when that was.
+    """
+
+    def __init__(
+        self,
+        container_name: str,
+        teardown: BestEffortTeardown,
+        runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    ) -> None:
+        self._container_name = container_name
+        self._runner = runner
+        self._blocked: dict[str, None] = {}
+        teardown.defer(self._unblock_all)
+
+    def add(self, ip: str) -> None:
+        if ip in self._blocked:
+            return
+        result = run_netns_sidecar(self._container_name, iptables_rule_shell_cmd(ip, "-I"), runner=self._runner)
         if result.returncode != 0:
-            raise RuntimeError(f"failed to remove iptables DROP rule for {ip}: {result.stderr}")
-        _LOGGER.info("Removed iptables DROP rule for %s in %s", ip, container.name)
+            raise RuntimeError(f"failed to add iptables DROP rule for {ip}: {result.stderr}")
+        self._blocked[ip] = None
+        print(f"Blocked {ip} via netns sidecar")
+
+    def top_up(self, ips: list[str]) -> list[str]:
+        """Add rules for any of `ips` not already blocked; returns the newly-added ones."""
+        added = [ip for ip in ips if ip not in self._blocked]
+        for ip in added:
+            self.add(ip)
+        return added
+
+    def _unblock_all(self) -> None:
+        errors = []
+        for ip in list(self._blocked):
+            result = run_netns_sidecar(self._container_name, iptables_rule_shell_cmd(ip, "-D"), runner=self._runner)
+            if result.returncode != 0:
+                errors.append(f"{ip}: {result.stderr}")
+            else:
+                del self._blocked[ip]
+        if errors:
+            raise RuntimeError(f"failed to remove {len(errors)} iptables DROP rule(s): {'; '.join(errors)}")
+
+
+def _default_abort(message: str) -> None:
+    print("\n" + "!" * 70)
+    print(message)
+    print("!" * 70 + "\n")
+    sys.exit(1)
+
+
+def unblock_port_or_abort(
+    container_name: str,
+    port: int,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    attempts: int = 3,
+    retry_delay: float = 5.0,
+    sleep: Callable[[float], None] = lambda s: time.sleep(s),
+    abort: Callable[[str], None] = _default_abort,
+) -> None:
+    """Retry removing the total-outage DROP rule; abort the run rather than
+    continue if it's still there after all attempts.
+
+    Unlike a hosts entry or a single blocked address, this rule severs all
+    outbound traffic on `port` - BestEffortTeardown's continue-past-failure
+    is exactly wrong here, since a run that carries on with the rule still
+    up leaves the dev container permanently unreachable on that port.
+    """
+    last_error = ""
+    for attempt in range(attempts):
+        result = run_netns_sidecar(container_name, port_block_shell_cmd("-D", port), runner=runner)
+        if result.returncode == 0:
+            print(f"Unblocked outbound TCP port {port} via netns sidecar")
+            return
+        last_error = result.stderr
+        if attempt < attempts - 1:
+            sleep(retry_delay)
+    abort(
+        f"Could not remove the port-{port} outbound DROP rule after {attempts} attempts "
+        f"({last_error}). The dev container has NO outbound TCP on this port. "
+        f"Operator action required: `docker restart {CONTAINER_NAME}` clears it."
+    )
+
+
+def block_port_total_outage(
+    container_name: str,
+    teardown: BestEffortTeardown,
+    port: int = 443,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> None:
+    """Block every outbound connection on `port`, deterministically - by
+    port rather than by address, so a rotating pool can't dodge it the way
+    per-IP blocking can.
+
+    Before committing, proves the *unblock path itself* still works (a
+    harmless `iptables -L -n` over the same sidecar) - the property that
+    matters is not whether the harness can still reach HA (a different port
+    and direction the block never touches), but whether this block can
+    still be undone. Rolls back immediately if it can't.
+    """
+    def _unblock() -> None:
+        unblock_port_or_abort(container_name, port, runner=runner)
+
+    add = run_netns_sidecar(container_name, port_block_shell_cmd("-I", port), runner=runner)
+    if add.returncode != 0:
+        raise RuntimeError(f"failed to add port-{port} DROP rule: {add.stderr}")
+    print(f"Blocked outbound TCP port {port} via netns sidecar (total outage)")
 
     teardown.defer(_unblock)
 
-    add = container.exec(["iptables", *rule])
-    if add.returncode != 0:
-        raise RuntimeError(f"failed to add iptables DROP rule for {ip}: {add.stderr}")
+    verify = run_netns_sidecar(container_name, "iptables -L -n", runner=runner, timeout=15.0)
+    if verify.returncode != 0:
+        teardown.run()
+        raise RuntimeError(
+            f"could not verify the port-{port} block can be undone "
+            f"(sidecar iptables -L -n failed) - rolled back: {verify.stderr}"
+        )
+
+
+# --- Scenario precondition (unit tested) -----------------------------------
+
+
+def precondition_met(sensor_state: str, peer_ips: list[str] | None) -> bool:
+    """True only if the sensor reads 'on' AND an established peer actually exists.
+
+    A sensor reading 'on' with no established peer is a looks-healthy-but-isn't
+    gap - both must hold.
+    """
+    return sensor_state == "on" and bool(peer_ips)
+
+
+def wait_for_healthy_precondition(
+    get_sensor_state: Callable[[], str],
+    get_peers: Callable[[], list[str] | str],
+    reload: Callable[[], None],
+    max_polls: int = 12,
+    sleep: Callable[[float], None] = lambda s: time.sleep(s),
+    poll_interval: float = 5.0,
+) -> list[str]:
+    """Poll until precondition_met holds, reloading once and retrying if it never does.
+
+    Returns the validated peer list - callers should block those peers
+    directly rather than re-querying a moment later, since a fresh query can
+    race a reconnect still in flight and find nothing.
+
+    `get_peers` returns either the peer list or an error-detail string (from
+    a failed peer check) - either way it's surfaced in the failure message,
+    since "no peers found" alone doesn't say why.
+    """
+    last_sensor_state = ""
+    last_peers: list[str] | str = []
+    for attempt in (1, 2):
+        for _ in range(max_polls):
+            last_sensor_state = get_sensor_state()
+            last_peers = get_peers()
+            peers = last_peers if isinstance(last_peers, list) else None
+            if precondition_met(last_sensor_state, peers):
+                return peers
+            sleep(poll_interval)
+        if attempt == 1:
+            reload()
+    raise ScenarioFailure(
+        f"precondition not met after reload-and-retry: sensor={last_sensor_state!r}, peers={last_peers!r}"
+    )
+
+
+def get_peers_with_retry(
+    get_peers: Callable[[], list[str] | str],
+    attempts: int = 3,
+    sleep: Callable[[float], None] = lambda s: time.sleep(s),
+    retry_delay: float = 3.0,
+) -> list[str]:
+    """Retry a peer lookup a few times before giving up.
+
+    A peer vanishing for one query is a normal reconnect in flight, not a
+    fatal condition - only give up once it's still gone after retrying.
+    """
+    last_result: list[str] | str = []
+    for attempt in range(attempts):
+        last_result = get_peers()
+        if isinstance(last_result, list) and last_result:
+            return last_result
+        if attempt < attempts - 1:
+            sleep(retry_delay)
+    detail = last_result if isinstance(last_result, str) else "no peers found"
+    raise RuntimeError(detail)
+
+
+def ensure_scenario_precondition(
+    token: str, entry_id: str, mqtt_entity: str, container_name: str, timeout: float = 60.0
+) -> list[str]:
+    """Real-run wrapper: every scenario calls this before doing anything destructive.
+
+    A prior scenario's failure - this run or a previous one - must not
+    silently poison the ones after it. Returns the validated peer list - use
+    it directly for the scenario's first block rather than re-querying, since
+    a fresh query a moment later can race a reconnect still in flight.
+    """
+    def _get_peers() -> list[str] | str:
+        try:
+            return get_established_peer_ips(container_name)
+        except RuntimeError as e:
+            return str(e)
+
+    return wait_for_healthy_precondition(
+        get_sensor_state=lambda: get_entity_state(token, mqtt_entity),
+        get_peers=_get_peers,
+        reload=lambda: _reload_ignoring_timeout(token, entry_id),
+        max_polls=max(1, int(timeout // 5)),
+    )
+
+
+def _reload_ignoring_timeout(token: str, entry_id: str) -> None:
+    try:
+        reload_entry(token, entry_id)
+    except ReloadTimedOut:
+        pass
 
 
 # --- Scenarios ---------------------------------------------------------
 
 
-def scenario_baseline(token: str, mqtt_entity: str) -> None:
-    state = get_entity_state(token, mqtt_entity)
-    if state != "on":
-        raise ScenarioFailure(f"{mqtt_entity} baseline is {state!r}, expected 'on'")
-    print(f"PASS baseline: {mqtt_entity} is on")
+def scenario_baseline(token: str, entry_id: str, mqtt_entity: str, container: Container) -> None:
+    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
+    print(f"PASS baseline: {mqtt_entity} is on with an established MQTT peer")
 
 
 def _wait_for_min_retry_attempts(container: Container, since: str, min_attempts: int, timeout: float) -> list[RetryAttempt]:
     deadline = time.monotonic() + timeout
     start = time.monotonic()
+    last_print: float | None = None
     attempts: list[RetryAttempt] = []
     while True:
         attempts = parse_retry_attempts(container.logs_since(since))
@@ -429,36 +900,124 @@ def _wait_for_min_retry_attempts(container: Container, since: str, min_attempts:
         if remaining <= 0:
             return attempts
         elapsed = time.monotonic() - start
-        print(
-            f"  ... waiting for {min_attempts} retry re-arms, have {len(attempts)} "
-            f"({elapsed:.0f}s elapsed, {remaining:.0f}s left)"
-        )
+        if should_print_tick(elapsed, last_print, DEFAULT_PRINT_INTERVAL):
+            print(
+                f"  ... waiting for {min_attempts} retry re-arms, have {len(attempts)} "
+                f"({elapsed:.0f}s elapsed, {remaining:.0f}s left)"
+            )
+            last_print = elapsed
         time.sleep(min(5, remaining))
 
 
-def _assert_backoff_reset_to_base(container: Container, token: str, entry_id: str, teardown: BestEffortTeardown) -> RetryAttempt:
-    since = now_utc_iso()
-    blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
-    reload_entry(token, entry_id)
-    wait_for_log_pattern(
-        container, _RETRY_ATTEMPT_RE, since,
-        timeout=60.0, label="post-recovery retry attempt",
-    )
-    attempts = parse_retry_attempts(container.logs_since(since))
-    if not attempts or attempts[0].delay > MQTT_RETRY_BASE_DELAY * 1.5:
-        raise ScenarioFailure(
-            f"backoff did not reset to base after recovery: first post-recovery "
-            f"attempt was {attempts[0] if attempts else 'missing'}"
+def _wait_for_entity_state(token: str, entity_id: str, expected: str, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    start = time.monotonic()
+    last_print: float | None = None
+    while True:
+        state = get_entity_state(token, entity_id)
+        if state == expected:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        elapsed = time.monotonic() - start
+        if should_print_tick(elapsed, last_print, DEFAULT_PRINT_INTERVAL):
+            print(
+                f"  ... waiting for {entity_id} to be {expected!r}, currently {state!r} "
+                f"({elapsed:.0f}s elapsed, {remaining:.0f}s left)"
+            )
+            last_print = elapsed
+        time.sleep(min(5, remaining))
+
+
+def _wait_for_entry_state_not_loaded(token: str, entry_id: str, timeout: float) -> str:
+    deadline = time.monotonic() + timeout
+    start = time.monotonic()
+    last_print: float | None = None
+    while True:
+        state = get_entry_state(token, entry_id)
+        if state != "loaded":
+            return state
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return state
+        elapsed = time.monotonic() - start
+        if should_print_tick(elapsed, last_print, DEFAULT_PRINT_INTERVAL):
+            print(f"  ... waiting for setup to fail under outage, still 'loaded' ({elapsed:.0f}s elapsed, {remaining:.0f}s left)")
+            last_print = elapsed
+        time.sleep(min(5, remaining))
+
+
+def _safe_top_up(block_set: IpBlockSet, container_name: str) -> None:
+    """Top up newly-seen peers, tolerating a transient empty state.
+
+    Once blocking has actually taken effect there may genuinely be nothing
+    established at the instant of a given poll - that's the point of the
+    block, not a failure to report.
+    """
+    try:
+        new_ips = get_established_peer_ips(container_name)
+    except RuntimeError:
+        return
+    added = block_set.top_up(new_ips)
+    if added:
+        print(f"Topped up newly-seen peer(s): {added}")
+
+
+def _enter_retry_chain_from_connected(container: Container, since: str, peers: list[str] | None = None) -> None:
+    """Force entry into _async_refresh_and_reconnect from an already-connected state.
+
+    Blocks `peers` if given (a caller-validated list, to avoid re-querying
+    and racing a reconnect in flight), else resolves its own. Tops up any
+    newly-rotated-in peers while waiting. Waits for the retry chain's own
+    first attempt rather than the watchdog specifically, since either
+    forcing path gets there. Needs NET_ADMIN - callers must check
+    check_net_admin_capable() first.
+    """
+    if peers is None:
+        peers = get_established_peer_ips_with_retry(container.name)
+    interrupt_teardown = BestEffortTeardown()
+    block_set = IpBlockSet(container.name, interrupt_teardown)
+    for ip in peers:
+        block_set.add(ip)
+
+    def _top_up() -> None:
+        _safe_top_up(block_set, container.name)
+
+    try:
+        wait_for_log_pattern(
+            container, _CONNECTION_INTERRUPTED_RE, since,
+            timeout=60.0, label="connection interrupt", on_tick=_top_up,
         )
-    return attempts[0]
+        wait_for_log_pattern(
+            container, _RETRY_ATTEMPT_RE, since,
+            timeout=INTERRUPT_WATCHDOG_TIMEOUT + 60.0,
+            label="retry chain entry (watchdog or resubscribe-failure)",
+            on_tick=_top_up,
+        )
+    finally:
+        interrupt_teardown.run()
 
 
-def scenario_outage_and_recovery(container: Container, token: str, teardown: BestEffortTeardown, mqtt_entity: str) -> None:
-    entry_id = get_exo_pool_entry_id(token)
+def scenario_reconnect_from_connected(container: Container, token: str, teardown: BestEffortTeardown, entry_id: str, mqtt_entity: str) -> bool | None:
+    """MQTT is connected, the network dies underneath it, and the retry
+    chain must re-arm and keep going."""
+    if not check_net_admin_capable(container.name):
+        print(
+            "SKIP reconnect-from-connected: could not run iptables against the dev "
+            "container's network via a netns sidecar - cannot force an "
+            "already-established MQTT connection to interrupt, and the fix's own "
+            "credential-refresh timer is up to ~55 minutes away, too long to wait on. "
+            "Needs `docker run` access and network access to pull the sidecar image "
+            "and its iptables package."
+        )
+        return None
+
+    peers = ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
+
     since = now_utc_iso()
-
     blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
-    reload_entry(token, entry_id)
+    _enter_retry_chain_from_connected(container, since, peers=peers)
 
     attempts = _wait_for_min_retry_attempts(container, since, min_attempts=3, timeout=210.0)
     assert_growing_backoff(attempts)
@@ -470,46 +1029,197 @@ def scenario_outage_and_recovery(container: Container, token: str, teardown: Bes
     print(f"PASS sensor flip: {mqtt_entity} is off during outage")
 
     next_wait_cap = attempts[-1].delay if attempts else MQTT_RETRY_BASE_DELAY
-    teardown.run()
+    teardown.run()  # restore DNS - the already-scheduled retry chain keeps running on its own timer
 
     wait_for_log_pattern(
-        container, re.compile(r"MQTT connected - REST fallback interval set to"), since,
+        container, _TRANSPORT_RECONNECTED_RE, since,
         timeout=next_wait_cap * 2 + 60,
         label="reconnect after DNS recovery",
     )
-    recovered_state = get_entity_state(token, mqtt_entity)
-    if recovered_state != "on":
-        raise ScenarioFailure(f"{mqtt_entity} did not return to 'on' after recovery (state={recovered_state!r})")
+    if not _wait_for_entity_state(token, mqtt_entity, "on", timeout=30.0):
+        raise ScenarioFailure(f"{mqtt_entity} did not return to 'on' after recovery")
     print("PASS recovery: reconnected and sensor back on")
 
-    reset_attempt = _assert_backoff_reset_to_base(container, token, entry_id, teardown)
-    print(f"PASS backoff reset to base: {reset_attempt}")
+    # _reset_mqtt_retry_backoff doesn't log, so proving it fired means
+    # forcing one more failure and reading the first delay back off it.
+    reset_since = now_utc_iso()
+    blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
+    _enter_retry_chain_from_connected(container, reset_since)
+    reset_attempts = _wait_for_min_retry_attempts(container, reset_since, min_attempts=1, timeout=60.0)
+    if not reset_attempts or reset_attempts[0].delay > MQTT_RETRY_BASE_DELAY * 1.5:
+        raise ScenarioFailure(
+            f"backoff did not reset to base after recovery: first post-recovery "
+            f"attempt was {reset_attempts[0] if reset_attempts else 'missing'}"
+        )
+    print(f"PASS backoff reset to base: {reset_attempts[0]}")
+
     teardown.run()
+    wait_for_log_pattern(
+        container, _TRANSPORT_RECONNECTED_RE, reset_since,
+        timeout=MQTT_RETRY_BASE_DELAY * 2 + 60,
+        label="reconnect after second DNS recovery",
+    )
+    if not _wait_for_entity_state(token, mqtt_entity, "on", timeout=30.0):
+        raise ScenarioFailure(f"{mqtt_entity} did not return to 'on' after the reset-check outage")
+    return True
 
 
-def scenario_watchdog(container: Container, token: str, teardown: BestEffortTeardown) -> bool | None:
-    """Returns True on pass, False on failure, None if skipped (no NET_ADMIN)."""
-    if not check_net_admin_capable(container):
+def scenario_interrupt_resume_recovers(container: Container, token: str, teardown: BestEffortTeardown, entry_id: str, mqtt_entity: str) -> bool | None:
+    """The common transient-blip path, distinct from the rare watchdog one:
+    the connection drops, the CRT resumes via a different address within
+    seconds, the resubscribe fails on stale credentials, and the fix forces
+    a refresh to recover.
+
+    Blocks only the connection's actual current peer(s), not the whole
+    rotating pool - unlike scenario_reconnect_from_connected and
+    scenario_watchdog, this scenario wants resume to succeed quickly via
+    some other address, not be prevented.
+    """
+    if not check_net_admin_capable(container.name):
         print(
-            "SKIP watchdog: container lacks NET_ADMIN (or iptables) - cannot "
-            "block traffic at the IP/TCP layer. Run with --privileged or "
-            "cap-add=NET_ADMIN on the dev container to exercise this scenario."
+            "SKIP interrupt-resume-recovers: could not run iptables against the "
+            "dev container's network via a netns sidecar - cannot force a brief "
+            "interrupt. Needs `docker run` access and network access to pull the "
+            "sidecar image and its iptables package."
         )
         return None
 
+    peers = ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
+
     since = now_utc_iso()
-    block_iot_endpoint_tcp(container, teardown, IOT_ENDPOINT)
+    block_set = IpBlockSet(container.name, teardown)
+    for ip in peers:
+        block_set.add(ip)
 
     wait_for_log_pattern(
-        container, re.compile(r"MQTT connection interrupted"), since,
+        container, _CONNECTION_INTERRUPTED_RE, since,
+        timeout=60.0, label="connection interrupt",
+    )
+    print("PASS interrupt: MQTT connection interrupted")
+
+    wait_for_log_pattern(
+        container, _CONNECTION_RESUMED_RE, since,
+        timeout=60.0, label="connection resume via another address",
+    )
+    print("PASS resume: MQTT connection resumed")
+
+    wait_for_log_pattern(
+        container, _RESUBSCRIBE_FAILED_AFTER_RESUME_RE, since,
+        timeout=30.0, label="resubscribe failure after resume",
+    )
+    print("PASS resubscribe fails after resume: credentials treated as possibly stale")
+
+    wait_for_log_pattern(
+        container, _RECONNECT_FAILED_REFRESHING_RE, since,
+        timeout=10.0, label="forced credential refresh triggered",
+    )
+    print("PASS forced credential refresh triggered")
+
+    wait_for_log_pattern(
+        container, _TRANSPORT_RECONNECTED_RE, since,
+        timeout=120.0, label="transport recovery",
+    )
+    if not _wait_for_entity_state(token, mqtt_entity, "on", timeout=30.0):
+        raise ScenarioFailure(f"{mqtt_entity} did not return to 'on' after recovery")
+    print("PASS recovery: reconnected via forced credential refresh")
+
+    teardown.run()
+    return True
+
+
+def _ensure_recovered(token: str, entry_id: str, mqtt_entity: str) -> bool:
+    """Land the integration back in a working state, reloading if needed.
+
+    Called unconditionally at the end of every run, not just on scenario
+    success - a harness that can leave the integration dead is worse than
+    no harness.
+    """
+    if _wait_for_entity_state(token, mqtt_entity, "on", timeout=30.0):
+        return True
+    for attempt in (1, 2):
+        _reload_ignoring_timeout(token, entry_id)
+        if _wait_for_entity_state(token, mqtt_entity, "on", timeout=120.0):
+            return True
+    return False
+
+
+def scenario_setup_under_outage(container: Container, token: str, teardown: BestEffortTeardown, entry_id: str, mqtt_entity: str) -> bool | None:
+    """Pins what happens when the entry is reloaded while the network is down.
+
+    This is a different code path from scenario_reconnect_from_connected: a
+    reload re-runs setup (get_coordinator -> _connect_mqtt), never
+    _async_refresh_and_reconnect, so it can't be used to test the fix's
+    retry chain - only to pin setup's own behaviour under an outage. Returns
+    True on pass, None if skipped (no NET_ADMIN for the total outbound block).
+    """
+    if not check_net_admin_capable(container.name):
+        print(
+            "SKIP setup-under-outage: could not run iptables against the dev "
+            "container's network via a netns sidecar - cannot make the API "
+            "genuinely unreachable (an /etc/hosts blackhole alone lets a "
+            "pooled connection let setup complete anyway). Needs `docker run` "
+            "access and network access to pull the sidecar image and its "
+            "iptables package."
+        )
+        return None
+
+    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
+
+    # /etc/hosts only stops *new* DNS resolution - a pooled/keepalive
+    # connection can still let setup complete, so pair it with a total
+    # outbound block to make the API genuinely unreachable.
+    blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
+    block_port_total_outage(container.name, teardown)
+
+    try:
+        reload_entry(token, entry_id)
+        outcome = "the reload call returned"
+    except ReloadTimedOut:
+        outcome = "the reload call timed out"
+    print(f"{outcome} - checking the entry's actual state under the outage")
+
+    entry_state = _wait_for_entry_state_not_loaded(token, entry_id, timeout=RELOAD_TIMEOUT)
+    if entry_state == "loaded":
+        raise ScenarioFailure("setup succeeded despite the simulated outage - expected it to fail")
+    print(f"PASS setup fails under outage: entry state is {entry_state!r}")
+
+    teardown.run()
+    if not _ensure_recovered(token, entry_id, mqtt_entity):
+        raise ScenarioFailure(recovery_failure_message(CONTAINER_NAME))
+    print("PASS recovery: entry reloaded and MQTT back on after DNS restored")
+    return True
+
+
+def scenario_watchdog(container: Container, token: str, teardown: BestEffortTeardown, entry_id: str, mqtt_entity: str) -> bool | None:
+    """The rare path: no address works at all, so resume never comes and
+    the fix's own INTERRUPT_WATCHDOG_TIMEOUT has to force the reconnect
+    itself. Needs a guaranteed no-resume window, so this blocks by port
+    (block_port_total_outage), not by address - per-IP blocking degenerates
+    into scenario_interrupt_resume_recovers as the CRT dodges onto a fresh
+    address faster than a top-up can chase it. Returns True on pass, False
+    on failure, None if skipped (no NET_ADMIN).
+    """
+    if not check_net_admin_capable(container.name):
+        print(
+            "SKIP watchdog: could not run iptables against the dev container's "
+            "network via a netns sidecar - cannot block traffic at the IP/TCP "
+            "layer. Needs `docker run` access and network access to pull the "
+            "sidecar image and its iptables package."
+        )
+        return None
+
+    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
+
+    since = now_utc_iso()
+    block_port_total_outage(container.name, teardown)
+
+    wait_for_log_pattern(
+        container, _CONNECTION_INTERRUPTED_RE, since,
         timeout=60.0, label="connection interrupt",
     )
     wait_for_log_pattern(
-        container,
-        re.compile(rf"MQTT connection interrupted {INTERRUPT_WATCHDOG_TIMEOUT}s ago with no resume"),
-        since,
-        timeout=INTERRUPT_WATCHDOG_TIMEOUT + 60,
-        label="watchdog-forced reconnect",
+        container, _WATCHDOG_FORCED_RECONNECT_RE, since,
+        timeout=INTERRUPT_WATCHDOG_TIMEOUT + 60, label="watchdog-forced reconnect",
     )
     print("PASS watchdog: forced reconnect after interrupt with no resume")
     teardown.run()
@@ -537,8 +1247,18 @@ def main() -> int:
 
     try:
         mqtt_entity = resolve_mqtt_entity_id(list_entity_ids(token))
+        entry_id = get_exo_pool_entry_id(token)
     except (MqttEntityResolutionError, RuntimeError) as e:
-        print(f"FATAL: could not resolve the exo_pool MQTT-connectivity entity: {e}")
+        print(f"FATAL: could not resolve the exo_pool entity/entry: {e}")
+        return 1
+
+    # Built once, before any scenario - scenario_baseline's own precondition
+    # is the first sidecar call of a run and must not be the one discovering
+    # the image doesn't exist yet.
+    try:
+        ensure_harness_tools_image()
+    except RuntimeError as e:
+        print(harness_image_failure_message(str(e)))
         return 1
 
     results: dict[str, str] = {}
@@ -552,35 +1272,69 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    def _recover_between_scenarios() -> None:
+        # A scenario's own failure - this run or a previous one - must not
+        # silently poison the ones after it; each scenario's own
+        # ensure_scenario_precondition() call retries too, but landing back
+        # in a known-good state here keeps that retry cheap.
+        teardown.run()
+        if not _ensure_recovered(token, entry_id, mqtt_entity):
+            print("WARNING: could not recover between scenarios - the next one's own precondition wait will retry")
+
     try:
         try:
-            scenario_baseline(token, mqtt_entity)
+            scenario_baseline(token, entry_id, mqtt_entity, container)
             results["baseline"] = "PASS"
         except (ScenarioFailure, AssertionError, RuntimeError) as e:
             results["baseline"] = f"FAIL: {e}"
+        _recover_between_scenarios()
 
-        if results["baseline"] == "PASS":
-            try:
-                scenario_outage_and_recovery(container, token, teardown, mqtt_entity)
-                results["outage_and_recovery"] = "PASS"
-            except (ScenarioFailure, AssertionError, RuntimeError) as e:
-                results["outage_and_recovery"] = f"FAIL: {e}"
+        try:
+            outcome = scenario_reconnect_from_connected(container, token, teardown, entry_id, mqtt_entity)
+            results["reconnect_from_connected"] = "PASS" if outcome else (
+                "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
+            )
+        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+            results["reconnect_from_connected"] = f"FAIL: {e}"
+        _recover_between_scenarios()
 
-            if args.skip_watchdog:
-                results["watchdog"] = "SKIP (--skip-watchdog)"
-            else:
-                try:
-                    outcome = scenario_watchdog(container, token, teardown)
-                    results["watchdog"] = "PASS" if outcome else (
-                        "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
-                    )
-                except (ScenarioFailure, AssertionError, RuntimeError) as e:
-                    results["watchdog"] = f"FAIL: {e}"
+        try:
+            outcome = scenario_interrupt_resume_recovers(container, token, teardown, entry_id, mqtt_entity)
+            results["interrupt_resume_recovers"] = "PASS" if outcome else (
+                "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
+            )
+        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+            results["interrupt_resume_recovers"] = f"FAIL: {e}"
+        _recover_between_scenarios()
+
+        try:
+            outcome = scenario_setup_under_outage(container, token, teardown, entry_id, mqtt_entity)
+            results["setup_under_outage"] = "PASS" if outcome else (
+                "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
+            )
+        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+            results["setup_under_outage"] = f"FAIL: {e}"
+        _recover_between_scenarios()
+
+        if args.skip_watchdog:
+            results["watchdog"] = "SKIP (--skip-watchdog)"
         else:
-            results["outage_and_recovery"] = "SKIP (baseline unhealthy)"
-            results["watchdog"] = "SKIP (baseline unhealthy)"
+            try:
+                outcome = scenario_watchdog(container, token, teardown, entry_id, mqtt_entity)
+                results["watchdog"] = "PASS" if outcome else (
+                    "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
+                )
+            except (ScenarioFailure, AssertionError, RuntimeError) as e:
+                results["watchdog"] = f"FAIL: {e}"
     finally:
         teardown.run()
+        if _ensure_recovered(token, entry_id, mqtt_entity):
+            results["recovery"] = "PASS"
+        else:
+            print("\n" + "!" * 70)
+            print(recovery_failure_message(CONTAINER_NAME))
+            print("!" * 70 + "\n")
+            results["recovery"] = "FAIL"
 
     print("\n--- Summary ---")
     failed = False

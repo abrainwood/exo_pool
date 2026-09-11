@@ -210,8 +210,42 @@ Tests are isolated from Home Assistant - no HA installation required to run them
 ### Verifying the MQTT outage-reconnect fix
 
 `scripts/verify_outage_reconnect.py` drives the running dev container through
-a simulated WAN outage and checks the retry/backoff/watchdog behaviour end to
-end - only ever against `ha-exo-pool-dev` on port 8125, never a live instance.
+a simulated WAN outage - only ever against `ha-exo-pool-dev` on port 8125,
+never a live instance. It runs four scenarios:
+
+- **reconnect-from-connected** (issue #2's actual reproduction): MQTT is
+  connected, every one of its actual established peers is blocked (and
+  topped up if it reconnects to a new one mid-test), and the fix's retry
+  chain must re-arm with growing backoff and recover.
+- **interrupt-resume-recovers**: the common case - only the connection's
+  current peer(s) are blocked, the CRT resumes via another address within
+  seconds, the resubscribe fails on stale credentials, and the fix forces a
+  refresh to recover.
+- **watchdog**: the rare case - a total outbound block on port 443 (not by
+  address) keeps resume from ever succeeding, so the fix's own interrupt
+  watchdog has to force the reconnect itself after 180s.
+- **setup-under-outage**: the same total outbound block, paired with the
+  `/etc/hosts` blackhole, while the config entry is reloaded - a different
+  code path (setup, not the reconnect chain) - and pins what that does,
+  including recovery once the outage clears.
+
+Two blocking mechanisms, deliberately not unified: reconnect-from-connected
+and interrupt-resume-recovers block by address - read from the container's
+actual established TCP connections (`ss -tn state established`, filtered
+to public, non-loopback peers on port 443), not a fresh DNS lookup, since
+AWS IoT's endpoint rotates continuously and a connection from a few minutes
+earlier is routinely pinned to an address no longer in the current DNS
+answer. That's also the more realistic simulation of a partial network
+failure, which is what those two scenarios model. watchdog and
+setup-under-outage need a *guaranteed* outage instead - blocking every
+address found doesn't survive the CRT reconnecting to a fresh one faster
+than the block can chase it - so they block by port
+(`iptables -p tcp --dport 443 -j DROP`) instead: deterministic regardless
+of which address gets used next, with a single rule to add and remove
+rather than a growing set. This harness can't be made fully deterministic
+against a rotating cloud endpoint; reading the actual peer (or blocking by
+port where an address list can't keep up) is what makes it reliable rather
+than lucky.
 
 ```bash
 export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
@@ -220,9 +254,36 @@ export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
 python3 scripts/verify_outage_reconnect.py
 ```
 
-The watchdog scenario needs `NET_ADMIN` on the container to block traffic
-with iptables; it's skipped with a clear message if that's unavailable, or
-pass `--skip-watchdog` to skip it deliberately.
+All four scenarios need to block traffic and inspect connections, which
+the HA dev image has no tools for. They run a sidecar (`docker run
+--network container:ha-exo-pool-dev --cap-add NET_ADMIN ...`) that shares
+the dev container's network namespace instead - no changes to the dev
+container itself, so no recreate needed. The sidecar uses a local image
+(built once, on normal networking, before any outage - `docker create` +
+`apk add iptables iproute2` + `docker commit`, reused after that) rather
+than installing those packages fresh on every call. That's not just an
+optimisation: the port-based total block cuts all outbound HTTPS,
+including the port `apk add` itself needs, so a sidecar call that tries to
+install packages *during* that block can't ever remove it - it fetches
+over the exact port it's supposed to be undoing. Removing the `apk add`
+dependency entirely is what makes teardown actually work. The total-block
+scenarios also verify the *removal* path specifically (a harmless
+`iptables -L -n` right after the block goes up) before relying on it, and
+if a rule still can't be removed after a few retries, the run aborts
+immediately with the exact command to run by hand
+(`docker restart ha-exo-pool-dev`) rather than continuing into a broken
+state. It does need `docker run` access and network access to build the
+image once. Each scenario skips with a clear message if that's
+unavailable; pass `--skip-watchdog` to skip the watchdog one deliberately.
+
+Every scenario is independent: before doing anything destructive it waits
+for `binary_sensor.exo_pool_mqtt_connected` to be `on` *and* an established
+MQTT peer to actually exist, reloading the entry once and retrying if
+either isn't there yet - so a failure anywhere (this run or a stale state
+left over from a previous one) can't cascade into failing every scenario
+after it. The harness also guarantees the integration is left working when
+it exits, reloading the entry if needed - if it can't get MQTT back on, it
+says so loudly and tells you to restart the dev container.
 
 ---
 
