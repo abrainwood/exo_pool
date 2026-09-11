@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -96,6 +97,23 @@ async def test_full_login_does_not_log_any_secret_value(hass, entry, caplog):
         assert secret not in log_text
 
 
+async def test_full_login_auth_failure_does_not_log_or_raise_with_a_secret_value(
+    hass, entry, caplog
+):
+    session = _FakeSession(
+        _FakeResponse(401, {"message": "Invalid credentials", "password": "hunter2"})
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(Exception) as exc_info:
+            await api._full_login(hass, entry, session)
+
+    assert "hunter2" not in caplog.text
+    assert "hunter2" not in str(exc_info.value)
+    assert "Invalid credentials" in caplog.text
+    assert "Invalid credentials" in str(exc_info.value)
+
+
 async def test_async_update_data_does_not_log_even_a_truncated_prefix_of_the_refreshed_id_token(
     hass, entry, monkeypatch, caplog
 ):
@@ -122,6 +140,66 @@ async def test_async_update_data_does_not_log_even_a_truncated_prefix_of_the_ref
     assert new_id_token[:10] not in caplog.text
 
 
+async def test_async_update_data_read_429_does_not_log_a_secret_shaped_body_value(
+    hass, monkeypatch, caplog
+):
+    fresh_entry = MockConfigEntry(
+        domain=api.DOMAIN,
+        data={
+            "serial_number": "JT00000000",
+            "id_token": "id-tok-abc123",
+            "expires_at": time.time() + 3600,
+        },
+        options={},
+    )
+    fresh_entry.add_to_hass(hass)
+    api._get_entry_store(hass, fresh_entry)
+
+    session = _FakeSession(
+        _FakeResponse(429, {"message": "Too Many Requests", "id_token": "id-tok-abc123"})
+    )
+    monkeypatch.setattr(
+        api.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        await api.async_update_data(hass, fresh_entry)
+
+    assert "id-tok-abc123" not in caplog.text
+
+
+async def test_async_update_data_fetch_failure_does_not_log_or_raise_with_a_secret_value(
+    hass, monkeypatch, caplog
+):
+    fresh_entry = MockConfigEntry(
+        domain=api.DOMAIN,
+        data={
+            "serial_number": "JT00000000",
+            "id_token": "id-tok-abc123",
+            "expires_at": time.time() + 3600,
+        },
+        options={},
+    )
+    fresh_entry.add_to_hass(hass)
+    api._get_entry_store(hass, fresh_entry)
+
+    session = _FakeSession(
+        _FakeResponse(403, {"message": "Forbidden", "id_token": "id-tok-abc123"})
+    )
+    monkeypatch.setattr(
+        api.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(api.UpdateFailed) as exc_info:
+            await api.async_update_data(hass, fresh_entry)
+
+    assert "id-tok-abc123" not in caplog.text
+    assert "id-tok-abc123" not in str(exc_info.value)
+    assert "Forbidden" in caplog.text
+    assert "Forbidden" in str(exc_info.value)
+
+
 async def test_write_rate_limited_response_does_not_log_a_secret_shaped_body_value(
     hass, entry, monkeypatch, caplog
 ):
@@ -139,10 +217,37 @@ async def test_write_rate_limited_response_does_not_log_a_secret_shaped_body_val
     item = api._WriteItem(kind="pool", key="pool:filter_pump", target="filter_pump", payload={})
 
     with caplog.at_level(logging.DEBUG):
-        with pytest.raises(Exception):
+        with pytest.raises(Exception) as exc_info:
             await api._execute_write_rest(hass, entry, item, {"filter_pump": {}})
 
     assert "id-tok-abc123" not in caplog.text
+    assert "id-tok-abc123" not in str(exc_info.value)
+
+
+async def test_write_failed_non_429_does_not_log_or_raise_with_a_secret_value(
+    hass, entry, monkeypatch, caplog
+):
+    failed_body = json.dumps({"message": "Forbidden", "id_token": "id-tok-abc123"})
+    session = _FakeSession(_FakeResponse(403, {}))
+    monkeypatch.setattr(
+        api.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+    monkeypatch.setattr(
+        api,
+        "_post_write",
+        AsyncMock(return_value=(403, failed_body)),
+    )
+
+    item = api._WriteItem(kind="pool", key="pool:filter_pump", target="filter_pump", payload={})
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(Exception) as exc_info:
+            await api._execute_write_rest(hass, entry, item, {"filter_pump": {}})
+
+    assert "id-tok-abc123" not in caplog.text
+    assert "id-tok-abc123" not in str(exc_info.value)
+    assert "Forbidden" in caplog.text
+    assert "Forbidden" in str(exc_info.value)
 
 
 async def test_write_rate_limited_non_json_body_does_not_log_the_raw_body(
@@ -177,3 +282,16 @@ async def test_refresh_token_does_not_log_any_secret_value(hass, entry, caplog):
     log_text = caplog.text
     for secret in SECRET_VALUES:
         assert secret not in log_text
+
+
+async def test_refresh_token_failure_does_not_log_a_secret_value(hass, entry, caplog):
+    session = _FakeSession(
+        _FakeResponse(401, {"message": "Invalid refresh token", "refresh_token": "old-refresh-tok"})
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        result = await api._refresh_token(hass, entry, session)
+
+    assert result is False
+    assert "old-refresh-tok" not in caplog.text
+    assert "Invalid refresh token" in caplog.text

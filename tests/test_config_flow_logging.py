@@ -90,6 +90,36 @@ async def test_config_flow_login_missing_id_token_does_not_log_the_partial_respo
     assert "auth-tok-abc123" not in caplog.text
 
 
+async def test_config_flow_login_missing_actual_id_token_value_does_not_log_the_response(
+    hass, monkeypatch, caplog
+):
+    # status=200, authentication_token and userPoolOAuth both present, but
+    # IdToken itself is falsy - takes the *success*-shaped branch's own
+    # "missing IdToken" error, a different leak site than the invalid-shape
+    # branch already covered above.
+    session = _FakeSession(
+        _FakeResponse(
+            200,
+            {
+                "authentication_token": "auth-tok-abc123",
+                "id": 999,
+                "userPoolOAuth": {"IdToken": None},
+            },
+        )
+    )
+    monkeypatch.setattr(
+        config_flow.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+
+    flow = config_flow.ExoPoolConfigFlow()
+    flow.hass = hass
+
+    with caplog.at_level(logging.DEBUG):
+        await flow.async_step_user({"email": "pool.owner@example.com", "password": "hunter2"})
+
+    assert "auth-tok-abc123" not in caplog.text
+
+
 class _RaisingResponse:
     def __init__(self, exc: Exception):
         self._exc = exc

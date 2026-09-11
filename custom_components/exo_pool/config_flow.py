@@ -91,7 +91,7 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         self.user_id = result["id"]
                         if not self.id_token:
                             _LOGGER.error(
-                                "No userPoolOAuth.IdToken in response: %s", result
+                                "No userPoolOAuth.IdToken in response: %s", redact(result)
                             )
                             errors["base"] = "auth_failed"
                         else:

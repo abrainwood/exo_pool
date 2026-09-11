@@ -457,7 +457,10 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
                 error_text
             )
             if is_rate_limited:
-                _LOGGER.warning("Rate limited fetching device data: %s", error_text)
+                _LOGGER.warning(
+                    "Rate limited fetching device data: %s",
+                    _redact_response_body(error_text),
+                )
                 coordinator = (
                     hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinator")
                 )
@@ -529,10 +532,13 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
                     return coordinator.data or {}
                 return {}
 
-            _LOGGER.error("Failed to fetch device data: %s", error_text)
+            redacted_error = _redact_response_body(error_text)
+            _LOGGER.error("Failed to fetch device data: %s", redacted_error)
+            # Matched against the raw text - the exact literal Zodiac sends
+            # for an expired token, not something redact() can produce.
             if "The incoming token has expired" in error_text:
                 _last_auth_error = error_text
-            raise UpdateFailed(f"Device data fetch failed: {error_text}")
+            raise UpdateFailed(f"Device data fetch failed: {redacted_error}")
         data = await response.json()
         _LOGGER.debug("Device data: %s", data)
         reported = data.get("state", {}).get("reported", {})
@@ -577,11 +583,12 @@ async def _full_login(
         _log_response_headers(response, label="Login")
         if response.status != 200:
             error_text = await response.text()
-            _LOGGER.error("Failed to authenticate: %s", error_text)
+            redacted_error = _redact_response_body(error_text)
+            _LOGGER.error("Failed to authenticate: %s", redacted_error)
             global _authentication_failed, _last_auth_error
             _authentication_failed = True
             _last_auth_error = error_text
-            raise Exception(f"Authentication failed: {error_text}")
+            raise Exception(f"Authentication failed: {redacted_error}")
         data = await response.json()
         _LOGGER.debug("Login response data: %s", redact(data))
         id_token = data.get("userPoolOAuth", {}).get("IdToken")
@@ -632,7 +639,7 @@ async def _refresh_token(
         _log_response_headers(response, label="Token refresh")
         if response.status != 200:
             error_text = await response.text()
-            _LOGGER.error("Failed to refresh token: %s", error_text)
+            _LOGGER.error("Failed to refresh token: %s", _redact_response_body(error_text))
             return False
         data = await response.json()
         _LOGGER.debug("Refresh response data: %s", redact(data))
@@ -850,10 +857,9 @@ async def _execute_write_rest(
             hass, entry, session, url, payload, headers, item.key
         )
     if response_status == 429:
+        redacted_body = _redact_response_body(response_text)
         _LOGGER.warning(
-            "Rate limited during write %s: %s",
-            item.key,
-            _redact_response_body(response_text),
+            "Rate limited during write %s: %s", item.key, redacted_body
         )
         _set_cooldown(
             hass,
@@ -861,16 +867,17 @@ async def _execute_write_rest(
             _get_configured_interval_seconds(entry),
             reason="write_429",
         )
-        raise Exception(f"Rate limited for write {item.key}: {response_text}")
+        raise Exception(f"Rate limited for write {item.key}: {redacted_body}")
     if response_status != 200:
+        redacted_body = _redact_response_body(response_text)
         _LOGGER.error(
             "Write failed for %s: %s (Status: %s)",
             item.key,
-            response_text,
+            redacted_body,
             response_status,
         )
         raise Exception(
-            f"Write failed for {item.key}: {response_text} (Status: {response_status})"
+            f"Write failed for {item.key}: {redacted_body} (Status: {response_status})"
         )
 
 
