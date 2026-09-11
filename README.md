@@ -214,18 +214,29 @@ a simulated WAN outage - only ever against `ha-exo-pool-dev` on port 8125,
 never a live instance. It runs four scenarios:
 
 - **reconnect-from-connected** (issue #2's actual reproduction): MQTT is
-  connected, every currently-resolved address for the IoT endpoint is
-  blocked (and topped up if the pool rotates mid-test), and the fix's retry
+  connected, every one of its actual established peers is blocked (and
+  topped up if it reconnects to a new one mid-test), and the fix's retry
   chain must re-arm with growing backoff and recover.
-- **interrupt-resume-recovers**: the common case - only one address drops,
-  the CRT resumes via another within seconds, the resubscribe fails on
-  stale credentials, and the fix forces a refresh to recover.
-- **watchdog**: the rare case - every address is blocked, so resume never
-  comes and the fix's own interrupt watchdog has to force the reconnect
-  itself after 180s.
+- **interrupt-resume-recovers**: the common case - only the connection's
+  current peer(s) are blocked, the CRT resumes via another address within
+  seconds, the resubscribe fails on stale credentials, and the fix forces a
+  refresh to recover.
+- **watchdog**: the rare case - every established peer is blocked and kept
+  blocked, so resume never comes and the fix's own interrupt watchdog has
+  to force the reconnect itself after 180s.
 - **setup-under-outage**: the config entry is reloaded while the network is
   down - a different code path (setup, not the reconnect chain) - and pins
   what that does, including recovery once the outage clears.
+
+The block list for all three is read from the container's actual
+established TCP connections (`ss -tn state established`, filtered to
+public, non-loopback peers on port 443), not from a fresh DNS lookup. AWS
+IoT's endpoint resolves to a pool of addresses that rotates continuously,
+and a connection established even a few minutes earlier is routinely
+pinned to an address no longer in the current DNS answer - blocking the
+DNS pool instead of the real peer reliably blocks nothing. This harness
+can't be made fully deterministic against a rotating cloud endpoint, but
+reading the actual peer is what makes it reliable rather than lucky.
 
 ```bash
 export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
@@ -235,14 +246,14 @@ python3 scripts/verify_outage_reconnect.py
 ```
 
 The reconnect-from-connected, interrupt-resume-recovers and watchdog
-scenarios need to block traffic with iptables, which the HA dev image
-doesn't ship. They run a throwaway `alpine` sidecar (`docker run --network
-container:ha-exo-pool-dev --cap-add NET_ADMIN ...`) that shares the dev
-container's network namespace instead - no changes to the dev container
-itself, so no recreate needed. It does need `docker run` access and network
-access to pull the sidecar image and its `iptables` package. All three skip
-with a clear message if that's unavailable; pass `--skip-watchdog` to skip
-the watchdog one deliberately.
+scenarios need to block traffic and inspect connections, which the HA dev
+image has no tools for. They run a throwaway `alpine` sidecar (`docker run
+--network container:ha-exo-pool-dev --cap-add NET_ADMIN ...`) that shares
+the dev container's network namespace instead - no changes to the dev
+container itself, so no recreate needed. It does need `docker run` access
+and network access to pull the sidecar image and its `iptables`/`iproute2`
+packages. All three skip with a clear message if that's unavailable; pass
+`--skip-watchdog` to skip the watchdog one deliberately.
 
 The harness guarantees the integration is left working when it exits,
 reloading the entry if needed - if it can't get MQTT back on, it says so

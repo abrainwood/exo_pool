@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
-import socket
 import subprocess
 import sys
 
@@ -270,26 +269,66 @@ def test_reload_entry_lets_a_non_timeout_url_error_propagate(monkeypatch):
         harness.reload_entry("token", "entry123")
 
 
-def test_resolve_all_ips_dedupes_and_keeps_only_ipv4():
-    def fake_getaddrinfo(host, port):
-        return [
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("3.226.158.32", 0)),
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("3.226.158.32", 0)),
-            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0)),
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("34.206.242.80", 0)),
-        ]
+def test_select_established_peer_ips_extracts_a_public_443_peer():
+    ss_output = (
+        "State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\n"
+        "ESTAB  0      0       172.17.0.3:52344      34.196.232.7:443\n"
+    )
 
-    ips = harness.resolve_all_ips("a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com", resolver=fake_getaddrinfo)
+    peers = harness.select_established_peer_ips(ss_output)
 
-    assert ips == ["3.226.158.32", "34.206.242.80"]
+    assert peers == ["34.196.232.7"]
 
 
-def test_resolve_all_ips_raises_a_clear_error_on_resolution_failure():
-    def failing_resolver(host, port):
-        raise socket.gaierror("Name or service not known")
+def test_select_established_peer_ips_excludes_rfc1918_peers_on_the_matching_port():
+    ss_output = (
+        "State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\n"
+        "ESTAB  0      0       172.17.0.3:52344      34.196.232.7:443\n"
+        "ESTAB  0      0       172.17.0.3:41230      192.168.65.1:443\n"
+    )
 
-    with pytest.raises(RuntimeError, match="a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"):
-        harness.resolve_all_ips("a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com", resolver=failing_resolver)
+    peers = harness.select_established_peer_ips(ss_output)
+
+    assert peers == ["34.196.232.7"]
+
+
+def test_select_established_peer_ips_excludes_loopback_peers_on_the_matching_port():
+    ss_output = (
+        "State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\n"
+        "ESTAB  0      0       127.0.0.1:52344       127.0.0.1:443\n"
+    )
+
+    with pytest.raises(RuntimeError):
+        harness.select_established_peer_ips(ss_output)
+
+
+def test_select_established_peer_ips_excludes_non_matching_port():
+    ss_output = (
+        "State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\n"
+        "ESTAB  0      0       172.17.0.3:52344      34.196.232.7:8123\n"
+    )
+
+    with pytest.raises(RuntimeError):
+        harness.select_established_peer_ips(ss_output)
+
+
+def test_select_established_peer_ips_dedupes_repeated_peers():
+    ss_output = (
+        "State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\n"
+        "ESTAB  0      0       172.17.0.3:52344      34.196.232.7:443\n"
+        "ESTAB  0      0       172.17.0.3:52346      34.196.232.7:443\n"
+    )
+
+    peers = harness.select_established_peer_ips(ss_output)
+
+    assert peers == ["34.196.232.7"]
+
+
+def test_select_established_peer_ips_raises_a_clear_error_when_nothing_matches():
+    ss_output = "State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\n"
+
+    with pytest.raises(RuntimeError, match="443"):
+        harness.select_established_peer_ips(ss_output)
 
 
 def test_matches_connection_resumed_on_the_resume_line():

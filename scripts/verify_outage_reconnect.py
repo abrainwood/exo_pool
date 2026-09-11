@@ -19,12 +19,12 @@ container on port 8125 - see assert_dev_instance_url().
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import logging
 import os
 import re
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -457,24 +457,34 @@ def reload_entry(token: str, entry_id: str, timeout: float = RELOAD_TIMEOUT) -> 
         raise
 
 
-# --- DNS resolution (unit tested) ------------------------------------------
+# --- Established-peer selection (unit tested) ------------------------------
+
+_SS_PEER_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d+)\s*$")
 
 
-def resolve_all_ips(hostname: str, resolver: Callable = socket.getaddrinfo) -> list[str]:
-    """All distinct IPv4 addresses currently resolved for `hostname`.
+def select_established_peer_ips(ss_output: str, port: int = 443) -> list[str]:
+    """Public IPv4 peers on `port` from `ss -tn state established` output.
 
-    Resolved via the operator's own resolver, not any container's - a
-    container's /etc/hosts can't be blackholed out from under this.
+    The DNS-resolved pool for a rotating cloud endpoint routinely doesn't
+    contain the address a live connection is actually pinned to, so the
+    block list has to come from the real established connections instead.
     """
-    try:
-        results = resolver(hostname, None)
-    except OSError as e:
-        raise RuntimeError(f"could not resolve {hostname}: {e}") from e
-    ips: list[str] = []
-    for family, _type, _proto, _canon, sockaddr in results:
-        if family == socket.AF_INET and sockaddr[0] not in ips:
-            ips.append(sockaddr[0])
-    return ips
+    peers: list[str] = []
+    for line in ss_output.splitlines():
+        match = _SS_PEER_RE.search(line)
+        if not match:
+            continue
+        ip, peer_port = match.group(1), int(match.group(2))
+        if peer_port != port:
+            continue
+        addr = ipaddress.ip_address(ip)
+        if addr.is_loopback or addr.is_private:
+            continue
+        if ip not in peers:
+            peers.append(ip)
+    if not peers:
+        raise RuntimeError(f"no established peers on port {port} found to block")
+    return peers
 
 
 # --- Netns sidecar (unit tested) ------------------------------------------
@@ -542,6 +552,18 @@ def check_net_admin_capable(
     """True if a netns sidecar can actually install and run iptables against `container_name`'s network."""
     result = run_netns_sidecar(container_name, "apk add -q iptables && iptables -L -n", runner=runner, timeout=30.0)
     return result.returncode == 0
+
+
+def get_established_peer_ips(
+    container_name: str,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    port: int = 443,
+) -> list[str]:
+    """The container's currently-established public peers on `port`, via a netns sidecar's `ss`."""
+    result = run_netns_sidecar(container_name, "apk add -q iproute2 && ss -tn state established", runner=runner, timeout=30.0)
+    if result.returncode != 0:
+        raise RuntimeError(f"failed to list established connections via netns sidecar: {result.stderr}")
+    return select_established_peer_ips(result.stdout, port=port)
 
 
 class IpBlockSet:
@@ -665,7 +687,7 @@ def _wait_for_entry_state_not_loaded(token: str, entry_id: str, timeout: float) 
 def _enter_retry_chain_from_connected(container: Container, since: str) -> None:
     """Force entry into _async_refresh_and_reconnect from an already-connected state.
 
-    Blocks every currently-resolved IoT-endpoint address, topping up any
+    Blocks every currently-established peer address, topping up any
     newly-rotated-in ones while waiting, so nothing can resume silently via
     an address that wasn't blocked yet. Waits for the retry chain's own
     first attempt rather than the watchdog specifically - either forcing
@@ -675,11 +697,11 @@ def _enter_retry_chain_from_connected(container: Container, since: str) -> None:
     """
     interrupt_teardown = BestEffortTeardown()
     block_set = IpBlockSet(container.name, interrupt_teardown)
-    for ip in resolve_all_ips(IOT_ENDPOINT):
+    for ip in get_established_peer_ips(container.name):
         block_set.add(ip)
 
     def _top_up() -> None:
-        block_set.top_up(resolve_all_ips(IOT_ENDPOINT))
+        block_set.top_up(get_established_peer_ips(container.name))
 
     try:
         wait_for_log_pattern(
@@ -763,18 +785,16 @@ def scenario_reconnect_from_connected(container: Container, token: str, teardown
     return True
 
 
-def scenario_interrupt_resume_recovers(container: Container, token: str, _teardown: BestEffortTeardown, mqtt_entity: str) -> bool | None:
+def scenario_interrupt_resume_recovers(container: Container, token: str, teardown: BestEffortTeardown, mqtt_entity: str) -> bool | None:
     """The common transient-blip path, distinct from the rare watchdog one:
-    the connection drops, the CRT resumes within seconds, the resubscribe
-    fails on stale credentials, and the fix forces a refresh to recover -
-    observed live on issue #2's actual dev box.
+    the connection drops, the CRT resumes via a different address within
+    seconds, the resubscribe fails on stale credentials, and the fix forces
+    a refresh to recover - observed live on issue #2's actual dev box.
 
-    Blocks every currently-resolved address just long enough to force an
-    interrupt, then releases immediately so resume can proceed unobstructed -
-    there's no way to see which address a live connection is actually using
-    from outside, so blocking one at random can't guarantee the interrupt a
-    partial block is supposed to produce. A sustained full block is
-    scenario_reconnect_from_connected's and scenario_watchdog's job.
+    Blocks only the connection's actual current peer(s), not the whole
+    rotating pool - unlike scenario_reconnect_from_connected and
+    scenario_watchdog, this scenario wants resume to succeed quickly via
+    some other address, not be prevented.
     """
     if not check_net_admin_capable(container.name):
         print(
@@ -790,18 +810,14 @@ def scenario_interrupt_resume_recovers(container: Container, token: str, _teardo
         raise ScenarioFailure(f"{mqtt_entity} is {baseline!r} before the outage, expected 'on'")
 
     since = now_utc_iso()
-    block_teardown = BestEffortTeardown()
-    block_set = IpBlockSet(container.name, block_teardown)
-    for ip in resolve_all_ips(IOT_ENDPOINT):
+    block_set = IpBlockSet(container.name, teardown)
+    for ip in get_established_peer_ips(container.name):
         block_set.add(ip)
 
-    try:
-        wait_for_log_pattern(
-            container, _CONNECTION_INTERRUPTED_RE, since,
-            timeout=60.0, label="connection interrupt",
-        )
-    finally:
-        block_teardown.run()  # release now - let resume proceed via any address
+    wait_for_log_pattern(
+        container, _CONNECTION_INTERRUPTED_RE, since,
+        timeout=60.0, label="connection interrupt",
+    )
     print("PASS interrupt: MQTT connection interrupted")
 
     wait_for_log_pattern(
@@ -829,6 +845,8 @@ def scenario_interrupt_resume_recovers(container: Container, token: str, _teardo
     if not _wait_for_entity_state(token, mqtt_entity, "on", timeout=30.0):
         raise ScenarioFailure(f"{mqtt_entity} did not return to 'on' after recovery")
     print("PASS recovery: reconnected via forced credential refresh")
+
+    teardown.run()
     return True
 
 
@@ -884,7 +902,7 @@ def scenario_watchdog(container: Container, token: str, teardown: BestEffortTear
     """The rare path: no address in the pool works, so resume never comes and
     the fix's own INTERRUPT_WATCHDOG_TIMEOUT has to force the reconnect itself.
 
-    Blocks every currently-resolved address, topping up any that rotate in
+    Blocks every currently-established peer address, topping up any that rotate in
     during the wait - a partial block just reproduces
     scenario_interrupt_resume_recovers instead. Returns True on pass, False
     on failure, None if skipped (no NET_ADMIN).
@@ -900,11 +918,11 @@ def scenario_watchdog(container: Container, token: str, teardown: BestEffortTear
 
     since = now_utc_iso()
     block_set = IpBlockSet(container.name, teardown)
-    for ip in resolve_all_ips(IOT_ENDPOINT):
+    for ip in get_established_peer_ips(container.name):
         block_set.add(ip)
 
     def _top_up() -> None:
-        block_set.top_up(resolve_all_ips(IOT_ENDPOINT))
+        block_set.top_up(get_established_peer_ips(container.name))
 
     wait_for_log_pattern(
         container, _CONNECTION_INTERRUPTED_RE, since,
