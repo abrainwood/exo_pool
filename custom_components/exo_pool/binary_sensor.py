@@ -15,7 +15,7 @@ from .api import (
     get_mqtt_client,
     ERROR_CODES,
     _authentication_failed,
-    _last_auth_error,
+    _last_auth_error_redacted,
     DOMAIN,
 )
 from homeassistant.const import EntityCategory
@@ -235,7 +235,7 @@ class AuthenticationStatusBinarySensor(CoordinatorEntity, BinarySensorEntity):
     @property
     def extra_state_attributes(self):
         """Provide additional details about authentication status."""
-        return {"last_error": _last_auth_error} if _authentication_failed else {}
+        return {"last_error": _last_auth_error_redacted} if _authentication_failed else {}
 
     @property
     def available(self):

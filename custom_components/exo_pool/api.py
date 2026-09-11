@@ -65,13 +65,7 @@ def _log_response_headers(
 
 
 def _redact_response_body(body: str) -> str | dict | list:
-    """Return a loggable form of a response body with secret keys redacted.
-
-    The body is an arbitrary string from the server, not something we
-    control the shape of - if it parses as JSON, redact() can mask any
-    known-secret key; otherwise there's no key to redact against, so
-    drop the content rather than log it unvetted.
-    """
+    """Return a loggable form of a response body with secret keys redacted."""
     try:
         parsed = json.loads(body)
     except ValueError:
@@ -100,7 +94,16 @@ ERROR_CODES = {
 
 # Class-level flag to track authentication status
 _authentication_failed = False
-_last_auth_error = None
+_last_auth_error = None  # raw - only for the api.py:420-style literal match
+_last_auth_error_redacted = None  # safe for external surfaces (attrs, diagnostics)
+
+
+def _record_auth_error(raw: str, redacted=None) -> None:
+    """Set the private raw and public redacted auth-error state together."""
+    global _last_auth_error, _last_auth_error_redacted
+    _last_auth_error = raw
+    _last_auth_error_redacted = raw if redacted is None else redacted
+
 
 # Domain constant
 DOMAIN = "exo_pool"
@@ -378,9 +381,9 @@ def _get_write_manager(hass: HomeAssistant, entry: ConfigEntry) -> _WriteManager
 
 async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
     """Fetch data from the Exo Pool API, handling token refresh."""
-    global _authentication_failed, _last_auth_error
+    global _authentication_failed
     _authentication_failed = False  # Reset flag
-    _last_auth_error = None
+    _record_auth_error(None)
     store = _get_entry_store(hass, entry)
     no_read_until = store.get("no_read_until")
     if no_read_until and time.monotonic() < no_read_until:
@@ -537,10 +540,10 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
             # Matched against the raw text - the exact literal Zodiac sends
             # for an expired token, not something redact() can produce.
             if "The incoming token has expired" in error_text:
-                _last_auth_error = error_text
+                _record_auth_error(error_text, redacted_error)
             raise UpdateFailed(f"Device data fetch failed: {redacted_error}")
         data = await response.json()
-        _LOGGER.debug("Device data: %s", data)
+        _LOGGER.debug("Device data: %s", redact(data))
         reported = data.get("state", {}).get("reported", {})
         coordinator = (
             hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinator")
@@ -585,9 +588,9 @@ async def _full_login(
             error_text = await response.text()
             redacted_error = _redact_response_body(error_text)
             _LOGGER.error("Failed to authenticate: %s", redacted_error)
-            global _authentication_failed, _last_auth_error
+            global _authentication_failed
             _authentication_failed = True
-            _last_auth_error = error_text
+            _record_auth_error(error_text, redacted_error)
             raise Exception(f"Authentication failed: {redacted_error}")
         data = await response.json()
         _LOGGER.debug("Login response data: %s", redact(data))
@@ -601,12 +604,12 @@ async def _full_login(
         if not id_token:
             _LOGGER.error("No userPoolOAuth.IdToken in response: %s", redact(data))
             _authentication_failed = True
-            _last_auth_error = "No userPoolOAuth.IdToken received"
+            _record_auth_error("No userPoolOAuth.IdToken received")
             raise Exception("No userPoolOAuth.IdToken received")
         if not auth_token:
             _LOGGER.error("No authentication_token in response: %s", redact(data))
             _authentication_failed = True
-            _last_auth_error = "No authentication_token received"
+            _record_auth_error("No authentication_token received")
             raise Exception("No authentication_token received")
         update_data = {
             **entry.data,
@@ -924,7 +927,7 @@ async def _post_write(
             "Write response for %s: %s %s",
             item_key,
             response.status,
-            response_text,
+            _redact_response_body(response_text),
         )
         return response.status, response_text
 

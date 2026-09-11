@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-from unittest.mock import AsyncMock
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -203,15 +202,11 @@ async def test_async_update_data_fetch_failure_does_not_log_or_raise_with_a_secr
 async def test_write_rate_limited_response_does_not_log_a_secret_shaped_body_value(
     hass, entry, monkeypatch, caplog
 ):
-    rate_limited_body = json.dumps({"message": "Too Many Requests", "id_token": "id-tok-abc123"})
-    session = _FakeSession(_FakeResponse(429, {}))
-    monkeypatch.setattr(
-        api.aiohttp_client, "async_get_clientsession", lambda hass: session
+    session = _FakeSession(
+        _FakeResponse(429, {"message": "Too Many Requests", "id_token": "id-tok-abc123"})
     )
     monkeypatch.setattr(
-        api,
-        "_post_write",
-        AsyncMock(return_value=(429, rate_limited_body)),
+        api.aiohttp_client, "async_get_clientsession", lambda hass: session
     )
 
     item = api._WriteItem(kind="pool", key="pool:filter_pump", target="filter_pump", payload={})
@@ -227,15 +222,11 @@ async def test_write_rate_limited_response_does_not_log_a_secret_shaped_body_val
 async def test_write_failed_non_429_does_not_log_or_raise_with_a_secret_value(
     hass, entry, monkeypatch, caplog
 ):
-    failed_body = json.dumps({"message": "Forbidden", "id_token": "id-tok-abc123"})
-    session = _FakeSession(_FakeResponse(403, {}))
-    monkeypatch.setattr(
-        api.aiohttp_client, "async_get_clientsession", lambda hass: session
+    session = _FakeSession(
+        _FakeResponse(403, {"message": "Forbidden", "id_token": "id-tok-abc123"})
     )
     monkeypatch.setattr(
-        api,
-        "_post_write",
-        AsyncMock(return_value=(403, failed_body)),
+        api.aiohttp_client, "async_get_clientsession", lambda hass: session
     )
 
     item = api._WriteItem(kind="pool", key="pool:filter_pump", target="filter_pump", payload={})
@@ -250,18 +241,22 @@ async def test_write_failed_non_429_does_not_log_or_raise_with_a_secret_value(
     assert "Forbidden" in str(exc_info.value)
 
 
+class _NonJsonResponse(_FakeResponse):
+    def __init__(self, status: int, body: str):
+        super().__init__(status, {})
+        self._body = body
+
+    async def text(self):
+        return self._body
+
+
 async def test_write_rate_limited_non_json_body_does_not_log_the_raw_body(
     hass, entry, monkeypatch, caplog
 ):
     non_json_body = "<html>upstream outage, token=id-tok-abc123</html>"
-    session = _FakeSession(_FakeResponse(429, {}))
+    session = _FakeSession(_NonJsonResponse(429, non_json_body))
     monkeypatch.setattr(
         api.aiohttp_client, "async_get_clientsession", lambda hass: session
-    )
-    monkeypatch.setattr(
-        api,
-        "_post_write",
-        AsyncMock(return_value=(429, non_json_body)),
     )
 
     item = api._WriteItem(kind="pool", key="pool:filter_pump", target="filter_pump", payload={})
@@ -295,3 +290,50 @@ async def test_refresh_token_failure_does_not_log_a_secret_value(hass, entry, ca
     assert result is False
     assert "old-refresh-tok" not in caplog.text
     assert "Invalid refresh token" in caplog.text
+
+
+async def test_async_update_data_success_does_not_log_the_raw_device_data(
+    hass, monkeypatch, caplog
+):
+    fresh_entry = MockConfigEntry(
+        domain=api.DOMAIN,
+        data={
+            "serial_number": "JT00000000",
+            "id_token": "id-tok-abc123",
+            "expires_at": time.time() + 3600,
+        },
+        options={},
+    )
+    fresh_entry.add_to_hass(hass)
+    api._get_entry_store(hass, fresh_entry)
+
+    session = _FakeSession(
+        _FakeResponse(
+            200,
+            {"state": {"reported": {"equipment": {"id_token": "id-tok-abc123"}}}},
+        )
+    )
+    monkeypatch.setattr(
+        api.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        await api.async_update_data(hass, fresh_entry)
+
+    assert "id-tok-abc123" not in caplog.text
+
+
+async def test_full_login_auth_failure_keeps_a_redacted_copy_for_the_public_attribute(
+    hass, entry, caplog
+):
+    session = _FakeSession(
+        _FakeResponse(401, {"message": "Invalid credentials", "password": "hunter2"})
+    )
+
+    with pytest.raises(Exception):
+        await api._full_login(hass, entry, session)
+
+    # _last_auth_error stays raw - api.py:420 matches it against the exact
+    # literal Zodiac sends for an expired token, which redact() would mangle.
+    assert api._last_auth_error is not None
+    assert "hunter2" not in str(api._last_auth_error_redacted)
