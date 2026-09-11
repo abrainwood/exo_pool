@@ -269,6 +269,43 @@ def test_reload_entry_lets_a_non_timeout_url_error_propagate(monkeypatch):
         harness.reload_entry("token", "entry123")
 
 
+def test_build_netns_sidecar_cmd_shares_the_target_containers_network():
+    argv = harness.build_netns_sidecar_cmd("ha-exo-pool-dev", "echo hi")
+
+    assert argv == [
+        "docker", "run", "--rm",
+        "--network", "container:ha-exo-pool-dev",
+        "--cap-add", "NET_ADMIN",
+        harness.SIDECAR_IMAGE, "sh", "-c", "echo hi",
+    ]
+
+
+def test_iptables_rule_shell_cmd_builds_the_insert_form():
+    cmd = harness.iptables_rule_shell_cmd("10.0.0.5", "-I")
+
+    assert cmd == "apk add -q iptables && iptables -I OUTPUT -d 10.0.0.5 -p tcp -j DROP"
+
+
+def test_iptables_rule_shell_cmd_builds_the_delete_form():
+    cmd = harness.iptables_rule_shell_cmd("10.0.0.5", "-D")
+
+    assert cmd == "apk add -q iptables && iptables -D OUTPUT -d 10.0.0.5 -p tcp -j DROP"
+
+
+def test_check_net_admin_capable_true_when_sidecar_iptables_succeeds():
+    def fake_runner(*args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    assert harness.check_net_admin_capable("ha-exo-pool-dev", runner=fake_runner) is True
+
+
+def test_check_net_admin_capable_false_when_sidecar_iptables_fails():
+    def fake_runner(*args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=127, stdout="", stderr="sh: iptables: not found")
+
+    assert harness.check_net_admin_capable("ha-exo-pool-dev", runner=fake_runner) is False
+
+
 def test_best_effort_teardown_runs_all_actions_even_if_one_raises():
     order = []
     teardown = harness.BestEffortTeardown()

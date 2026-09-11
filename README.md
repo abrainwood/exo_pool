@@ -228,13 +228,14 @@ export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
 python3 scripts/verify_outage_reconnect.py
 ```
 
-The reconnect-from-connected and watchdog scenarios need `NET_ADMIN` on the
-container to block traffic with iptables - already set in
-`docker-compose.dev.yml`, but since `cap_add` only applies at container
-creation, run `docker compose -f docker-compose.dev.yml up -d --force-recreate`
-(not just `make restart`) to pick it up on an existing dev container. Both
-scenarios skip with a clear message if it's unavailable; pass `--skip-watchdog`
-to skip the watchdog one deliberately.
+The reconnect-from-connected and watchdog scenarios need to block traffic
+with iptables, which the HA dev image doesn't ship. They run a throwaway
+`alpine` sidecar (`docker run --network container:ha-exo-pool-dev --cap-add
+NET_ADMIN ...`) that shares the dev container's network namespace instead -
+no changes to the dev container itself, so no recreate needed. It does need
+`docker run` access and network access to pull the sidecar image and its
+`iptables` package. Both scenarios skip with a clear message if that's
+unavailable; pass `--skip-watchdog` to skip the watchdog one deliberately.
 
 The harness guarantees the integration is left working when it exits,
 reloading the entry if needed - if it can't get MQTT back on, it says so

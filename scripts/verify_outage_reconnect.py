@@ -409,6 +409,27 @@ def reload_entry(token: str, entry_id: str, timeout: float = RELOAD_TIMEOUT) -> 
         raise
 
 
+# --- Netns sidecar (unit tested) ------------------------------------------
+
+# The HA image has no iptables/nft/ip - blocking traffic needs a throwaway
+# container sharing its network namespace instead.
+SIDECAR_IMAGE = "alpine:3.20"
+
+
+def build_netns_sidecar_cmd(container_name: str, shell_cmd: str) -> list[str]:
+    return [
+        "docker", "run", "--rm",
+        "--network", f"container:{container_name}",
+        "--cap-add", "NET_ADMIN",
+        SIDECAR_IMAGE, "sh", "-c", shell_cmd,
+    ]
+
+
+def iptables_rule_shell_cmd(ip: str, flag: str) -> str:
+    """flag is '-I' to insert the OUTPUT DROP rule for `ip`, '-D' to remove it."""
+    return f"apk add -q iptables && iptables {flag} OUTPUT -d {ip} -p tcp -j DROP"
+
+
 # --- Outage simulation -----------------------------------------------------
 
 
@@ -438,30 +459,39 @@ def blackhole_hosts(container: Container, teardown: BestEffortTeardown, hostname
         raise RuntimeError(f"failed to blackhole hosts in {container.name}: {append.stderr}")
 
 
-def check_net_admin_capable(container: Container) -> bool:
-    """True if the container can actually run iptables (NET_ADMIN present)."""
-    result = container.exec(["iptables", "-L", "-n"], timeout=10)
+def run_netns_sidecar(
+    container_name: str,
+    shell_cmd: str,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    timeout: float = 60.0,
+) -> subprocess.CompletedProcess:
+    return runner(build_netns_sidecar_cmd(container_name, shell_cmd), capture_output=True, text=True, timeout=timeout)
+
+
+def check_net_admin_capable(
+    container_name: str, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run
+) -> bool:
+    """True if a netns sidecar can actually install and run iptables against `container_name`'s network."""
+    result = run_netns_sidecar(container_name, "apk add -q iptables && iptables -L -n", runner=runner, timeout=30.0)
     return result.returncode == 0
 
 
 def block_iot_endpoint_tcp(container: Container, teardown: BestEffortTeardown, endpoint: str) -> None:
-    """Drop outbound TCP to `endpoint` at the IP layer (DNS still resolves)."""
+    """Drop outbound TCP to `endpoint` at the IP layer via a netns sidecar (DNS still resolves)."""
     resolved = container.exec(["getent", "hosts", endpoint])
     if resolved.returncode != 0 or not resolved.stdout.strip():
         raise RuntimeError(f"could not resolve {endpoint} inside {container.name}")
     ip = resolved.stdout.split()[0]
 
-    rule = ["-I", "OUTPUT", "-d", ip, "-p", "tcp", "-j", "DROP"]
-
     def _unblock():
-        result = container.exec(["iptables", "-D", *rule[1:]])
+        result = run_netns_sidecar(container.name, iptables_rule_shell_cmd(ip, "-D"))
         if result.returncode != 0:
             raise RuntimeError(f"failed to remove iptables DROP rule for {ip}: {result.stderr}")
-        _LOGGER.info("Removed iptables DROP rule for %s in %s", ip, container.name)
+        _LOGGER.info("Removed iptables DROP rule for %s via netns sidecar", ip)
 
     teardown.defer(_unblock)
 
-    add = container.exec(["iptables", *rule])
+    add = run_netns_sidecar(container.name, iptables_rule_shell_cmd(ip, "-I"))
     if add.returncode != 0:
         raise RuntimeError(f"failed to add iptables DROP rule for {ip}: {add.stderr}")
 
@@ -554,13 +584,14 @@ def _enter_retry_chain_from_connected(container: Container, since: str) -> None:
 def scenario_reconnect_from_connected(container: Container, token: str, teardown: BestEffortTeardown, mqtt_entity: str) -> bool | None:
     """Issue #2's actual reproduction: MQTT is connected, the network dies
     underneath it, and the retry chain must re-arm and keep going."""
-    if not check_net_admin_capable(container):
+    if not check_net_admin_capable(container.name):
         print(
-            "SKIP reconnect-from-connected: container lacks NET_ADMIN (or iptables) - "
-            "cannot force an already-established MQTT connection to interrupt, and "
-            "the fix's own credential-refresh timer is up to ~55 minutes away, too "
-            "long to wait on. Run with cap-add=NET_ADMIN on the dev container "
-            "(see docker-compose.dev.yml) to exercise this scenario."
+            "SKIP reconnect-from-connected: could not run iptables against the dev "
+            "container's network via a netns sidecar - cannot force an "
+            "already-established MQTT connection to interrupt, and the fix's own "
+            "credential-refresh timer is up to ~55 minutes away, too long to wait on. "
+            "Needs `docker run` access and network access to pull the sidecar image "
+            "and its iptables package."
         )
         return None
 
@@ -667,11 +698,12 @@ def scenario_setup_under_outage(container: Container, token: str, teardown: Best
 
 def scenario_watchdog(container: Container, token: str, teardown: BestEffortTeardown) -> bool | None:
     """Returns True on pass, False on failure, None if skipped (no NET_ADMIN)."""
-    if not check_net_admin_capable(container):
+    if not check_net_admin_capable(container.name):
         print(
-            "SKIP watchdog: container lacks NET_ADMIN (or iptables) - cannot "
-            "block traffic at the IP/TCP layer. Run with --privileged or "
-            "cap-add=NET_ADMIN on the dev container to exercise this scenario."
+            "SKIP watchdog: could not run iptables against the dev container's "
+            "network via a netns sidecar - cannot block traffic at the IP/TCP "
+            "layer. Needs `docker run` access and network access to pull the "
+            "sidecar image and its iptables package."
         )
         return None
 
