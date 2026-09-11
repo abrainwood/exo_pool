@@ -1,5 +1,6 @@
 import logging
 import urllib.parse
+import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
@@ -135,7 +136,7 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         try:
             async with session.get(system_url) as resp:
                 result = await resp.json()
-                _LOGGER.debug("System discovery result: %s", result)
+                _LOGGER.debug("System discovery result: %s", redact(result))
 
             if not isinstance(result, list) or not result:
                 errors["base"] = "no_systems"
@@ -171,6 +172,15 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors={},
             )
 
+        except aiohttp.ClientResponseError as err:
+            # ClientResponseError's own __str__ embeds the request URL,
+            # which carries authentication_token and api_key as query
+            # params - log status/message only, not str(err) or exc_info.
+            _LOGGER.error(
+                "Error during system selection: HTTP %s %s", err.status, err.message
+            )
+            errors["base"] = "unknown"
+            return self.async_show_form(step_id="select_system", errors=errors)
         except Exception:
             _LOGGER.exception("Error during system selection")
             errors["base"] = "unknown"

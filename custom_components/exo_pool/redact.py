@@ -29,6 +29,6 @@ SENSITIVE_KEYS: set[str] = {
 }
 
 
-def redact(data: dict) -> dict:
+def redact(data: dict | list) -> dict | list:
     """Return a copy of data with known-secret keys redacted, any depth."""
     return async_redact_data(data, SENSITIVE_KEYS)

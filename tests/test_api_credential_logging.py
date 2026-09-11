@@ -76,10 +76,12 @@ def entry(hass):
             "email": "pool.owner@example.com",
             "password": "hunter2",
             "refresh_token": "old-refresh-tok",
+            "id_token": "id-tok-abc123",
         },
         options={},
     )
     config_entry.add_to_hass(hass)
+    api._get_entry_store(hass, config_entry)
     return config_entry
 
 
@@ -118,6 +120,52 @@ async def test_async_update_data_does_not_log_even_a_truncated_prefix_of_the_ref
         await api.async_update_data(hass, entry)
 
     assert new_id_token[:10] not in caplog.text
+
+
+async def test_write_rate_limited_response_does_not_log_a_secret_shaped_body_value(
+    hass, entry, monkeypatch, caplog
+):
+    rate_limited_body = json.dumps({"message": "Too Many Requests", "id_token": "id-tok-abc123"})
+    session = _FakeSession(_FakeResponse(429, {}))
+    monkeypatch.setattr(
+        api.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+    monkeypatch.setattr(
+        api,
+        "_post_write",
+        AsyncMock(return_value=(429, rate_limited_body)),
+    )
+
+    item = api._WriteItem(kind="pool", key="pool:filter_pump", target="filter_pump", payload={})
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(Exception):
+            await api._execute_write_rest(hass, entry, item, {"filter_pump": {}})
+
+    assert "id-tok-abc123" not in caplog.text
+
+
+async def test_write_rate_limited_non_json_body_does_not_log_the_raw_body(
+    hass, entry, monkeypatch, caplog
+):
+    non_json_body = "<html>upstream outage, token=id-tok-abc123</html>"
+    session = _FakeSession(_FakeResponse(429, {}))
+    monkeypatch.setattr(
+        api.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+    monkeypatch.setattr(
+        api,
+        "_post_write",
+        AsyncMock(return_value=(429, non_json_body)),
+    )
+
+    item = api._WriteItem(kind="pool", key="pool:filter_pump", target="filter_pump", payload={})
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(Exception):
+            await api._execute_write_rest(hass, entry, item, {"filter_pump": {}})
+
+    assert "id-tok-abc123" not in caplog.text
 
 
 async def test_refresh_token_does_not_log_any_secret_value(hass, entry, caplog):

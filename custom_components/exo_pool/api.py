@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import aiohttp
 import async_timeout
 import logging
+import json
 import time
 import asyncio
 
@@ -61,6 +62,23 @@ def _log_response_headers(
     }
     if rate_headers:
         _LOGGER.info("%s rate-limit headers found: %s", label, rate_headers)
+
+
+def _redact_response_body(body: str) -> str | dict | list:
+    """Return a loggable form of a response body with secret keys redacted.
+
+    The body is an arbitrary string from the server, not something we
+    control the shape of - if it parses as JSON, redact() can mask any
+    known-secret key; otherwise there's no key to redact against, so
+    drop the content rather than log it unvetted.
+    """
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return f"<non-JSON body, {len(body)} chars>"
+    if isinstance(parsed, (dict, list)):
+        return redact(parsed)
+    return "<non-object JSON body>"
 
 
 # API endpoints and keys from config_flow.py and REST sensors
@@ -832,7 +850,11 @@ async def _execute_write_rest(
             hass, entry, session, url, payload, headers, item.key
         )
     if response_status == 429:
-        _LOGGER.warning("Rate limited during write %s: %s", item.key, response_text)
+        _LOGGER.warning(
+            "Rate limited during write %s: %s",
+            item.key,
+            _redact_response_body(response_text),
+        )
         _set_cooldown(
             hass,
             entry,
