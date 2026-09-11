@@ -228,6 +228,13 @@ def test_find_entry_state_raises_when_entry_id_not_present():
         harness.find_entry_state(entries, "zzz")
 
 
+def test_harness_image_failure_message_names_the_error_and_says_fatal():
+    message = harness.harness_image_failure_message("pull access denied for exo-pool-harness-tools")
+
+    assert message.startswith("FATAL:")
+    assert "pull access denied for exo-pool-harness-tools" in message
+
+
 def test_recovery_failure_message_names_the_container_and_both_restart_paths():
     message = harness.recovery_failure_message("ha-exo-pool-dev")
 
@@ -773,6 +780,35 @@ def test_port_block_shell_cmd_builds_the_delete_form():
     cmd = harness.port_block_shell_cmd("-D", 443)
 
     assert cmd == "iptables -D OUTPUT -p tcp --dport 443 -j DROP"
+
+
+def test_ensuring_the_image_upfront_lets_the_first_sidecar_call_of_a_run_succeed():
+    build_calls = []
+
+    def fake_runner(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            rc = 0 if build_calls else 1
+            return subprocess.CompletedProcess(args=argv, returncode=rc, stdout="", stderr="No such image")
+        if argv[:2] == ["docker", "create"]:
+            build_calls.append(argv)
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="builder123\n", stderr="")
+        if argv[:2] in (["docker", "start"], ["docker", "commit"], ["docker", "rm"]):
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0,
+            stdout="State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\n"
+                   "ESTAB  0      0       172.17.0.3:52344      34.196.232.7:443\n",
+            stderr="",
+        )
+
+    # main() builds the image once, before scenario_baseline's precondition -
+    # the actual first sidecar call of a run - ever runs.
+    harness.ensure_harness_tools_image(runner=fake_runner)
+
+    peers = harness.get_established_peer_ips("ha-exo-pool-dev", runner=fake_runner)
+
+    assert peers == ["34.196.232.7"]
+    assert len(build_calls) == 1
 
 
 def test_get_established_peer_ips_runs_ss_with_no_apk_install():

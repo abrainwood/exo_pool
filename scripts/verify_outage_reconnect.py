@@ -224,6 +224,16 @@ class BestEffortTeardown:
                 _LOGGER.warning("Teardown action failed - continuing", exc_info=True)
 
 
+def harness_image_failure_message(error: str) -> str:
+    """Message for when the one-time harness-tools image build fails before any scenario runs.
+
+    Must read as a clear pre-flight problem, not surface later as a
+    confusing per-scenario "pull access denied" precondition failure from
+    whichever scenario happens to need the sidecar first.
+    """
+    return f"FATAL: could not prepare the harness tools image (needed by every blocking scenario): {error}"
+
+
 def recovery_failure_message(container_name: str) -> str:
     return (
         "The integration did NOT recover after the simulated outage. Operator "
@@ -1245,6 +1255,15 @@ def main() -> int:
         entry_id = get_exo_pool_entry_id(token)
     except (MqttEntityResolutionError, RuntimeError) as e:
         print(f"FATAL: could not resolve the exo_pool entity/entry: {e}")
+        return 1
+
+    # Built once, before any scenario - scenario_baseline's own precondition
+    # is the first sidecar call of a run and must not be the one discovering
+    # the image doesn't exist yet.
+    try:
+        ensure_harness_tools_image()
+    except RuntimeError as e:
+        print(harness_image_failure_message(str(e)))
         return 1
 
     results: dict[str, str] = {}
