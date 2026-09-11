@@ -14,7 +14,6 @@ SENSITIVE_KEYS: set[str] = {
     "access_token",
     "api_key",
     "user_id",
-    "id",
     "IdToken",
     "RefreshToken",
     "authentication_token",
@@ -24,6 +23,10 @@ SENSITIVE_KEYS: set[str] = {
     "AccessToken",
     "Authorization",
 }
+
+# redact() also treats bare "id" as sensitive; diagnostics.py's schedule
+# ids use the same key and stay out of SENSITIVE_KEYS itself.
+_API_RESPONSE_KEYS: set[str] = SENSITIVE_KEYS | {"id"}
 
 
 def scrub_text(text: str, secrets: Iterable[str | None]) -> str:
@@ -37,7 +40,7 @@ def scrub_text(text: str, secrets: Iterable[str | None]) -> str:
 def redact(data: object) -> object:
     """Return a copy of data with known-secret keys redacted, any depth."""
     if isinstance(data, dict):
-        return async_redact_data(data, SENSITIVE_KEYS)
+        return async_redact_data(data, _API_RESPONSE_KEYS)
     if isinstance(data, list) and any(isinstance(item, (dict, list)) for item in data):
-        return async_redact_data(data, SENSITIVE_KEYS)
+        return async_redact_data(data, _API_RESPONSE_KEYS)
     return f"<redacted {type(data).__name__}, no keys to redact against>"

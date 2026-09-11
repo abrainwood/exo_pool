@@ -44,3 +44,17 @@ async def test_config_entry_diagnostics_does_not_expose_any_secret_value(hass, e
         "pool.owner@example.com",
     ):
         assert secret not in diag_text
+
+
+async def test_config_entry_diagnostics_preserves_schedule_ids(hass, entry):
+    hass.data.setdefault(api.DOMAIN, {})[entry.entry_id] = {
+        "coordinator": MagicMock(
+            last_update_success=True,
+            last_exception=None,
+            data={"schedules": {"sched_0": {"id": "swc_prog_1", "active": 1}}},
+        )
+    }
+
+    diag = await diagnostics.async_get_config_entry_diagnostics(hass, entry)
+
+    assert diag["coordinator"]["data"]["schedules"]["sched_0"]["id"] == "swc_prog_1"
