@@ -331,6 +331,75 @@ def test_select_established_peer_ips_raises_a_clear_error_when_nothing_matches()
         harness.select_established_peer_ips(ss_output)
 
 
+def test_select_established_peer_ips_error_includes_the_raw_ss_output():
+    ss_output = (
+        "State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\n"
+        "ESTAB  0      0       172.17.0.3:52344      192.168.65.1:8123\n"
+    )
+
+    with pytest.raises(RuntimeError, match="192.168.65.1:8123"):
+        harness.select_established_peer_ips(ss_output)
+
+
+def test_wait_for_healthy_precondition_returns_immediately_when_already_met():
+    sleeps = []
+    reloads = []
+
+    harness.wait_for_healthy_precondition(
+        get_sensor_state=lambda: "on",
+        get_peers=lambda: ["34.196.232.7"],
+        reload=lambda: reloads.append(1),
+        max_polls=3,
+        sleep=sleeps.append,
+    )
+
+    assert sleeps == []
+    assert reloads == []
+
+
+def test_wait_for_healthy_precondition_reloads_once_then_succeeds():
+    sensor_states = iter(["off", "off", "on"])
+    peer_results = iter([[], [], ["34.196.232.7"]])
+    reloads = []
+
+    harness.wait_for_healthy_precondition(
+        get_sensor_state=lambda: next(sensor_states),
+        get_peers=lambda: next(peer_results),
+        reload=lambda: reloads.append(1),
+        max_polls=2,
+        sleep=lambda s: None,
+    )
+
+    assert reloads == [1]
+
+
+def test_wait_for_healthy_precondition_raises_with_detail_when_never_met():
+    with pytest.raises(harness.ScenarioFailure, match="off.*192.168.65.1:8123"):
+        harness.wait_for_healthy_precondition(
+            get_sensor_state=lambda: "off",
+            get_peers=lambda: "no established peers on port 443 found to block; ss output was:\n192.168.65.1:8123",
+            reload=lambda: None,
+            max_polls=1,
+            sleep=lambda s: None,
+        )
+
+
+def test_precondition_met_true_when_sensor_on_and_peer_present():
+    assert harness.precondition_met("on", ["34.196.232.7"]) is True
+
+
+def test_precondition_met_false_when_peer_absent():
+    assert harness.precondition_met("on", []) is False
+
+
+def test_precondition_met_false_when_peer_check_failed():
+    assert harness.precondition_met("on", None) is False
+
+
+def test_precondition_met_false_when_sensor_off_despite_peer_present():
+    assert harness.precondition_met("off", ["34.196.232.7"]) is False
+
+
 def test_matches_connection_resumed_on_the_resume_line():
     log_text = (
         "2026-09-11 09:12:29.100 INFO (MainThread) [custom_components.exo_pool.mqtt_client] "

@@ -483,7 +483,10 @@ def select_established_peer_ips(ss_output: str, port: int = 443) -> list[str]:
         if ip not in peers:
             peers.append(ip)
     if not peers:
-        raise RuntimeError(f"no established peers on port {port} found to block")
+        raise RuntimeError(
+            f"no established peers on port {port} found to block; ss output was:\n"
+            f"{ss_output.strip() or '(empty)'}"
+        )
     return peers
 
 
@@ -613,14 +616,84 @@ class IpBlockSet:
             raise RuntimeError(f"failed to remove {len(errors)} iptables DROP rule(s): {'; '.join(errors)}")
 
 
+# --- Scenario precondition (unit tested) -----------------------------------
+
+
+def precondition_met(sensor_state: str, peer_ips: list[str] | None) -> bool:
+    """True only if the sensor reads 'on' AND an established peer actually exists.
+
+    A sensor reading 'on' with no established peer is exactly the
+    looks-healthy-but-isn't gap issue #2 was about - both must hold.
+    """
+    return sensor_state == "on" and bool(peer_ips)
+
+
+def wait_for_healthy_precondition(
+    get_sensor_state: Callable[[], str],
+    get_peers: Callable[[], list[str] | str],
+    reload: Callable[[], None],
+    max_polls: int = 12,
+    sleep: Callable[[float], None] = lambda s: time.sleep(s),
+    poll_interval: float = 5.0,
+) -> None:
+    """Poll until precondition_met holds, reloading once and retrying if it never does.
+
+    `get_peers` returns either the peer list or an error-detail string (from
+    a failed peer check) - either way it's surfaced in the failure message,
+    since "no peers found" alone doesn't say why.
+    """
+    last_sensor_state = ""
+    last_peers: list[str] | str = []
+    for attempt in (1, 2):
+        for _ in range(max_polls):
+            last_sensor_state = get_sensor_state()
+            last_peers = get_peers()
+            peers = last_peers if isinstance(last_peers, list) else None
+            if precondition_met(last_sensor_state, peers):
+                return
+            sleep(poll_interval)
+        if attempt == 1:
+            reload()
+    raise ScenarioFailure(
+        f"precondition not met after reload-and-retry: sensor={last_sensor_state!r}, peers={last_peers!r}"
+    )
+
+
+def ensure_scenario_precondition(
+    token: str, entry_id: str, mqtt_entity: str, container_name: str, timeout: float = 60.0
+) -> None:
+    """Real-run wrapper: every scenario calls this before doing anything destructive.
+
+    A prior scenario's failure - this run or a previous one - must not
+    silently poison the ones after it.
+    """
+    def _get_peers() -> list[str] | str:
+        try:
+            return get_established_peer_ips(container_name)
+        except RuntimeError as e:
+            return str(e)
+
+    wait_for_healthy_precondition(
+        get_sensor_state=lambda: get_entity_state(token, mqtt_entity),
+        get_peers=_get_peers,
+        reload=lambda: _reload_ignoring_timeout(token, entry_id),
+        max_polls=max(1, int(timeout // 5)),
+    )
+
+
+def _reload_ignoring_timeout(token: str, entry_id: str) -> None:
+    try:
+        reload_entry(token, entry_id)
+    except ReloadTimedOut:
+        pass
+
+
 # --- Scenarios ---------------------------------------------------------
 
 
-def scenario_baseline(token: str, mqtt_entity: str) -> None:
-    state = get_entity_state(token, mqtt_entity)
-    if state != "on":
-        raise ScenarioFailure(f"{mqtt_entity} baseline is {state!r}, expected 'on'")
-    print(f"PASS baseline: {mqtt_entity} is on")
+def scenario_baseline(token: str, entry_id: str, mqtt_entity: str, container: Container) -> None:
+    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
+    print(f"PASS baseline: {mqtt_entity} is on with an established MQTT peer")
 
 
 def _wait_for_min_retry_attempts(container: Container, since: str, min_attempts: int, timeout: float) -> list[RetryAttempt]:
@@ -718,7 +791,7 @@ def _enter_retry_chain_from_connected(container: Container, since: str) -> None:
         interrupt_teardown.run()
 
 
-def scenario_reconnect_from_connected(container: Container, token: str, teardown: BestEffortTeardown, mqtt_entity: str) -> bool | None:
+def scenario_reconnect_from_connected(container: Container, token: str, teardown: BestEffortTeardown, entry_id: str, mqtt_entity: str) -> bool | None:
     """Issue #2's actual reproduction: MQTT is connected, the network dies
     underneath it, and the retry chain must re-arm and keep going."""
     if not check_net_admin_capable(container.name):
@@ -732,9 +805,7 @@ def scenario_reconnect_from_connected(container: Container, token: str, teardown
         )
         return None
 
-    baseline = get_entity_state(token, mqtt_entity)
-    if baseline != "on":
-        raise ScenarioFailure(f"{mqtt_entity} is {baseline!r} before the outage, expected 'on'")
+    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
 
     since = now_utc_iso()
     blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
@@ -785,7 +856,7 @@ def scenario_reconnect_from_connected(container: Container, token: str, teardown
     return True
 
 
-def scenario_interrupt_resume_recovers(container: Container, token: str, teardown: BestEffortTeardown, mqtt_entity: str) -> bool | None:
+def scenario_interrupt_resume_recovers(container: Container, token: str, teardown: BestEffortTeardown, entry_id: str, mqtt_entity: str) -> bool | None:
     """The common transient-blip path, distinct from the rare watchdog one:
     the connection drops, the CRT resumes via a different address within
     seconds, the resubscribe fails on stale credentials, and the fix forces
@@ -805,9 +876,7 @@ def scenario_interrupt_resume_recovers(container: Container, token: str, teardow
         )
         return None
 
-    baseline = get_entity_state(token, mqtt_entity)
-    if baseline != "on":
-        raise ScenarioFailure(f"{mqtt_entity} is {baseline!r} before the outage, expected 'on'")
+    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
 
     since = now_utc_iso()
     block_set = IpBlockSet(container.name, teardown)
@@ -860,10 +929,7 @@ def _ensure_recovered(token: str, entry_id: str, mqtt_entity: str) -> bool:
     if _wait_for_entity_state(token, mqtt_entity, "on", timeout=30.0):
         return True
     for attempt in (1, 2):
-        try:
-            reload_entry(token, entry_id)
-        except ReloadTimedOut:
-            pass
+        _reload_ignoring_timeout(token, entry_id)
         if _wait_for_entity_state(token, mqtt_entity, "on", timeout=120.0):
             return True
     return False
@@ -877,6 +943,8 @@ def scenario_setup_under_outage(container: Container, token: str, teardown: Best
     _async_refresh_and_reconnect, so it can't be used to test the fix's
     retry chain - only to pin setup's own behaviour under an outage.
     """
+    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
+
     since = now_utc_iso()
     blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
 
@@ -898,7 +966,7 @@ def scenario_setup_under_outage(container: Container, token: str, teardown: Best
     print("PASS recovery: entry reloaded and MQTT back on after DNS restored")
 
 
-def scenario_watchdog(container: Container, token: str, teardown: BestEffortTeardown) -> bool | None:
+def scenario_watchdog(container: Container, token: str, teardown: BestEffortTeardown, entry_id: str, mqtt_entity: str) -> bool | None:
     """The rare path: no address in the pool works, so resume never comes and
     the fix's own INTERRUPT_WATCHDOG_TIMEOUT has to force the reconnect itself.
 
@@ -915,6 +983,8 @@ def scenario_watchdog(container: Container, token: str, teardown: BestEffortTear
             "sidecar image and its iptables package."
         )
         return None
+
+    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
 
     since = now_utc_iso()
     block_set = IpBlockSet(container.name, teardown)
@@ -975,51 +1045,58 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    def _recover_between_scenarios() -> None:
+        # A scenario's own failure - this run or a previous one - must not
+        # silently poison the ones after it; each scenario's own
+        # ensure_scenario_precondition() call retries too, but landing back
+        # in a known-good state here keeps that retry cheap.
+        teardown.run()
+        if not _ensure_recovered(token, entry_id, mqtt_entity):
+            print("WARNING: could not recover between scenarios - the next one's own precondition wait will retry")
+
     try:
         try:
-            scenario_baseline(token, mqtt_entity)
+            scenario_baseline(token, entry_id, mqtt_entity, container)
             results["baseline"] = "PASS"
         except (ScenarioFailure, AssertionError, RuntimeError) as e:
             results["baseline"] = f"FAIL: {e}"
+        _recover_between_scenarios()
 
-        if results["baseline"] == "PASS":
-            try:
-                outcome = scenario_reconnect_from_connected(container, token, teardown, mqtt_entity)
-                results["reconnect_from_connected"] = "PASS" if outcome else (
-                    "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
-                )
-            except (ScenarioFailure, AssertionError, RuntimeError) as e:
-                results["reconnect_from_connected"] = f"FAIL: {e}"
+        try:
+            outcome = scenario_reconnect_from_connected(container, token, teardown, entry_id, mqtt_entity)
+            results["reconnect_from_connected"] = "PASS" if outcome else (
+                "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
+            )
+        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+            results["reconnect_from_connected"] = f"FAIL: {e}"
+        _recover_between_scenarios()
 
-            try:
-                outcome = scenario_interrupt_resume_recovers(container, token, teardown, mqtt_entity)
-                results["interrupt_resume_recovers"] = "PASS" if outcome else (
-                    "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
-                )
-            except (ScenarioFailure, AssertionError, RuntimeError) as e:
-                results["interrupt_resume_recovers"] = f"FAIL: {e}"
+        try:
+            outcome = scenario_interrupt_resume_recovers(container, token, teardown, entry_id, mqtt_entity)
+            results["interrupt_resume_recovers"] = "PASS" if outcome else (
+                "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
+            )
+        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+            results["interrupt_resume_recovers"] = f"FAIL: {e}"
+        _recover_between_scenarios()
 
-            try:
-                scenario_setup_under_outage(container, token, teardown, entry_id, mqtt_entity)
-                results["setup_under_outage"] = "PASS"
-            except (ScenarioFailure, AssertionError, RuntimeError) as e:
-                results["setup_under_outage"] = f"FAIL: {e}"
+        try:
+            scenario_setup_under_outage(container, token, teardown, entry_id, mqtt_entity)
+            results["setup_under_outage"] = "PASS"
+        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+            results["setup_under_outage"] = f"FAIL: {e}"
+        _recover_between_scenarios()
 
-            if args.skip_watchdog:
-                results["watchdog"] = "SKIP (--skip-watchdog)"
-            else:
-                try:
-                    outcome = scenario_watchdog(container, token, teardown)
-                    results["watchdog"] = "PASS" if outcome else (
-                        "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
-                    )
-                except (ScenarioFailure, AssertionError, RuntimeError) as e:
-                    results["watchdog"] = f"FAIL: {e}"
+        if args.skip_watchdog:
+            results["watchdog"] = "SKIP (--skip-watchdog)"
         else:
-            results["reconnect_from_connected"] = "SKIP (baseline unhealthy)"
-            results["interrupt_resume_recovers"] = "SKIP (baseline unhealthy)"
-            results["setup_under_outage"] = "SKIP (baseline unhealthy)"
-            results["watchdog"] = "SKIP (baseline unhealthy)"
+            try:
+                outcome = scenario_watchdog(container, token, teardown, entry_id, mqtt_entity)
+                results["watchdog"] = "PASS" if outcome else (
+                    "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
+                )
+            except (ScenarioFailure, AssertionError, RuntimeError) as e:
+                results["watchdog"] = f"FAIL: {e}"
     finally:
         teardown.run()
         if _ensure_recovered(token, entry_id, mqtt_entity):

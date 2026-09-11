@@ -255,9 +255,14 @@ and network access to pull the sidecar image and its `iptables`/`iproute2`
 packages. All three skip with a clear message if that's unavailable; pass
 `--skip-watchdog` to skip the watchdog one deliberately.
 
-The harness guarantees the integration is left working when it exits,
-reloading the entry if needed - if it can't get MQTT back on, it says so
-loudly and tells you to restart the dev container.
+Every scenario is independent: before doing anything destructive it waits
+for `binary_sensor.exo_pool_mqtt_connected` to be `on` *and* an established
+MQTT peer to actually exist, reloading the entry once and retrying if
+either isn't there yet - so a failure anywhere (this run or a stale state
+left over from a previous one) can't cascade into failing every scenario
+after it. The harness also guarantees the integration is left working when
+it exits, reloading the entry if needed - if it can't get MQTT back on, it
+says so loudly and tells you to restart the dev container.
 
 ---
 
