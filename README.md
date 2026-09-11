@@ -221,22 +221,31 @@ never a live instance. It runs four scenarios:
   current peer(s) are blocked, the CRT resumes via another address within
   seconds, the resubscribe fails on stale credentials, and the fix forces a
   refresh to recover.
-- **watchdog**: the rare case - every established peer is blocked and kept
-  blocked, so resume never comes and the fix's own interrupt watchdog has
-  to force the reconnect itself after 180s.
-- **setup-under-outage**: the config entry is reloaded while the network is
-  down - a different code path (setup, not the reconnect chain) - and pins
-  what that does, including recovery once the outage clears.
+- **watchdog**: the rare case - a total outbound block on port 443 (not by
+  address) keeps resume from ever succeeding, so the fix's own interrupt
+  watchdog has to force the reconnect itself after 180s.
+- **setup-under-outage**: the same total outbound block, paired with the
+  `/etc/hosts` blackhole, while the config entry is reloaded - a different
+  code path (setup, not the reconnect chain) - and pins what that does,
+  including recovery once the outage clears.
 
-The block list for all three is read from the container's actual
-established TCP connections (`ss -tn state established`, filtered to
-public, non-loopback peers on port 443), not from a fresh DNS lookup. AWS
-IoT's endpoint resolves to a pool of addresses that rotates continuously,
-and a connection established even a few minutes earlier is routinely
-pinned to an address no longer in the current DNS answer - blocking the
-DNS pool instead of the real peer reliably blocks nothing. This harness
-can't be made fully deterministic against a rotating cloud endpoint, but
-reading the actual peer is what makes it reliable rather than lucky.
+Two blocking mechanisms, deliberately not unified: reconnect-from-connected
+and interrupt-resume-recovers block by address - read from the container's
+actual established TCP connections (`ss -tn state established`, filtered
+to public, non-loopback peers on port 443), not a fresh DNS lookup, since
+AWS IoT's endpoint rotates continuously and a connection from a few minutes
+earlier is routinely pinned to an address no longer in the current DNS
+answer. That's also the more realistic simulation of a partial network
+failure, which is what those two scenarios model. watchdog and
+setup-under-outage need a *guaranteed* outage instead - blocking every
+address found doesn't survive the CRT reconnecting to a fresh one faster
+than the block can chase it - so they block by port
+(`iptables -p tcp --dport 443 -j DROP`) instead: deterministic regardless
+of which address gets used next, with a single rule to add and remove
+rather than a growing set. This harness can't be made fully deterministic
+against a rotating cloud endpoint; reading the actual peer (or blocking by
+port where an address list can't keep up) is what makes it reliable rather
+than lucky.
 
 ```bash
 export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
@@ -245,15 +254,14 @@ export EXO_HARNESS_TOKEN=<HA long-lived access token for the dev instance>
 python3 scripts/verify_outage_reconnect.py
 ```
 
-The reconnect-from-connected, interrupt-resume-recovers and watchdog
-scenarios need to block traffic and inspect connections, which the HA dev
-image has no tools for. They run a throwaway `alpine` sidecar (`docker run
---network container:ha-exo-pool-dev --cap-add NET_ADMIN ...`) that shares
-the dev container's network namespace instead - no changes to the dev
-container itself, so no recreate needed. It does need `docker run` access
-and network access to pull the sidecar image and its `iptables`/`iproute2`
-packages. All three skip with a clear message if that's unavailable; pass
-`--skip-watchdog` to skip the watchdog one deliberately.
+All four scenarios need to block traffic and inspect connections, which
+the HA dev image has no tools for. They run a throwaway `alpine` sidecar
+(`docker run --network container:ha-exo-pool-dev --cap-add NET_ADMIN ...`)
+that shares the dev container's network namespace instead - no changes to
+the dev container itself, so no recreate needed. It does need `docker run`
+access and network access to pull the sidecar image and its
+`iptables`/`iproute2` packages. Each skips with a clear message if that's
+unavailable; pass `--skip-watchdog` to skip the watchdog one deliberately.
 
 Every scenario is independent: before doing anything destructive it waits
 for `binary_sensor.exo_pool_mqtt_connected` to be `on` *and* an established

@@ -511,6 +511,15 @@ def iptables_rule_shell_cmd(ip: str, flag: str) -> str:
     return f"apk add -q iptables && iptables {flag} OUTPUT -d {ip} -p tcp -j DROP"
 
 
+def port_block_shell_cmd(flag: str, port: int) -> str:
+    """flag is '-I' to insert an OUTPUT DROP rule for every peer on `port`, '-D' to remove it.
+
+    Blocks by port rather than by address - deterministic against a
+    rotating pool, unlike a per-IP rule that a fresh address dodges.
+    """
+    return f"apk add -q iptables && iptables {flag} OUTPUT -p tcp --dport {port} -j DROP"
+
+
 # --- Outage simulation -----------------------------------------------------
 
 
@@ -632,6 +641,40 @@ class IpBlockSet:
                 del self._blocked[ip]
         if errors:
             raise RuntimeError(f"failed to remove {len(errors)} iptables DROP rule(s): {'; '.join(errors)}")
+
+
+def block_port_total_outage(
+    container_name: str,
+    teardown: BestEffortTeardown,
+    verify_still_reachable: Callable[[], None],
+    port: int = 443,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> None:
+    """Block every outbound connection on `port`, deterministically - by
+    port rather than by address, so a rotating pool can't dodge it the way
+    per-IP blocking can. `verify_still_reachable` confirms the harness's own
+    HA API access (a different port/direction entirely) survives the block,
+    rather than assuming it does; on failure this rolls the block back
+    before raising.
+    """
+    def _unblock() -> None:
+        result = run_netns_sidecar(container_name, port_block_shell_cmd("-D", port), runner=runner)
+        if result.returncode != 0:
+            raise RuntimeError(f"failed to remove port-{port} DROP rule: {result.stderr}")
+        print(f"Unblocked outbound TCP port {port} via netns sidecar")
+
+    add = run_netns_sidecar(container_name, port_block_shell_cmd("-I", port), runner=runner)
+    if add.returncode != 0:
+        raise RuntimeError(f"failed to add port-{port} DROP rule: {add.stderr}")
+    print(f"Blocked outbound TCP port {port} via netns sidecar (total outage)")
+
+    teardown.defer(_unblock)
+
+    try:
+        verify_still_reachable()
+    except Exception as e:
+        teardown.run()
+        raise RuntimeError(f"HA API became unreachable after blocking port {port} - rolled back: {e}") from e
 
 
 # --- Scenario precondition (unit tested) -----------------------------------
@@ -998,17 +1041,35 @@ def _ensure_recovered(token: str, entry_id: str, mqtt_entity: str) -> bool:
     return False
 
 
-def scenario_setup_under_outage(container: Container, token: str, teardown: BestEffortTeardown, entry_id: str, mqtt_entity: str) -> None:
+def scenario_setup_under_outage(container: Container, token: str, teardown: BestEffortTeardown, entry_id: str, mqtt_entity: str) -> bool | None:
     """Pins what happens when the entry is reloaded while the network is down.
 
     This is a different code path from scenario_reconnect_from_connected: a
     reload re-runs setup (get_coordinator -> _connect_mqtt), never
     _async_refresh_and_reconnect, so it can't be used to test the fix's
-    retry chain - only to pin setup's own behaviour under an outage.
+    retry chain - only to pin setup's own behaviour under an outage. Returns
+    True on pass, None if skipped (no NET_ADMIN for the total outbound block).
     """
+    if not check_net_admin_capable(container.name):
+        print(
+            "SKIP setup-under-outage: could not run iptables against the dev "
+            "container's network via a netns sidecar - cannot make the API "
+            "genuinely unreachable (an /etc/hosts blackhole alone lets a "
+            "pooled connection let setup complete anyway). Needs `docker run` "
+            "access and network access to pull the sidecar image and its "
+            "iptables package."
+        )
+        return None
+
     ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
 
+    # /etc/hosts only stops *new* DNS resolution - a pooled/keepalive
+    # connection can still let setup complete, so pair it with a total
+    # outbound block to make the API genuinely unreachable.
     blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
+    block_port_total_outage(
+        container.name, teardown, verify_still_reachable=lambda: get_entity_state(token, mqtt_entity),
+    )
 
     try:
         reload_entry(token, entry_id)
@@ -1026,15 +1087,16 @@ def scenario_setup_under_outage(container: Container, token: str, teardown: Best
     if not _ensure_recovered(token, entry_id, mqtt_entity):
         raise ScenarioFailure(recovery_failure_message(CONTAINER_NAME))
     print("PASS recovery: entry reloaded and MQTT back on after DNS restored")
+    return True
 
 
 def scenario_watchdog(container: Container, token: str, teardown: BestEffortTeardown, entry_id: str, mqtt_entity: str) -> bool | None:
-    """The rare path: no address in the pool works, so resume never comes and
-    the fix's own INTERRUPT_WATCHDOG_TIMEOUT has to force the reconnect itself.
-
-    Blocks every currently-established peer address, topping up any that rotate in
-    during the wait - a partial block just reproduces
-    scenario_interrupt_resume_recovers instead. Returns True on pass, False
+    """The rare path: no address works at all, so resume never comes and
+    the fix's own INTERRUPT_WATCHDOG_TIMEOUT has to force the reconnect
+    itself. Needs a guaranteed no-resume window, so this blocks by port
+    (block_port_total_outage), not by address - per-IP blocking degenerates
+    into scenario_interrupt_resume_recovers as the CRT dodges onto a fresh
+    address faster than a top-up can chase it. Returns True on pass, False
     on failure, None if skipped (no NET_ADMIN).
     """
     if not check_net_admin_capable(container.name):
@@ -1046,24 +1108,20 @@ def scenario_watchdog(container: Container, token: str, teardown: BestEffortTear
         )
         return None
 
-    peers = ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
+    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
 
     since = now_utc_iso()
-    block_set = IpBlockSet(container.name, teardown)
-    for ip in peers:
-        block_set.add(ip)
-
-    def _top_up() -> None:
-        _safe_top_up(block_set, container.name)
+    block_port_total_outage(
+        container.name, teardown, verify_still_reachable=lambda: get_entity_state(token, mqtt_entity),
+    )
 
     wait_for_log_pattern(
         container, _CONNECTION_INTERRUPTED_RE, since,
-        timeout=60.0, label="connection interrupt", on_tick=_top_up,
+        timeout=60.0, label="connection interrupt",
     )
     wait_for_log_pattern(
         container, _WATCHDOG_FORCED_RECONNECT_RE, since,
         timeout=INTERRUPT_WATCHDOG_TIMEOUT + 60, label="watchdog-forced reconnect",
-        on_tick=_top_up,
     )
     print("PASS watchdog: forced reconnect after interrupt with no resume")
     teardown.run()
@@ -1143,8 +1201,10 @@ def main() -> int:
         _recover_between_scenarios()
 
         try:
-            scenario_setup_under_outage(container, token, teardown, entry_id, mqtt_entity)
-            results["setup_under_outage"] = "PASS"
+            outcome = scenario_setup_under_outage(container, token, teardown, entry_id, mqtt_entity)
+            results["setup_under_outage"] = "PASS" if outcome else (
+                "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
+            )
         except (ScenarioFailure, AssertionError, RuntimeError) as e:
             results["setup_under_outage"] = f"FAIL: {e}"
         _recover_between_scenarios()

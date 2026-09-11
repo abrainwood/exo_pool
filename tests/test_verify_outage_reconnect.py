@@ -584,6 +584,64 @@ def test_ip_block_set_teardown_removes_the_rest_even_if_one_ip_fails():
     assert removed == ["apk add -q iptables && iptables -D OUTPUT -d 3.226.158.32 -p tcp -j DROP"]
 
 
+def test_block_port_total_outage_issues_the_insert_rule_and_verifies_reachable():
+    calls = []
+    verified = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv[-1])
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    teardown = harness.BestEffortTeardown()
+    harness.block_port_total_outage(
+        "ha-exo-pool-dev", teardown, verify_still_reachable=lambda: verified.append(1),
+        port=443, runner=fake_runner,
+    )
+
+    assert calls == ["apk add -q iptables && iptables -I OUTPUT -p tcp --dport 443 -j DROP"]
+    assert verified == [1]
+
+
+def test_block_port_total_outage_teardown_removes_the_rule():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv[-1])
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    teardown = harness.BestEffortTeardown()
+    harness.block_port_total_outage(
+        "ha-exo-pool-dev", teardown, verify_still_reachable=lambda: None, port=443, runner=fake_runner,
+    )
+    calls.clear()
+
+    teardown.run()
+
+    assert calls == ["apk add -q iptables && iptables -D OUTPUT -p tcp --dport 443 -j DROP"]
+
+
+def test_block_port_total_outage_rolls_back_when_unreachable():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv[-1])
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    def _fail_reachability():
+        raise RuntimeError("HA API unreachable")
+
+    teardown = harness.BestEffortTeardown()
+    with pytest.raises(RuntimeError, match="rolled back"):
+        harness.block_port_total_outage(
+            "ha-exo-pool-dev", teardown, verify_still_reachable=_fail_reachability, port=443, runner=fake_runner,
+        )
+
+    assert calls == [
+        "apk add -q iptables && iptables -I OUTPUT -p tcp --dport 443 -j DROP",
+        "apk add -q iptables && iptables -D OUTPUT -p tcp --dport 443 -j DROP",
+    ]
+
+
 def test_build_netns_sidecar_cmd_shares_the_target_containers_network():
     argv = harness.build_netns_sidecar_cmd("ha-exo-pool-dev", "echo hi")
 
@@ -605,6 +663,18 @@ def test_iptables_rule_shell_cmd_builds_the_delete_form():
     cmd = harness.iptables_rule_shell_cmd("10.0.0.5", "-D")
 
     assert cmd == "apk add -q iptables && iptables -D OUTPUT -d 10.0.0.5 -p tcp -j DROP"
+
+
+def test_port_block_shell_cmd_builds_the_insert_form():
+    cmd = harness.port_block_shell_cmd("-I", 443)
+
+    assert cmd == "apk add -q iptables && iptables -I OUTPUT -p tcp --dport 443 -j DROP"
+
+
+def test_port_block_shell_cmd_builds_the_delete_form():
+    cmd = harness.port_block_shell_cmd("-D", 443)
+
+    assert cmd == "apk add -q iptables && iptables -D OUTPUT -p tcp --dport 443 -j DROP"
 
 
 def test_check_net_admin_capable_true_when_sidecar_iptables_succeeds():
