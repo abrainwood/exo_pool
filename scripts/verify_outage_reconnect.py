@@ -807,7 +807,6 @@ def scenario_reconnect_from_connected(container: Container, token: str, teardown
 
     ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
 
-    since = now_utc_iso()
     blackhole_hosts(container, teardown, BLACKHOLE_HOSTS)
     _enter_retry_chain_from_connected(container, since)
 
