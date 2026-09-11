@@ -6,6 +6,7 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import aiohttp_client
 
 from .const import DOMAIN
+from .redact import redact
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -58,19 +59,12 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     },
                 ) as resp:
                     _LOGGER.debug("Login raw response status: %s", resp.status)
-                    _LOGGER.debug("Login raw response headers: %s", resp.headers)
-                    raw_response = await resp.text()
-                    _LOGGER.debug("Login raw response text: %s", raw_response)
 
                     # Parse JSON response
                     try:
                         result = await resp.json()
                     except Exception as e:
-                        _LOGGER.error(
-                            "Failed to parse login response JSON: %s, Raw: %s",
-                            e,
-                            raw_response,
-                        )
+                        _LOGGER.error("Failed to parse login response JSON: %s", e)
                         errors["base"] = "unknown"
                         return self.async_show_form(
                             step_id="user",
@@ -78,7 +72,7 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             errors=errors,
                         )
 
-                    _LOGGER.debug("Login response parsed: %s", result)
+                    _LOGGER.debug("Login response parsed: %s", redact(result))
                     _LOGGER.debug(
                         "Condition check: status=%s, auth_token=%s, userPoolOAuth=%s",
                         resp.status == 200,
@@ -108,7 +102,7 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         _LOGGER.error(
                             "Login response invalid: Status=%s, Result=%s",
                             resp.status,
-                            result,
+                            redact(result),
                         )
                         errors["base"] = "auth_failed"
 

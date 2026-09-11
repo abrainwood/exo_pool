@@ -17,6 +17,13 @@ for pkg in ("custom_components", "custom_components.exo_pool"):
     if pkg not in sys.modules:
         sys.modules[pkg] = types.ModuleType(pkg)
 
+# Give the exo_pool stub a real __path__ so that a module loaded standalone
+# below (e.g. api.py) can still resolve its own relative imports of sibling
+# modules (e.g. `from .redact import redact`) via normal package lookup.
+sys.modules["custom_components.exo_pool"].__path__ = [
+    str(_REPO_ROOT / "custom_components" / "exo_pool")
+]
+
 
 def load_exo_pool_module(name: str):
     """Load a custom_components.exo_pool submodule directly.

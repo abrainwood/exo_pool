@@ -13,6 +13,8 @@ import logging
 import time
 import asyncio
 
+from .redact import redact
+
 _LOGGER = logging.getLogger(__name__)
 
 # Header names we want to surface when present on any response
@@ -416,7 +418,7 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
             await _full_login(hass, entry, session)
 
         id_token = entry.data.get("id_token")  # Update after refresh/login
-        _LOGGER.debug("Authentication token refreshed: %s", id_token[:10] + "...")
+        _LOGGER.debug("Authentication token refreshed")
 
     # Fetch device data
     headers = {
@@ -550,7 +552,7 @@ async def _full_login(
         "email": entry.data["email"],
         "password": entry.data["password"],
     }
-    _LOGGER.debug("Login payload: %s", {**payload, "password": "REDACTED"})
+    _LOGGER.debug("Login payload: %s", redact(payload))
     await _async_rate_limit(hass, entry)
     async with session.post(LOGIN_URL, json=payload, headers=headers) as response:
         _LOGGER.debug("Login response status: %s", response.status)
@@ -563,10 +565,7 @@ async def _full_login(
             _last_auth_error = error_text
             raise Exception(f"Authentication failed: {error_text}")
         data = await response.json()
-        _LOGGER.debug(
-            "Login response data: %s",
-            {k: v if k != "id_token" else v[:10] + "..." for k, v in data.items()},
-        )
+        _LOGGER.debug("Login response data: %s", redact(data))
         id_token = data.get("userPoolOAuth", {}).get("IdToken")
         refresh_token = data.get("userPoolOAuth", {}).get("RefreshToken")
         auth_token = data.get("authentication_token")
@@ -575,12 +574,12 @@ async def _full_login(
             "ExpiresIn", 3600
         )  # Default to 1 hour if not present
         if not id_token:
-            _LOGGER.error("No userPoolOAuth.IdToken in response: %s", data)
+            _LOGGER.error("No userPoolOAuth.IdToken in response: %s", redact(data))
             _authentication_failed = True
             _last_auth_error = "No userPoolOAuth.IdToken received"
             raise Exception("No userPoolOAuth.IdToken received")
         if not auth_token:
-            _LOGGER.error("No authentication_token in response: %s", data)
+            _LOGGER.error("No authentication_token in response: %s", redact(data))
             _authentication_failed = True
             _last_auth_error = "No authentication_token received"
             raise Exception("No authentication_token received")
@@ -608,7 +607,7 @@ async def _refresh_token(
         "email": entry.data["email"],
         "refresh_token": entry.data["refresh_token"],
     }
-    _LOGGER.debug("Refresh token payload: %s", {**payload, "refresh_token": "REDACTED"})
+    _LOGGER.debug("Refresh token payload: %s", redact(payload))
     await _async_rate_limit(hass, entry)
     async with session.post(REFRESH_URL, json=payload, headers=headers) as response:
         _LOGGER.debug("Refresh response status: %s", response.status)
@@ -618,10 +617,7 @@ async def _refresh_token(
             _LOGGER.error("Failed to refresh token: %s", error_text)
             return False
         data = await response.json()
-        _LOGGER.debug(
-            "Refresh response data: %s",
-            {k: v if k != "id_token" else v[:10] + "..." for k, v in data.items()},
-        )
+        _LOGGER.debug("Refresh response data: %s", redact(data))
         id_token = data.get("userPoolOAuth", {}).get("IdToken")
         refresh_token = data.get("userPoolOAuth", {}).get(
             "RefreshToken"
@@ -630,7 +626,9 @@ async def _refresh_token(
         user_id = data.get("id")
         expires_in = data.get("userPoolOAuth", {}).get("ExpiresIn", 3600)
         if not id_token:
-            _LOGGER.error("No userPoolOAuth.IdToken in refresh response: %s", data)
+            _LOGGER.error(
+                "No userPoolOAuth.IdToken in refresh response: %s", redact(data)
+            )
             return False
         update_data = {
             **entry.data,
