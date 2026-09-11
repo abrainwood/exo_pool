@@ -17,3 +17,7 @@ custom_components/exo_pool/scripts.yaml
 custom_components/exo_pool/scenes.yaml
 custom_components/exo_pool/blueprints/
 custom_components/exo_pool/home-assistant*
+
+# HA writes these into the component dir; never track them
+*.log
+*.log.[0-9]
