@@ -10,12 +10,11 @@ from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
 )
 import logging
+from . import api
 from .api import (
     get_coordinator,
     get_mqtt_client,
     ERROR_CODES,
-    _authentication_failed,
-    _last_auth_error_redacted,
     DOMAIN,
 )
 from homeassistant.const import EntityCategory
@@ -230,12 +229,14 @@ class AuthenticationStatusBinarySensor(CoordinatorEntity, BinarySensorEntity):
     @property
     def is_on(self):
         """Return true if authentication is successful."""
-        return not _authentication_failed
+        return not api._authentication_failed
 
     @property
     def extra_state_attributes(self):
         """Provide additional details about authentication status."""
-        return {"last_error": _last_auth_error_redacted} if _authentication_failed else {}
+        if not api._authentication_failed:
+            return {}
+        return {"last_error": api._last_auth_error_redacted}
 
     @property
     def available(self):
