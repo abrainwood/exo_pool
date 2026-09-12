@@ -192,8 +192,8 @@ class TestShadowCallback:
 
         # Bridged via call_soon_threadsafe (not called directly), which the
         # fixture executes immediately so the callback has already run.
-        mock_event_loop.call_soon_threadsafe.assert_called_with(callback, reported_state)
-        callback.assert_called_once_with(reported_state)
+        mock_event_loop.call_soon_threadsafe.assert_called_with(callback, reported_state, {})
+        callback.assert_called_once_with(reported_state, {})
 
     def test_shadow_callback_invoked_on_get_accepted(
         self, build_client, mock_mqtt_connection, mock_event_loop
@@ -229,8 +229,76 @@ class TestShadowCallback:
             retain=False,
         )
 
-        mock_event_loop.call_soon_threadsafe.assert_called_with(callback, reported_state)
-        callback.assert_called_once_with(reported_state)
+        mock_event_loop.call_soon_threadsafe.assert_called_with(callback, reported_state, {})
+        callback.assert_called_once_with(reported_state, {})
+
+    def test_shadow_callback_receives_the_current_desired_state_from_update_documents(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        callback = MagicMock()
+        client = build_client()
+        client.set_shadow_callback(callback)
+        client.connect(SAMPLE_CREDENTIALS)
+
+        doc_sub_call = None
+        for c in mock_mqtt_connection.subscribe.call_args_list:
+            topic = c.kwargs.get("topic") or c.args[0]
+            if "update/documents" in topic:
+                doc_sub_call = c
+                break
+        mqtt_callback = doc_sub_call.kwargs.get("callback") or doc_sub_call.args[2]
+
+        reported_state = {"equipment": {"swc_0": {"production": 0}}}
+        desired_state = {"equipment": {"swc_0": {"production": 0}}}
+        shadow_doc = {
+            "current": {
+                "state": {"reported": reported_state, "desired": desired_state},
+            },
+            "previous": {"state": {"reported": {}}},
+            "timestamp": 1776208189,
+        }
+        mqtt_callback(
+            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/update/documents",
+            payload=json.dumps(shadow_doc).encode(),
+            dup=False,
+            qos=1,
+            retain=False,
+        )
+
+        callback.assert_called_once_with(reported_state, desired_state)
+
+    def test_shadow_callback_gets_an_empty_desired_dict_when_get_accepted_carries_none(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        callback = MagicMock()
+        client = build_client()
+        client.set_shadow_callback(callback)
+        client.connect(SAMPLE_CREDENTIALS)
+
+        get_sub_call = None
+        for c in mock_mqtt_connection.subscribe.call_args_list:
+            topic = c.kwargs.get("topic") or c.args[0]
+            if "get/accepted" in topic:
+                get_sub_call = c
+                break
+        mqtt_callback = get_sub_call.kwargs.get("callback") or get_sub_call.args[2]
+
+        reported_state = {"equipment": {"swc_0": {"swc": 30}}}
+        shadow_get = {
+            "state": {"reported": reported_state},
+            "metadata": {},
+            "version": 150334,
+            "timestamp": 1776206206,
+        }
+        mqtt_callback(
+            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/get/accepted",
+            payload=json.dumps(shadow_get).encode(),
+            dup=False,
+            qos=1,
+            retain=False,
+        )
+
+        callback.assert_called_once_with(reported_state, {})
 
     def test_no_callback_set_does_not_bridge(
         self, build_client, mock_mqtt_connection, mock_event_loop

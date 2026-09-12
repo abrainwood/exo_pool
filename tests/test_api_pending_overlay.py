@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -11,38 +13,8 @@ api = load_exo_pool_module("api")
 
 
 @pytest.fixture
-def entry(hass):
-    config_entry = MockConfigEntry(
-        domain=api.DOMAIN,
-        data={"serial_number": "JT00000000", "id_token": "tok"},
-        options={},
-    )
-    config_entry.add_to_hass(hass)
-    api._get_entry_store(hass, config_entry)
-    return config_entry
-
-
-@pytest.fixture(autouse=True)
-def fake_client_session(monkeypatch):
-    monkeypatch.setattr(
-        api.aiohttp_client, "async_get_clientsession", MagicMock(return_value=MagicMock())
-    )
-
-
-@pytest.fixture
 def no_write_gap_sleep(monkeypatch):
-    """Writes in these tests aren't testing the post-write gap - skip it."""
     monkeypatch.setattr(api.asyncio, "sleep", AsyncMock())
-
-
-@pytest.fixture
-def connected_mqtt(hass, entry):
-    store = api._get_entry_store(hass, entry)
-    client = MagicMock()
-    client.connected = True
-    client.publish_desired = MagicMock()
-    store["mqtt_client"] = client
-    return client
 
 
 @pytest.fixture
@@ -64,7 +36,7 @@ SWC_0 = {
 async def test_write_then_stale_echo_with_reported_still_zero_keeps_the_written_value(
     hass, entry, connected_mqtt, coordinator
 ):
-    coordinator.async_set_updated_data({"equipment": {"swc_0": dict(SWC_0)}})
+    coordinator.async_set_updated_data({"equipment": {"swc_0": copy.deepcopy(SWC_0)}})
 
     await api.set_pool_value(hass, entry, "production", 1)
 
@@ -77,7 +49,7 @@ async def test_write_then_stale_echo_with_reported_still_zero_keeps_the_written_
 async def test_unrelated_sensor_change_while_pending_updates_but_production_stays_pending(
     hass, entry, connected_mqtt, coordinator
 ):
-    coordinator.async_set_updated_data({"equipment": {"swc_0": dict(SWC_0)}})
+    coordinator.async_set_updated_data({"equipment": {"swc_0": copy.deepcopy(SWC_0)}})
 
     await api.set_pool_value(hass, entry, "production", 1)
 
@@ -93,7 +65,7 @@ async def test_unrelated_sensor_change_while_pending_updates_but_production_stay
 async def test_matching_report_clears_pending_so_a_later_off_report_is_honored(
     hass, entry, connected_mqtt, coordinator
 ):
-    coordinator.async_set_updated_data({"equipment": {"swc_0": dict(SWC_0)}})
+    coordinator.async_set_updated_data({"equipment": {"swc_0": copy.deepcopy(SWC_0)}})
 
     await api.set_pool_value(hass, entry, "production", 1)
 
@@ -109,7 +81,7 @@ async def test_matching_report_clears_pending_so_a_later_off_report_is_honored(
 async def test_write_one_then_zero_quickly_leaves_pending_at_the_latest_value(
     hass, entry, connected_mqtt, coordinator, monkeypatch, no_write_gap_sleep
 ):
-    coordinator.async_set_updated_data({"equipment": {"swc_0": dict(SWC_0)}})
+    coordinator.async_set_updated_data({"equipment": {"swc_0": copy.deepcopy(SWC_0)}})
     clock = [1000.0]
     monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
 
@@ -164,7 +136,7 @@ async def test_connect_mqtt_shadow_callback_overlays_pending_writes(hass, entry,
 
     api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
     stale_echo = {"equipment": {"swc_0": {"production": 0}}}
-    shadow_callback(stale_echo)
+    shadow_callback(stale_echo, {})
 
     coordinator.async_set_updated_data.assert_called_once_with(
         {"equipment": {"swc_0": {"production": 1}}}
@@ -233,7 +205,7 @@ async def test_async_update_data_rest_fetch_overlays_pending_writes(
 async def test_no_matching_report_before_expiry_lets_stale_reported_value_win(
     hass, entry, connected_mqtt, coordinator, monkeypatch
 ):
-    coordinator.async_set_updated_data({"equipment": {"swc_0": dict(SWC_0)}})
+    coordinator.async_set_updated_data({"equipment": {"swc_0": copy.deepcopy(SWC_0)}})
     clock = [1000.0]
     monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
 

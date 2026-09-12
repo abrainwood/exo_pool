@@ -251,7 +251,7 @@ class ExoMqttClient:
             _LOGGER.warning("Malformed shadow payload on %s", topic)
             return
 
-        reported = self._extract_reported(topic, data)
+        reported, desired = self._extract_reported(topic, data)
         if reported is None:
             _LOGGER.debug("Shadow message on %s (no reported state to extract)", topic)
             return
@@ -265,16 +265,17 @@ class ExoMqttClient:
                     _LOGGER.info("Shadow changes: %s", ", ".join(changes))
 
         if self._shadow_callback is not None:
-            self._loop.call_soon_threadsafe(self._shadow_callback, reported)
+            self._loop.call_soon_threadsafe(self._shadow_callback, reported, desired)
 
-    def _extract_reported(self, topic: str, data: dict) -> dict | None:
-        """Extract the reported state dict from a shadow message."""
+    def _extract_reported(self, topic: str, data: dict) -> tuple[dict | None, dict]:
+        """Extract the (reported, desired) state dicts from a shadow message."""
         if "update/documents" in topic:
-            return data.get("current", {}).get("state", {}).get("reported")
+            current_state = data.get("current", {}).get("state", {})
+            return current_state.get("reported"), current_state.get("desired") or {}
         if "get/accepted" in topic:
-            return data.get("state", {}).get("reported")
+            return data.get("state", {}).get("reported"), {}
         # update/accepted and update/delta don't carry the full reported state
-        return None
+        return None, {}
 
     def set_interrupted_watchdog_callback(self, callback: Callable[[], None]) -> None:
         """Register a callback invoked when resume doesn't follow an interrupt in time.

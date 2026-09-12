@@ -121,7 +121,7 @@ def connected_client(build_client, mock_mqtt_connection, mock_event_loop):
     mock_event_loop.call_soon_threadsafe = capture_call_soon
 
     client = build_client()
-    client.set_shadow_callback(lambda data: received_data.append(data))
+    client.set_shadow_callback(lambda data, desired: received_data.append(data))
     client.connect(SAMPLE_CREDENTIALS)
 
     return client, mock_mqtt_connection, received_data

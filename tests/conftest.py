@@ -112,6 +112,48 @@ def mock_event_loop_deferred():
 
 
 @pytest.fixture
+def entry(hass):
+    """A loaded config entry with an id_token, for api.py write/overlay tests."""
+    from unittest.mock import MagicMock
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    api = load_exo_pool_module("api")
+    config_entry = MockConfigEntry(
+        domain=api.DOMAIN,
+        data={"serial_number": SAMPLE_SERIAL, "id_token": "tok"},
+        options={},
+    )
+    config_entry.add_to_hass(hass)
+    api._get_entry_store(hass, config_entry)
+    return config_entry
+
+
+@pytest.fixture(autouse=True)
+def fake_client_session(monkeypatch):
+    """api.py tests never hit the network - stub the HA aiohttp helper."""
+    from unittest.mock import MagicMock
+
+    api = load_exo_pool_module("api")
+    monkeypatch.setattr(
+        api.aiohttp_client, "async_get_clientsession", MagicMock(return_value=MagicMock())
+    )
+
+
+@pytest.fixture
+def connected_mqtt(hass, entry):
+    """Install a stub MQTT client that always accepts publish_desired."""
+    from unittest.mock import MagicMock
+
+    api = load_exo_pool_module("api")
+    store = api._get_entry_store(hass, entry)
+    client = MagicMock()
+    client.connected = True
+    client.publish_desired = MagicMock()
+    store["mqtt_client"] = client
+    return client
+
+
+@pytest.fixture
 def build_client(mock_mqtt_connection, mock_event_loop):
     """Factory to build an ExoMqttClient with mocked internals."""
     from unittest.mock import MagicMock
