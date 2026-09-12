@@ -982,8 +982,8 @@ def _try_mqtt(
     try:
         mqtt_client.publish_desired(desired)
         return True
-    except Exception:
-        _LOGGER.warning("MQTT publish failed for %s", item.key)
+    except Exception as err:
+        _LOGGER.warning("MQTT publish failed for %s: %s", item.key, err)
         return False
 
 
@@ -1022,7 +1022,7 @@ async def _execute_write(
             return Transport.MQTT
 
     _record_pending_writes(hass, entry, [], desired)
-    _LOGGER.debug("Writing %s via REST fallback", item.key)
+    _LOGGER.info("Writing %s via REST fallback", item.key)
     try:
         await _execute_write_rest(hass, entry, item, desired)
     except (Exception, asyncio.CancelledError):

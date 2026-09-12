@@ -315,6 +315,26 @@ class TestMqttPublishFailurePreservesPublishedValues:
 
         assert overlaid["equipment"]["swc_0"]["production"] == 0
 
+    async def test_mqtt_publish_failure_logs_the_key_and_error_at_warning(
+        self, hass, entry, connected_mqtt, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(api.asyncio, "sleep", AsyncMock())
+        monkeypatch.setattr(api, "_execute_write_rest", AsyncMock(return_value=None))
+        connected_mqtt.publish_desired.side_effect = ConnectionError("dropped")
+
+        with caplog.at_level(logging.INFO):
+            await api.set_pool_value(hass, entry, "production", 1)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "pool:production" in warnings[0].getMessage()
+        assert "dropped" in warnings[0].getMessage()
+        assert any(
+            "via REST fallback" in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.INFO
+        )
+
 
 class TestRecordBeforeRestSend:
     async def test_stale_echo_arriving_during_rest_send_is_already_overlaid(
@@ -627,6 +647,7 @@ class TestWakeHeldWriteOnMqttReconnect:
         async def fake_sleep(seconds):
             fake_clock[0] += seconds
             disconnected_mqtt.connected = True
+            api._wake_held_write_on_reconnect(hass, entry, True)
 
         monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
 

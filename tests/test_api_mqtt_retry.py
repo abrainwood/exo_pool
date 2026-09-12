@@ -407,6 +407,34 @@ async def test_connect_mqtt_wires_the_watchdog_callback_to_force_a_reconnect(
     reconnect.assert_called_once_with(hass, entry, force_credential_refresh=True)
 
 
+async def test_connect_mqtt_wires_the_reconnect_failed_callback_to_force_a_reconnect(
+    hass, entry, monkeypatch
+):
+    store = api._get_entry_store(hass, entry)
+    store["aws_credentials"] = {"Expiration": ""}
+    store["coordinator"] = MagicMock()
+
+    fake_mqtt_client = MagicMock()
+    fake_mqtt_client.connect.return_value = None
+    fake_client_cls = MagicMock(return_value=fake_mqtt_client)
+    monkeypatch.setattr(
+        sys.modules["custom_components.exo_pool.mqtt_client"],
+        "ExoMqttClient",
+        fake_client_cls,
+    )
+    trigger = MagicMock()
+    monkeypatch.setattr(api, "_trigger_mqtt_reconnect", trigger)
+
+    api._connect_mqtt(hass, entry)
+
+    fake_mqtt_client.set_reconnect_failed_callback.assert_called_once()
+    reconnect_failed = fake_mqtt_client.set_reconnect_failed_callback.call_args.args[0]
+
+    reconnect_failed()
+
+    trigger.assert_called_once_with(hass, entry, name="exo_pool_reconnect_refresh")
+
+
 async def test_connect_mqtt_wires_the_state_changed_callback_to_coordinator_listeners(
     hass, entry, monkeypatch
 ):
