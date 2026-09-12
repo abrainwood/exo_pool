@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 import logging
 import time
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from tests.conftest import load_exo_pool_module
+from tests.conftest import FakeResponse, FakeSession, load_exo_pool_module
 
 api = load_exo_pool_module("api")
 
@@ -37,35 +36,6 @@ LOGIN_RESPONSE = {
 }
 
 
-class _FakeResponse:
-    def __init__(self, status: int, payload: dict):
-        self.status = status
-        self.headers: dict = {}
-        self._payload = payload
-
-    async def json(self):
-        return self._payload
-
-    async def text(self):
-        return json.dumps(self._payload)
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc_info):
-        return False
-
-
-class _FakeSession:
-    def __init__(self, response: _FakeResponse):
-        self._response = response
-
-    def post(self, url, json=None, headers=None):  # noqa: A002 - matches aiohttp signature
-        return self._response
-
-    def get(self, url, headers=None):
-        return self._response
-
 
 @pytest.fixture
 def entry(hass):
@@ -86,7 +56,7 @@ def entry(hass):
 
 
 async def test_full_login_does_not_log_any_secret_value(hass, entry, caplog):
-    session = _FakeSession(_FakeResponse(200, LOGIN_RESPONSE))
+    session = FakeSession(FakeResponse(200, LOGIN_RESPONSE))
 
     with caplog.at_level(logging.DEBUG):
         await api._full_login(hass, entry, session)
@@ -99,8 +69,8 @@ async def test_full_login_does_not_log_any_secret_value(hass, entry, caplog):
 async def test_full_login_auth_failure_does_not_log_or_raise_with_a_secret_value(
     hass, entry, caplog
 ):
-    session = _FakeSession(
-        _FakeResponse(401, {"message": "Invalid credentials", "password": "hunter2"})
+    session = FakeSession(
+        FakeResponse(401, {"message": "Invalid credentials", "password": "hunter2"})
     )
 
     with caplog.at_level(logging.DEBUG):
@@ -128,8 +98,8 @@ async def test_async_update_data_does_not_log_even_a_truncated_prefix_of_the_ref
     monkeypatch.setattr(
         api.aiohttp_client,
         "async_get_clientsession",
-        lambda hass: _FakeSession(
-            _FakeResponse(200, {"state": {"reported": {"equipment": {}}}})
+        lambda hass: FakeSession(
+            FakeResponse(200, {"state": {"reported": {"equipment": {}}}})
         ),
     )
 
@@ -154,8 +124,8 @@ async def test_async_update_data_read_429_does_not_log_a_secret_shaped_body_valu
     fresh_entry.add_to_hass(hass)
     api._get_entry_store(hass, fresh_entry)
 
-    session = _FakeSession(
-        _FakeResponse(429, {"message": "Too Many Requests", "id_token": "id-tok-abc123"})
+    session = FakeSession(
+        FakeResponse(429, {"message": "Too Many Requests", "id_token": "id-tok-abc123"})
     )
     monkeypatch.setattr(
         api.aiohttp_client, "async_get_clientsession", lambda hass: session
@@ -182,8 +152,8 @@ async def test_async_update_data_fetch_failure_does_not_log_or_raise_with_a_secr
     fresh_entry.add_to_hass(hass)
     api._get_entry_store(hass, fresh_entry)
 
-    session = _FakeSession(
-        _FakeResponse(403, {"message": "Forbidden", "id_token": "id-tok-abc123"})
+    session = FakeSession(
+        FakeResponse(403, {"message": "Forbidden", "id_token": "id-tok-abc123"})
     )
     monkeypatch.setattr(
         api.aiohttp_client, "async_get_clientsession", lambda hass: session
@@ -202,8 +172,8 @@ async def test_async_update_data_fetch_failure_does_not_log_or_raise_with_a_secr
 async def test_write_rate_limited_response_does_not_log_a_secret_shaped_body_value(
     hass, entry, monkeypatch, caplog
 ):
-    session = _FakeSession(
-        _FakeResponse(429, {"message": "Too Many Requests", "id_token": "id-tok-abc123"})
+    session = FakeSession(
+        FakeResponse(429, {"message": "Too Many Requests", "id_token": "id-tok-abc123"})
     )
     monkeypatch.setattr(
         api.aiohttp_client, "async_get_clientsession", lambda hass: session
@@ -222,8 +192,8 @@ async def test_write_rate_limited_response_does_not_log_a_secret_shaped_body_val
 async def test_write_failed_non_429_does_not_log_or_raise_with_a_secret_value(
     hass, entry, monkeypatch, caplog
 ):
-    session = _FakeSession(
-        _FakeResponse(403, {"message": "Forbidden", "id_token": "id-tok-abc123"})
+    session = FakeSession(
+        FakeResponse(403, {"message": "Forbidden", "id_token": "id-tok-abc123"})
     )
     monkeypatch.setattr(
         api.aiohttp_client, "async_get_clientsession", lambda hass: session
@@ -241,7 +211,7 @@ async def test_write_failed_non_429_does_not_log_or_raise_with_a_secret_value(
     assert "Forbidden" in str(exc_info.value)
 
 
-class _NonJsonResponse(_FakeResponse):
+class _NonJsonResponse(FakeResponse):
     def __init__(self, status: int, body: str):
         super().__init__(status, {})
         self._body = body
@@ -254,7 +224,7 @@ async def test_write_rate_limited_non_json_body_does_not_log_the_raw_body(
     hass, entry, monkeypatch, caplog
 ):
     non_json_body = "<html>upstream outage, token=id-tok-abc123</html>"
-    session = _FakeSession(_NonJsonResponse(429, non_json_body))
+    session = FakeSession(_NonJsonResponse(429, non_json_body))
     monkeypatch.setattr(
         api.aiohttp_client, "async_get_clientsession", lambda hass: session
     )
@@ -269,7 +239,7 @@ async def test_write_rate_limited_non_json_body_does_not_log_the_raw_body(
 
 
 async def test_refresh_token_does_not_log_any_secret_value(hass, entry, caplog):
-    session = _FakeSession(_FakeResponse(200, LOGIN_RESPONSE))
+    session = FakeSession(FakeResponse(200, LOGIN_RESPONSE))
 
     with caplog.at_level(logging.DEBUG):
         await api._refresh_token(hass, entry, session)
@@ -280,8 +250,8 @@ async def test_refresh_token_does_not_log_any_secret_value(hass, entry, caplog):
 
 
 async def test_refresh_token_failure_does_not_log_a_secret_value(hass, entry, caplog):
-    session = _FakeSession(
-        _FakeResponse(401, {"message": "Invalid refresh token", "refresh_token": "old-refresh-tok"})
+    session = FakeSession(
+        FakeResponse(401, {"message": "Invalid refresh token", "refresh_token": "old-refresh-tok"})
     )
 
     with caplog.at_level(logging.DEBUG):
@@ -307,8 +277,8 @@ async def test_async_update_data_success_does_not_log_the_raw_device_data(
     fresh_entry.add_to_hass(hass)
     api._get_entry_store(hass, fresh_entry)
 
-    session = _FakeSession(
-        _FakeResponse(
+    session = FakeSession(
+        FakeResponse(
             200,
             {"state": {"reported": {"equipment": {"id_token": "id-tok-abc123"}}}},
         )
@@ -326,8 +296,8 @@ async def test_async_update_data_success_does_not_log_the_raw_device_data(
 async def test_full_login_auth_failure_keeps_a_redacted_copy_for_the_public_attribute(
     hass, entry, caplog
 ):
-    session = _FakeSession(
-        _FakeResponse(401, {"message": "Invalid credentials", "password": "hunter2"})
+    session = FakeSession(
+        FakeResponse(401, {"message": "Invalid credentials", "password": "hunter2"})
     )
 
     with pytest.raises(Exception):

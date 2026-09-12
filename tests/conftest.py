@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import pathlib
 import sys
 import types
@@ -112,6 +113,68 @@ def mock_event_loop_deferred():
 
 
 @pytest.fixture
+def entry(hass):
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    api = load_exo_pool_module("api")
+    config_entry = MockConfigEntry(
+        domain=api.DOMAIN,
+        data={"serial_number": SAMPLE_SERIAL, "id_token": "tok"},
+        options={},
+    )
+    config_entry.add_to_hass(hass)
+    api._get_entry_store(hass, config_entry)
+    return config_entry
+
+
+@pytest.fixture(autouse=True)
+def no_network_client_session(monkeypatch):
+    from unittest.mock import MagicMock
+
+    api = load_exo_pool_module("api")
+    monkeypatch.setattr(
+        api.aiohttp_client, "async_get_clientsession", MagicMock(return_value=MagicMock())
+    )
+
+
+@pytest.fixture
+def connected_mqtt(hass, entry):
+    from unittest.mock import MagicMock
+
+    api = load_exo_pool_module("api")
+    store = api._get_entry_store(hass, entry)
+    client = MagicMock()
+    client.connected = True
+    client.publish_desired = MagicMock()
+    store["mqtt_client"] = client
+    return client
+
+
+@pytest.fixture
+def disconnected_mqtt(hass, entry):
+    from unittest.mock import MagicMock
+
+    api = load_exo_pool_module("api")
+    store = api._get_entry_store(hass, entry)
+    client = MagicMock()
+    client.connected = False
+    client.publish_desired = MagicMock()
+    store["mqtt_client"] = client
+    return client
+
+
+@pytest.fixture
+def coordinator(hass, entry):
+    from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+
+    api = load_exo_pool_module("api")
+    coord = DataUpdateCoordinator(hass, api._LOGGER, name="Test")
+    store = api._get_entry_store(hass, entry)
+    store["coordinator"] = coord
+    return coord
+
+
+@pytest.fixture
 def build_client(mock_mqtt_connection, mock_event_loop):
     """Factory to build an ExoMqttClient with mocked internals."""
     from unittest.mock import MagicMock
@@ -128,3 +191,51 @@ def build_client(mock_mqtt_connection, mock_event_loop):
         return client
 
     return _build
+
+
+class FakeResponse:
+    def __init__(self, status: int, payload: dict):
+        self.status = status
+        self.headers: dict = {}
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+    async def text(self):
+        return json.dumps(self._payload)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+class FakeSession:
+    def __init__(self, response: FakeResponse):
+        self._response = response
+
+    def get(self, url, headers=None):
+        return self._response
+
+    def post(self, url, json=None, headers=None):  # noqa: A002 - matches aiohttp signature
+        return self._response
+
+
+def get_subscribe_callback(mock_conn, topic_fragment: str):
+    """Find the MQTT callback registered for a topic containing the fragment."""
+    for c in mock_conn.subscribe.call_args_list:
+        topic = c.kwargs.get("topic") or c.args[0]
+        if topic_fragment in topic:
+            return c.kwargs.get("callback") or c.args[2]
+    raise AssertionError(f"No subscription found matching '{topic_fragment}'")
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Monkeypatch api.time.monotonic to an advanceable fake clock starting at 1000.0."""
+    api = load_exo_pool_module("api")
+    clock = [1000.0]
+    monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
+    return clock

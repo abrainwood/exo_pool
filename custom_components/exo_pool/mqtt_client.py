@@ -61,7 +61,7 @@ class ExoMqttClient:
         self._serial = serial
         self._connection: mqtt.Connection | None = None
         self._connected = False
-        self._shadow_callback: Callable[[dict], None] | None = None
+        self._shadow_callback: Callable[[dict, dict], None] | None = None
         self._reconnect_failed_callback: Callable[[], None] | None = None
         self._interrupted_watchdog_callback: Callable[[], None] | None = None
         self._state_changed_callback: Callable[[bool], None] | None = None
@@ -79,12 +79,8 @@ class ExoMqttClient:
     def connected(self) -> bool:
         return self._connected
 
-    def set_shadow_callback(self, callback: Callable[[dict], None]) -> None:
-        """Register a callback for shadow state updates.
-
-        The callback receives the reported state dict and is always
-        invoked on the event loop passed to the constructor.
-        """
+    def set_shadow_callback(self, callback: Callable[[dict, dict], None]) -> None:
+        """Register a callback(reported, changed_desired), invoked on the event loop."""
         self._shadow_callback = callback
 
     def set_reconnect_failed_callback(self, callback: Callable[[], None]) -> None:
@@ -251,7 +247,7 @@ class ExoMqttClient:
             _LOGGER.warning("Malformed shadow payload on %s", topic)
             return
 
-        reported = self._extract_reported(topic, data)
+        reported, changed_desired = self._extract_state(topic, data)
         if reported is None:
             _LOGGER.debug("Shadow message on %s (no reported state to extract)", topic)
             return
@@ -265,16 +261,24 @@ class ExoMqttClient:
                     _LOGGER.info("Shadow changes: %s", ", ".join(changes))
 
         if self._shadow_callback is not None:
-            self._loop.call_soon_threadsafe(self._shadow_callback, reported)
+            self._loop.call_soon_threadsafe(
+                self._shadow_callback, reported, changed_desired
+            )
 
-    def _extract_reported(self, topic: str, data: dict) -> dict | None:
-        """Extract the reported state dict from a shadow message."""
+    def _extract_state(self, topic: str, data: dict) -> tuple[dict | None, dict]:
         if "update/documents" in topic:
-            return data.get("current", {}).get("state", {}).get("reported")
+            current_state = data.get("current", {}).get("state", {})
+            if "previous" not in data:
+                return current_state.get("reported"), {}
+            previous_state = data.get("previous", {}).get("state", {})
+            changed_desired = _diff_desired(
+                previous_state.get("desired") or {}, current_state.get("desired") or {}
+            )
+            return current_state.get("reported"), changed_desired
         if "get/accepted" in topic:
-            return data.get("state", {}).get("reported")
+            return data.get("state", {}).get("reported"), {}
         # update/accepted and update/delta don't carry the full reported state
-        return None
+        return None, {}
 
     def set_interrupted_watchdog_callback(self, callback: Callable[[], None]) -> None:
         """Register a callback invoked when resume doesn't follow an interrupt in time.
@@ -335,6 +339,23 @@ class ExoMqttClient:
             self._set_connected(False)
             if self._reconnect_failed_callback is not None:
                 self._loop.call_soon_threadsafe(self._reconnect_failed_callback)
+
+
+def _diff_desired(previous: dict, current: dict) -> dict:
+    """Return the leaves of `current` added or changed vs `previous`; deletions omitted."""
+    diff: dict = {}
+    for key in set(previous.keys()) | set(current.keys()):
+        old_val = previous.get(key)
+        new_val = current.get(key)
+        if old_val == new_val:
+            continue
+        if isinstance(old_val, dict) and isinstance(new_val, dict):
+            nested = _diff_desired(old_val, new_val)
+            if nested:
+                diff[key] = nested
+        elif key in current:
+            diff[key] = new_val
+    return diff
 
 
 def _summarize_changes(old: dict, new: dict, path: str = "") -> list[str]:

@@ -6,11 +6,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from custom_components.exo_pool.mqtt_client import _diff_desired
 from tests.conftest import (
     IOT_ENDPOINT,
     IOT_REGION,
     SAMPLE_CREDENTIALS,
     SAMPLE_SERIAL,
+    get_subscribe_callback,
 )
 
 # Fixtures mock_mqtt_connection, mock_event_loop, and build_client
@@ -192,8 +194,8 @@ class TestShadowCallback:
 
         # Bridged via call_soon_threadsafe (not called directly), which the
         # fixture executes immediately so the callback has already run.
-        mock_event_loop.call_soon_threadsafe.assert_called_with(callback, reported_state)
-        callback.assert_called_once_with(reported_state)
+        mock_event_loop.call_soon_threadsafe.assert_called_with(callback, reported_state, {})
+        callback.assert_called_once_with(reported_state, {})
 
     def test_shadow_callback_invoked_on_get_accepted(
         self, build_client, mock_mqtt_connection, mock_event_loop
@@ -229,8 +231,131 @@ class TestShadowCallback:
             retain=False,
         )
 
-        mock_event_loop.call_soon_threadsafe.assert_called_with(callback, reported_state)
-        callback.assert_called_once_with(reported_state)
+        mock_event_loop.call_soon_threadsafe.assert_called_with(callback, reported_state, {})
+        callback.assert_called_once_with(reported_state, {})
+
+    def test_previous_state_present_without_desired_diffs_against_empty(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        callback = MagicMock()
+        client = build_client()
+        client.set_shadow_callback(callback)
+        client.connect(SAMPLE_CREDENTIALS)
+
+        mqtt_callback = get_subscribe_callback(mock_mqtt_connection, "update/documents")
+
+        reported_state = {"equipment": {"swc_0": {"production": 0}}}
+        desired_state = {"equipment": {"swc_0": {"production": 0}}}
+        shadow_doc = {
+            "current": {
+                "state": {"reported": reported_state, "desired": desired_state},
+            },
+            "previous": {"state": {"reported": {}}},
+            "timestamp": 1776208189,
+        }
+        mqtt_callback(
+            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/update/documents",
+            payload=json.dumps(shadow_doc).encode(),
+            dup=False,
+            qos=1,
+            retain=False,
+        )
+
+        callback.assert_called_once_with(reported_state, desired_state)
+
+    def test_missing_previous_entirely_never_supersedes_a_pending_write(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        callback = MagicMock()
+        client = build_client()
+        client.set_shadow_callback(callback)
+        client.connect(SAMPLE_CREDENTIALS)
+
+        mqtt_callback = get_subscribe_callback(mock_mqtt_connection, "update/documents")
+
+        shadow_doc = {
+            "current": {
+                "state": {
+                    "reported": {"equipment": {"swc_0": {"production": 0}}},
+                    "desired": {"equipment": {"swc_0": {"production": 1}}},
+                },
+            },
+        }
+        mqtt_callback(
+            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/update/documents",
+            payload=json.dumps(shadow_doc).encode(),
+            dup=False,
+            qos=1,
+            retain=False,
+        )
+
+        callback.assert_called_once_with(
+            {"equipment": {"swc_0": {"production": 0}}}, {}
+        )
+
+    def test_identical_desired_in_previous_and_current_yields_no_change(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        callback = MagicMock()
+        client = build_client()
+        client.set_shadow_callback(callback)
+        client.connect(SAMPLE_CREDENTIALS)
+
+        mqtt_callback = get_subscribe_callback(mock_mqtt_connection, "update/documents")
+
+        reported_state = {"equipment": {"swc_0": {"production": 0}}}
+        desired_state = {"equipment": {"swc_0": {"production": 0}}}
+        shadow_doc = {
+            "current": {
+                "state": {"reported": reported_state, "desired": desired_state},
+            },
+            "previous": {"state": {"reported": {}, "desired": desired_state}},
+        }
+        mqtt_callback(
+            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/update/documents",
+            payload=json.dumps(shadow_doc).encode(),
+            dup=False,
+            qos=1,
+            retain=False,
+        )
+
+        callback.assert_called_once_with(reported_state, {})
+
+    def test_shadow_callback_never_surfaces_desired_from_get_accepted(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        callback = MagicMock()
+        client = build_client()
+        client.set_shadow_callback(callback)
+        client.connect(SAMPLE_CREDENTIALS)
+
+        get_sub_call = None
+        for c in mock_mqtt_connection.subscribe.call_args_list:
+            topic = c.kwargs.get("topic") or c.args[0]
+            if "get/accepted" in topic:
+                get_sub_call = c
+                break
+        mqtt_callback = get_sub_call.kwargs.get("callback") or get_sub_call.args[2]
+
+        reported_state = {"equipment": {"swc_0": {"swc": 30}}}
+        shadow_get = {
+            "state": {
+                "reported": reported_state,
+                "desired": {"equipment": {"swc_0": {"production": 0}}},
+            },
+            "metadata": {},
+            "version": 150334,
+            "timestamp": 1776206206,
+        }
+        mqtt_callback(
+            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/get/accepted",
+            payload=json.dumps(shadow_get).encode(),
+            dup=False,
+            qos=1,
+            retain=False,
+        )
+
+        callback.assert_called_once_with(reported_state, {})
 
     def test_no_callback_set_does_not_bridge(
         self, build_client, mock_mqtt_connection, mock_event_loop
@@ -750,3 +875,25 @@ class TestBuildConnection:
         assert call_kwargs["on_connection_resumed"] == client._on_connection_resumed
 
         assert result is mock_conn
+
+
+class TestDiffDesired:
+    def test_identical_desired_in_previous_and_current_yields_no_diff(self):
+        previous = {"equipment": {"swc_0": {"production": 0}}}
+        current = {"equipment": {"swc_0": {"production": 0}}}
+
+        assert _diff_desired(previous, current) == {}
+
+    def test_change_on_a_sibling_leaf_does_not_touch_the_unchanged_leaf(self):
+        previous = {"schedules": {"main": {"timer": {"start": "08:00", "end": "18:00"}}}}
+        current = {"schedules": {"main": {"timer": {"start": "09:00", "end": "18:00"}}}}
+
+        diff = _diff_desired(previous, current)
+
+        assert diff == {"schedules": {"main": {"timer": {"start": "09:00"}}}}
+
+    def test_key_deleted_between_previous_and_current_is_not_a_change(self):
+        previous = {"equipment": {"swc_0": {"production": 0}}}
+        current = {"equipment": {}}
+
+        assert _diff_desired(previous, current) == {}
