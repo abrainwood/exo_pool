@@ -12,6 +12,7 @@ from tests.conftest import (
     IOT_REGION,
     SAMPLE_CREDENTIALS,
     SAMPLE_SERIAL,
+    get_subscribe_callback,
 )
 
 # Fixtures mock_mqtt_connection, mock_event_loop, and build_client
@@ -241,13 +242,7 @@ class TestShadowCallback:
         client.set_shadow_callback(callback)
         client.connect(SAMPLE_CREDENTIALS)
 
-        doc_sub_call = None
-        for c in mock_mqtt_connection.subscribe.call_args_list:
-            topic = c.kwargs.get("topic") or c.args[0]
-            if "update/documents" in topic:
-                doc_sub_call = c
-                break
-        mqtt_callback = doc_sub_call.kwargs.get("callback") or doc_sub_call.args[2]
+        mqtt_callback = get_subscribe_callback(mock_mqtt_connection, "update/documents")
 
         reported_state = {"equipment": {"swc_0": {"production": 0}}}
         desired_state = {"equipment": {"swc_0": {"production": 0}}}
@@ -276,13 +271,7 @@ class TestShadowCallback:
         client.set_shadow_callback(callback)
         client.connect(SAMPLE_CREDENTIALS)
 
-        doc_sub_call = None
-        for c in mock_mqtt_connection.subscribe.call_args_list:
-            topic = c.kwargs.get("topic") or c.args[0]
-            if "update/documents" in topic:
-                doc_sub_call = c
-                break
-        mqtt_callback = doc_sub_call.kwargs.get("callback") or doc_sub_call.args[2]
+        mqtt_callback = get_subscribe_callback(mock_mqtt_connection, "update/documents")
 
         shadow_doc = {
             "current": {
@@ -304,7 +293,35 @@ class TestShadowCallback:
             {"equipment": {"swc_0": {"production": 0}}}, {}
         )
 
-    def test_shadow_callback_gets_an_empty_desired_dict_when_get_accepted_carries_none(
+    def test_identical_desired_in_previous_and_current_yields_no_change(
+        self, build_client, mock_mqtt_connection, mock_event_loop
+    ):
+        callback = MagicMock()
+        client = build_client()
+        client.set_shadow_callback(callback)
+        client.connect(SAMPLE_CREDENTIALS)
+
+        mqtt_callback = get_subscribe_callback(mock_mqtt_connection, "update/documents")
+
+        reported_state = {"equipment": {"swc_0": {"production": 0}}}
+        desired_state = {"equipment": {"swc_0": {"production": 0}}}
+        shadow_doc = {
+            "current": {
+                "state": {"reported": reported_state, "desired": desired_state},
+            },
+            "previous": {"state": {"reported": {}, "desired": desired_state}},
+        }
+        mqtt_callback(
+            topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/update/documents",
+            payload=json.dumps(shadow_doc).encode(),
+            dup=False,
+            qos=1,
+            retain=False,
+        )
+
+        callback.assert_called_once_with(reported_state, {})
+
+    def test_shadow_callback_never_surfaces_desired_from_get_accepted(
         self, build_client, mock_mqtt_connection, mock_event_loop
     ):
         callback = MagicMock()
@@ -322,7 +339,10 @@ class TestShadowCallback:
 
         reported_state = {"equipment": {"swc_0": {"swc": 30}}}
         shadow_get = {
-            "state": {"reported": reported_state},
+            "state": {
+                "reported": reported_state,
+                "desired": {"equipment": {"swc_0": {"production": 0}}},
+            },
             "metadata": {},
             "version": 150334,
             "timestamp": 1776206206,

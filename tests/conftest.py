@@ -221,3 +221,21 @@ class FakeSession:
 
     def post(self, url, json=None, headers=None):  # noqa: A002 - matches aiohttp signature
         return self._response
+
+
+def get_subscribe_callback(mock_conn, topic_fragment: str):
+    """Find the MQTT callback registered for a topic containing the fragment."""
+    for c in mock_conn.subscribe.call_args_list:
+        topic = c.kwargs.get("topic") or c.args[0]
+        if topic_fragment in topic:
+            return c.kwargs.get("callback") or c.args[2]
+    raise AssertionError(f"No subscription found matching '{topic_fragment}'")
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Monkeypatch api.time.monotonic to an advanceable fake clock starting at 1000.0."""
+    api = load_exo_pool_module("api")
+    clock = [1000.0]
+    monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
+    return clock

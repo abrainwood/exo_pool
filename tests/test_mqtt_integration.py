@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from tests.conftest import SAMPLE_CREDENTIALS, SAMPLE_SERIAL
+from tests.conftest import SAMPLE_CREDENTIALS, SAMPLE_SERIAL, get_subscribe_callback
 
 
 # ---------------------------------------------------------------------------
@@ -131,22 +131,13 @@ def connected_client(build_client, mock_mqtt_connection, mock_event_loop):
 def get_accepted_data(connected_client):
     """Fire a get/accepted message and return the parsed coordinator data."""
     _, mock_conn, received = connected_client
-    cb = _get_subscribe_callback(mock_conn, "get/accepted")
+    cb = get_subscribe_callback(mock_conn, "get/accepted")
     cb(
         topic=f"$aws/things/{SAMPLE_SERIAL}/shadow/get/accepted",
         payload=_make_get_accepted(REAL_REPORTED_STATE),
         dup=False, qos=1, retain=False,
     )
     return received[0]
-
-
-def _get_subscribe_callback(mock_conn, topic_fragment: str):
-    """Find the MQTT callback registered for a topic containing the fragment."""
-    for c in mock_conn.subscribe.call_args_list:
-        topic = c.kwargs.get("topic") or c.args[0]
-        if topic_fragment in topic:
-            return c.kwargs.get("callback") or c.args[2]
-    raise AssertionError(f"No subscription found matching '{topic_fragment}'")
 
 
 class TestGetAcceptedDataContract:
@@ -251,7 +242,7 @@ class TestUpdateDocumentsDataContract:
 
     def test_chlorinator_percentage_change_from_30_to_40_reaches_callback(self, connected_client):
         _, mock_conn, received = connected_client
-        cb = _get_subscribe_callback(mock_conn, "update/documents")
+        cb = get_subscribe_callback(mock_conn, "update/documents")
 
         current = json.loads(json.dumps(REAL_REPORTED_STATE))
         previous = json.loads(json.dumps(REAL_REPORTED_STATE))
@@ -270,7 +261,7 @@ class TestUpdateDocumentsDataContract:
 
     def test_aux_1_toggled_on_reaches_callback(self, connected_client):
         _, mock_conn, received = connected_client
-        cb = _get_subscribe_callback(mock_conn, "update/documents")
+        cb = get_subscribe_callback(mock_conn, "update/documents")
 
         current = json.loads(json.dumps(REAL_REPORTED_STATE))
         previous = json.loads(json.dumps(REAL_REPORTED_STATE))
@@ -286,7 +277,7 @@ class TestUpdateDocumentsDataContract:
 
     def test_device_pushed_ph_sensor_reading_reaches_callback_without_user_action(self, connected_client):
         _, mock_conn, received = connected_client
-        cb = _get_subscribe_callback(mock_conn, "update/documents")
+        cb = get_subscribe_callback(mock_conn, "update/documents")
 
         current = json.loads(json.dumps(REAL_REPORTED_STATE))
         previous = json.loads(json.dumps(REAL_REPORTED_STATE))
@@ -302,7 +293,7 @@ class TestUpdateDocumentsDataContract:
 
     def test_schedule_becoming_active_reaches_callback(self, connected_client):
         _, mock_conn, received = connected_client
-        cb = _get_subscribe_callback(mock_conn, "update/documents")
+        cb = get_subscribe_callback(mock_conn, "update/documents")
 
         current = json.loads(json.dumps(REAL_REPORTED_STATE))
         previous = json.loads(json.dumps(REAL_REPORTED_STATE))

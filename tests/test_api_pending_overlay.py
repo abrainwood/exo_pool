@@ -82,11 +82,9 @@ async def test_matching_report_clears_pending_so_a_later_off_report_is_honored(
 
 
 async def test_write_one_then_zero_quickly_leaves_pending_at_the_latest_value(
-    hass, entry, connected_mqtt, coordinator, monkeypatch
+    hass, entry, connected_mqtt, coordinator, fake_clock
 ):
     coordinator.async_set_updated_data({"equipment": {"swc_0": copy.deepcopy(SWC_0)}})
-    clock = [1000.0]
-    monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
 
     await api.set_pool_value(hass, entry, "production", 1)
     await api.set_pool_value(hass, entry, "production", 0)
@@ -163,15 +161,13 @@ async def test_async_update_data_rest_fetch_overlays_pending_writes(
 
 
 async def test_no_matching_report_before_expiry_lets_stale_reported_value_win(
-    hass, entry, connected_mqtt, coordinator, monkeypatch
+    hass, entry, connected_mqtt, coordinator, fake_clock
 ):
     coordinator.async_set_updated_data({"equipment": {"swc_0": copy.deepcopy(SWC_0)}})
-    clock = [1000.0]
-    monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
 
     await api.set_pool_value(hass, entry, "production", 1)
 
-    clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
+    fake_clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
 
     still_zero_report = {"equipment": {"swc_0": {**SWC_0, "production": 0}}}
     overlaid = api._overlay_pending_writes(hass, entry, still_zero_report)
@@ -198,23 +194,19 @@ async def test_real_ticket_sequence_shows_one_throughout_and_clears_at_one(hass,
 
 
 class TestExpiryBoundsDerivedFromConstant:
-    async def test_just_before_expiry_still_overlaid(self, hass, entry, monkeypatch):
-        clock = [1000.0]
-        monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
+    async def test_just_before_expiry_still_overlaid(self, hass, entry, fake_clock):
         api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
 
-        clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS - 0.001
+        fake_clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS - 0.001
         overlaid = api._overlay_pending_writes(
             hass, entry, {"equipment": {"swc_0": {"production": 0}}}
         )
         assert overlaid["equipment"]["swc_0"]["production"] == 1
 
-    async def test_exactly_at_expiry_is_expired(self, hass, entry, monkeypatch):
-        clock = [1000.0]
-        monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
+    async def test_exactly_at_expiry_is_expired(self, hass, entry, fake_clock):
         api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
 
-        clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS
+        fake_clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS
         overlaid = api._overlay_pending_writes(
             hass, entry, {"equipment": {"swc_0": {"production": 0}}}
         )
@@ -223,12 +215,10 @@ class TestExpiryBoundsDerivedFromConstant:
 
 class TestExpiryTelemetry:
     async def test_expiry_logs_a_warning_with_path_desired_and_reported(
-        self, hass, entry, monkeypatch, caplog
+        self, hass, entry, fake_clock, caplog
     ):
-        clock = [1000.0]
-        monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
         api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
-        clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
+        fake_clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
 
         with caplog.at_level(logging.WARNING):
             api._overlay_pending_writes(
@@ -240,12 +230,10 @@ class TestExpiryTelemetry:
         assert "reported=0" in caplog.text
 
     async def test_expiry_warning_renders_missing_reported_as_absent(
-        self, hass, entry, monkeypatch, caplog
+        self, hass, entry, fake_clock, caplog
     ):
-        clock = [1000.0]
-        monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
         api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
-        clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
+        fake_clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
 
         with caplog.at_level(logging.WARNING):
             api._overlay_pending_writes(hass, entry, {})
@@ -373,14 +361,16 @@ class TestSupersessionOnlyOnChange:
 
 
 class TestExpiredEntryDoesNotCarryForwardPublishedValues:
-    def test_recording_after_expiry_starts_published_values_fresh(self, hass, entry, monkeypatch):
-        clock = [1000.0]
-        monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
-
+    def test_recording_after_expiry_drops_a_stale_published_value_on_supersession(
+        self, hass, entry, fake_clock
+    ):
         api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
-        clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
+        fake_clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
         api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 0)
 
-        pending = api._get_entry_store(hass, entry)["pending_writes"]
-        published = pending[("equipment", "swc_0", "production")]["published_values"]
-        assert published == [0]
+        changed_desired = {"equipment": {"swc_0": {"production": 1}}}
+        overlaid = api._overlay_pending_writes(
+            hass, entry, {"equipment": {"swc_0": {"production": 1}}}, changed_desired
+        )
+
+        assert overlaid["equipment"]["swc_0"]["production"] == 1
