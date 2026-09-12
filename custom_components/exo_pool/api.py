@@ -134,6 +134,11 @@ class Transport(StrEnum):
     MQTT = "mqtt"
     REST = "rest"
 
+
+class CooldownWait(StrEnum):
+    RECONNECTED = "reconnected"
+    ELAPSED = "elapsed"
+
 # AWS IoT MQTT
 IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
 IOT_REGION = "us-east-1"
@@ -207,7 +212,6 @@ def _get_reconnect_event(store: dict) -> asyncio.Event:
 def _wake_held_write_on_reconnect(
     hass: HomeAssistant, entry: ConfigEntry, connected: bool
 ) -> None:
-    """Wake a write waiting out a cooldown when MQTT reports it has reconnected."""
     if not connected:
         return
     store = hass.data.get(DOMAIN, {}).get(entry.entry_id)
@@ -218,10 +222,9 @@ def _wake_held_write_on_reconnect(
         event.set()
 
 
-async def _woke_early_from_cooldown(
+async def _wait_out_cooldown(
     hass: HomeAssistant, entry: ConfigEntry, cooldown: float
-) -> bool:
-    """Wait out `cooldown`, waking early if MQTT reconnects."""
+) -> CooldownWait:
     store = _get_entry_store(hass, entry)
     event = _get_reconnect_event(store)
     event.clear()
@@ -234,7 +237,9 @@ async def _woke_early_from_cooldown(
             task.cancel()
         if sleep_task in done:
             sleep_task.result()
-        return event.is_set() and _cooldown_remaining(hass, entry) > 0
+        if event.is_set() and _cooldown_remaining(hass, entry) > 0:
+            return CooldownWait.RECONNECTED
+        return CooldownWait.ELAPSED
     finally:
         for task in tasks:
             if not task.done():
@@ -1012,13 +1017,13 @@ async def _execute_write(
             store.get("cooldown_reason", "unknown"),
         )
         try:
-            woke_early = await _woke_early_from_cooldown(hass, entry, cooldown)
+            outcome = await _wait_out_cooldown(hass, entry, cooldown)
         except (Exception, asyncio.CancelledError):
             _clear_pending_writes(hass, entry, [], desired)
             raise
-        if woke_early:
-            _LOGGER.info("Write %s woken early by MQTT reconnect", item.key)
         if _try_mqtt(hass, entry, item, desired):
+            if outcome is CooldownWait.RECONNECTED:
+                _LOGGER.info("Write %s woken early by MQTT reconnect", item.key)
             return Transport.MQTT
 
     _record_pending_writes(hass, entry, [], desired)
@@ -1178,7 +1183,6 @@ async def _async_refresh_and_reconnect(
         return
 
     store = _get_entry_store(hass, entry)
-    store["mqtt_reconnect_in_progress"] = True
     connected = False
     error: Exception | None = None
     try:
@@ -1188,8 +1192,6 @@ async def _async_refresh_and_reconnect(
         connected = await hass.async_add_executor_job(_connect_mqtt, hass, entry)
     except Exception as err:
         error = err
-    finally:
-        store["mqtt_reconnect_in_progress"] = False
 
     if not _entry_is_loaded(hass, entry):
         return
@@ -1260,8 +1262,6 @@ def _trigger_mqtt_reconnect(hass: HomeAssistant, entry: ConfigEntry, *, name: st
     if not _entry_is_loaded(hass, entry):
         return
     store = _get_entry_store(hass, entry)
-    if store.get("mqtt_reconnect_in_progress"):
-        return
     task = store.get("mqtt_retry_task")
     if task is not None and not task.done():
         if not store.get("mqtt_retry_sleeping"):

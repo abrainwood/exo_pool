@@ -251,14 +251,7 @@ def post_write_cooldown_seconds():
 
 
 @pytest.fixture
-def fake_sleep_that_wakes_at_full_cooldown(fake_clock, post_write_cooldown_seconds):
-    """Build a fake asyncio.sleep that only reacts to the full-cooldown sleep call.
-
-    Any shorter sleep (e.g. WRITE_GAP_SECONDS) passes through unpatched; the
-    full-cooldown call advances the fake clock by `elapsed`, invokes `wake`,
-    then hangs so only the reconnect event can resolve the race.
-    """
-
+def build_full_cooldown_fake_sleep(fake_clock, post_write_cooldown_seconds):
     def _build(wake, elapsed=3):
         async def fake_sleep(seconds):
             if seconds != pytest.approx(post_write_cooldown_seconds):
