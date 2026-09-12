@@ -35,33 +35,12 @@ def fake_client_session(monkeypatch):
 
 
 async def _cancel_retry_task(hass, entry) -> None:
-    """Cancel and await the pending mqtt_retry_task and any stray reconnect task.
-
-    A reconnect-failed callback delivered via call_soon_threadsafe can race the
-    synchronous failure path in _async_refresh_and_reconnect: both react to the
-    same connect failure, one task ends up cancelled by the other's
-    _schedule_mqtt_retry, but the loser is never awaited - it lingers
-    "cancelling, not done" past hass.async_block_till_done(). Sweep every
-    exo_pool_* task, not just the current mqtt_retry_task slot, so teardown
-    never sees one.
-    """
     store = api._get_entry_store(hass, entry)
     task = store.pop("mqtt_retry_task", None)
     if isinstance(task, asyncio.Task):
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-    current = asyncio.current_task()
-    stray_tasks = [
-        t
-        for t in asyncio.all_tasks()
-        if t is not current and t.get_name().startswith("exo_pool_") and not t.done()
-    ]
-    for stray in stray_tasks:
-        stray.cancel()
-    for stray in stray_tasks:
-        with contextlib.suppress(asyncio.CancelledError):
-            await stray
 
 
 @pytest.fixture
@@ -328,6 +307,7 @@ async def test_a_fully_failed_subscribe_does_not_reset_the_backoff(
             loop=loop, endpoint=endpoint, region=region, serial=serial
         )
         client._build_connection = MagicMock(return_value=mock_connection)
+        client.set_reconnect_failed_callback = MagicMock()
         return client
 
     monkeypatch.setattr(mqtt_client_mod, "ExoMqttClient", _build_real_client)
@@ -335,9 +315,6 @@ async def test_a_fully_failed_subscribe_does_not_reset_the_backoff(
     try:
         await api._async_refresh_and_reconnect(hass, entry)
 
-        # A fully-failed subscribe (real mqtt_client.connect(), driven all
-        # the way through) must not look like a successful connect - the
-        # backoff must keep climbing, not reset to base.
         assert store["mqtt_retry_delay"] > 120.0
         assert store["mqtt_retry_attempts"] == 3
     finally:

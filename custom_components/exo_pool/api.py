@@ -139,6 +139,7 @@ class CooldownWait(StrEnum):
     RECONNECTED = "reconnected"
     ELAPSED = "elapsed"
 
+
 # AWS IoT MQTT
 IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
 IOT_REGION = "us-east-1"
@@ -201,7 +202,6 @@ def _set_cooldown(
 
 
 def _get_reconnect_event(store: dict) -> asyncio.Event:
-    """Return the entry's MQTT-reconnect event, creating it on first use."""
     event = store.get("mqtt_reconnect_event")
     if event is None:
         event = asyncio.Event()
@@ -971,10 +971,7 @@ def _apply_schedule_update(
 
 
 def _try_mqtt(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    item: _WriteItem,
-    desired: dict,
+    hass: HomeAssistant, entry: ConfigEntry, item: _WriteItem, desired: dict
 ) -> bool:
     store = _get_entry_store(hass, entry)
     mqtt_client = store.get("mqtt_client")
@@ -986,9 +983,7 @@ def _try_mqtt(
         mqtt_client.publish_desired(desired)
         return True
     except Exception:
-        _LOGGER.warning(
-            "MQTT write failed for %s - falling back to REST", item.key, exc_info=True
-        )
+        _LOGGER.warning("MQTT publish failed for %s", item.key)
         return False
 
 

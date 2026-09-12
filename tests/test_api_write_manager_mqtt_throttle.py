@@ -6,10 +6,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from tests.conftest import load_exo_pool_module
+from tests.conftest import _UNPATCHED_ASYNCIO_SLEEP, load_exo_pool_module
 
 api = load_exo_pool_module("api")
-_unpatched_asyncio_sleep = asyncio.sleep
+
+
+def assert_stale_pending_write_survives_expiry(hass, entry, fake_clock, caplog):
+    fake_clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
+    stale = api._overlay_pending_writes(
+        hass, entry, {"equipment": {"swc_0": {"production": 0}}}
+    )
+    assert stale["equipment"]["swc_0"]["production"] == 1
+    assert "expired unsettled" not in caplog.text
 
 
 async def test_two_back_to_back_mqtt_writes_are_both_delivered(
@@ -199,7 +207,7 @@ class TestMqttReconnectDuringRestCooldownWait:
                 fake_clock[0] += seconds
                 return
             overlaid = api._overlay_pending_writes(
-                hass, entry, {"equipment": {"swc_0": {"production": 0}}}, {}
+                hass, entry, {"equipment": {"swc_0": {"production": 0}}}
             )
             mid_wait_result["production"] = overlaid["equipment"]["swc_0"]["production"]
             fake_clock[0] += seconds
@@ -347,12 +355,7 @@ class TestNoRestInsideCooldownAfterEarlyWake:
                 disconnected_mqtt.connected = False
                 await asyncio.Future()
             elif calls["n"] == 2:
-                fake_clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
-                stale = api._overlay_pending_writes(
-                    hass, entry, {"equipment": {"swc_0": {"production": 0}}}
-                )
-                assert stale["equipment"]["swc_0"]["production"] == 1
-                assert "expired unsettled" not in caplog.text
+                assert_stale_pending_write_survives_expiry(hass, entry, fake_clock, caplog)
                 fake_clock[0] += seconds - (api.PENDING_WRITE_EXPIRY_SECONDS + 1)
             else:
                 fake_clock[0] += seconds
@@ -387,12 +390,7 @@ class TestNoRestInsideCooldownAfterEarlyWake:
                 api._wake_held_write_on_reconnect(hass, entry, True)
                 await asyncio.Future()
             elif calls["n"] == 2:
-                fake_clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
-                stale = api._overlay_pending_writes(
-                    hass, entry, {"equipment": {"swc_0": {"production": 0}}}
-                )
-                assert stale["equipment"]["swc_0"]["production"] == 1
-                assert "expired unsettled" not in caplog.text
+                assert_stale_pending_write_survives_expiry(hass, entry, fake_clock, caplog)
                 fake_clock[0] += seconds - (api.PENDING_WRITE_EXPIRY_SECONDS + 1)
             else:
                 fake_clock[0] += seconds
@@ -426,7 +424,7 @@ class TestStateChangedCallbackWiring:
 
         async def fake_sleep(seconds):
             if woken["once"]:
-                await _unpatched_asyncio_sleep(0)
+                await _UNPATCHED_ASYNCIO_SLEEP(0)
                 return
             woken["once"] = True
             fake_clock[0] += 3
@@ -441,7 +439,7 @@ class TestStateChangedCallbackWiring:
         disconnected_mqtt.publish_desired.assert_called_once()
         assert fake_clock[0] == pytest.approx(1003.0)
 
-    async def test_disconnect_callback_does_not_wake_a_held_write(
+    async def test_disconnect_callback_does_not_set_the_reconnect_event(
         self, hass, entry, disconnected_mqtt
     ):
         store = api._get_entry_store(hass, entry)
@@ -470,18 +468,15 @@ class TestCancelDuringCooldownWaitClosesInnerTasks:
 
         entered_wait = asyncio.Event()
 
-        async def slow_sleep(seconds):
+        async def sleep_needing_an_extra_tick_after_cancel(seconds):
             entered_wait.set()
             try:
-                await _unpatched_asyncio_sleep(seconds)
+                await _UNPATCHED_ASYNCIO_SLEEP(seconds)
             except asyncio.CancelledError:
-                # Simulate real cleanup work that needs an extra tick after
-                # cancellation - only an explicit gather (not the single
-                # implicit tick from awaiting wait_task) can pin it done.
-                await _unpatched_asyncio_sleep(0)
+                await _UNPATCHED_ASYNCIO_SLEEP(0)
                 raise
 
-        monkeypatch.setattr(api.asyncio, "sleep", slow_sleep)
+        monkeypatch.setattr(api.asyncio, "sleep", sleep_needing_an_extra_tick_after_cancel)
         monkeypatch.setattr(api.asyncio, "ensure_future", tracking_ensure_future)
 
         wait_task = asyncio.ensure_future(
@@ -509,16 +504,14 @@ class TestEarlyWakeDecidedByEventNotTaskCompletionOrder:
         async def fake_sleep(seconds):
             event.set()
 
-        async def fake_wait(tasks, **kwargs):
+        async def wait_forcing_a_tie(tasks, **kwargs):
             return await real_wait(tasks, return_when=asyncio.ALL_COMPLETED)
 
         monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
         fake_clock[0] += 5.0
 
-        # Scoped to just the call under test (rather than the whole test) so
-        # the tie-forcing patch can't mask a real asyncio.wait call elsewhere.
         with monkeypatch.context() as m:
-            m.setattr(api.asyncio, "wait", fake_wait)
+            m.setattr(api.asyncio, "wait", wait_forcing_a_tie)
             outcome = await api._wait_out_cooldown(hass, entry, 5.0)
 
         assert outcome is api.CooldownWait.ELAPSED
@@ -544,7 +537,8 @@ class TestCooldownReasonMatchesLongestHold:
             for record in caplog.records
             if "held behind cooldown" in record.getMessage()
         ]
-        assert hold_lines and "write_429" in hold_lines[0]
+        assert hold_lines
+        assert "write_429" in hold_lines[0]
         assert "post_write" not in hold_lines[0]
 
 
@@ -620,6 +614,58 @@ class TestWakeHeldWriteOnMqttReconnect:
         )
         assert not any(
             "woken early" in r.getMessage() for r in caplog.records
+        )
+
+    async def test_reconnect_exactly_at_full_cooldown_is_not_logged_as_early_wake(
+        self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock, caplog,
+        post_write_cooldown_seconds,
+    ):
+        api._set_cooldown(hass, entry, post_write_cooldown_seconds, reason="post_write")
+        execute_rest = AsyncMock(return_value=None)
+        monkeypatch.setattr(api, "_execute_write_rest", execute_rest)
+
+        async def fake_sleep(seconds):
+            fake_clock[0] += seconds
+            disconnected_mqtt.connected = True
+
+        monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+
+        with caplog.at_level(logging.INFO):
+            await api.set_pool_value(hass, entry, "production", 1)
+
+        disconnected_mqtt.publish_desired.assert_called_once()
+        execute_rest.assert_not_called()
+        assert not any("woken early" in r.getMessage() for r in caplog.records)
+
+    async def test_new_cooldown_set_during_wait_forces_a_second_hold(
+        self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock, caplog,
+        post_write_cooldown_seconds,
+    ):
+        api._set_cooldown(hass, entry, post_write_cooldown_seconds, reason="post_write")
+        execute_rest = AsyncMock(return_value=None)
+        monkeypatch.setattr(api, "_execute_write_rest", execute_rest)
+        calls = {"n": 0}
+
+        async def fake_sleep(seconds):
+            calls["n"] += 1
+            fake_clock[0] += seconds
+            if calls["n"] == 1:
+                api._set_cooldown(hass, entry, 600.0, reason="write_429")
+
+        monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+
+        with caplog.at_level(logging.INFO):
+            await api.set_pool_value(hass, entry, "production", 1)
+
+        disconnected_mqtt.publish_desired.assert_not_called()
+        execute_rest.assert_called_once()
+        hold_records = [
+            r for r in caplog.records if "held behind cooldown" in r.getMessage()
+        ]
+        assert len(hold_records) == 2
+        assert "write_429" in hold_records[1].getMessage()
+        assert fake_clock[0] == pytest.approx(
+            1000.0 + post_write_cooldown_seconds + 600.0 + api.WRITE_GAP_SECONDS
         )
 
     async def test_hold_and_early_wake_are_logged_at_info(
