@@ -127,6 +127,7 @@ READ_DEFERRAL_JITTER_MAX = 45.0
 DEBOUNCE_JITTER_MIN = 30.0
 DEBOUNCE_JITTER_MAX = 90.0
 PENDING_WRITE_EXPIRY_SECONDS = 15.0
+DELAY_REFRESH_EXTRA_DELAY_SECONDS = 10.0
 
 
 class Transport(StrEnum):
@@ -396,7 +397,16 @@ def _record_pending_writes(
     pending = store.setdefault("pending_writes", {})
     expires_at = time.monotonic() + PENDING_WRITE_EXPIRY_SECONDS
     for leaf_keys, leaf_value in _flatten_leaves(keys, value):
-        pending[tuple(leaf_keys)] = {"value": leaf_value, "expires_at": expires_at}
+        path = tuple(leaf_keys)
+        existing = pending.get(path)
+        published_values = list(existing["published_values"]) if existing else []
+        if leaf_value not in published_values:
+            published_values.append(leaf_value)
+        pending[path] = {
+            "value": leaf_value,
+            "expires_at": expires_at,
+            "published_values": published_values,
+        }
 
 
 def _get_nested_value(data: dict, keys: tuple[str, ...]):
@@ -431,10 +441,17 @@ def _clear_pending_writes(
             del pending[path]
 
 
+def _render_value(value) -> str:
+    return "absent" if value is _MISSING else str(value)
+
+
 def _overlay_pending_writes(
-    hass: HomeAssistant, entry: ConfigEntry, reported: dict, desired: dict | None = None
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    reported: dict,
+    changed_desired: dict | None = None,
 ) -> dict:
-    """Overlay still-pending desired values onto an incoming reported state."""
+    """Mutate `reported` in place, overlaying any still-pending desired values."""
     store = _get_entry_store(hass, entry)
     pending = store.get("pending_writes")
     if not pending:
@@ -442,9 +459,12 @@ def _overlay_pending_writes(
     now = time.monotonic()
     for path in list(pending.keys()):
         info = pending[path]
-        if desired:
-            incoming_desired = _get_nested_value(desired, path)
-            if incoming_desired is not _MISSING and incoming_desired != info["value"]:
+        if changed_desired:
+            changed_value = _get_nested_value(changed_desired, path)
+            if (
+                changed_value is not _MISSING
+                and changed_value not in info["published_values"]
+            ):
                 del pending[path]
                 continue
         reported_value = _get_nested_value(reported, path)
@@ -456,7 +476,7 @@ def _overlay_pending_writes(
                 "Pending write expired unsettled: path=%s desired=%s reported=%s",
                 ".".join(path),
                 info["value"],
-                reported_value,
+                _render_value(reported_value),
             )
             del pending[path]
             continue
@@ -464,8 +484,9 @@ def _overlay_pending_writes(
             _set_nested_value(reported, list(path), info["value"])
         except (TypeError, AttributeError):
             _LOGGER.warning(
-                "Could not overlay pending write at path=%s (unexpected shape)",
+                "Could not overlay pending write at path=%s (unexpected shape: %s)",
                 ".".join(path),
+                type(_get_nested_value(reported, path[:-1])).__name__,
             )
     return reported
 
@@ -887,6 +908,26 @@ def _apply_schedule_update(
     coordinator.async_set_updated_data(data)
 
 
+def _try_mqtt(
+    hass: HomeAssistant, entry: ConfigEntry, item: _WriteItem, desired: dict
+) -> bool:
+    store = _get_entry_store(hass, entry)
+    mqtt_client = store.get("mqtt_client")
+    if not (mqtt_client and mqtt_client.connected):
+        return False
+    _record_pending_writes(hass, entry, [], desired)
+    _LOGGER.debug("Writing %s via MQTT: %s", item.key, desired)
+    try:
+        mqtt_client.publish_desired(desired)
+        return True
+    except Exception:
+        _clear_pending_writes(hass, entry, [], desired)
+        _LOGGER.warning(
+            "MQTT write failed for %s - falling back to REST", item.key, exc_info=True
+        )
+        return False
+
+
 async def _execute_write(
     hass: HomeAssistant, entry: ConfigEntry, item: _WriteItem
 ) -> Transport:
@@ -899,30 +940,25 @@ async def _execute_write(
     else:
         raise Exception(f"Unknown write kind: {item.kind}")
 
-    store = _get_entry_store(hass, entry)
-    mqtt_client = store.get("mqtt_client")
-    if mqtt_client and mqtt_client.connected:
-        _record_pending_writes(hass, entry, [], desired)
-        _LOGGER.debug("Writing %s via MQTT: %s", item.key, desired)
-        try:
-            mqtt_client.publish_desired(desired)
-            return Transport.MQTT
-        except Exception:
-            _LOGGER.warning(
-                "MQTT write failed for %s - falling back to REST",
-                item.key,
-                exc_info=True,
-            )
+    if _try_mqtt(hass, entry, item, desired):
+        return Transport.MQTT
 
     cooldown = _cooldown_remaining(hass, entry)
     if cooldown > 0:
-        await asyncio.sleep(cooldown)
+        _record_pending_writes(hass, entry, [], desired)
+        try:
+            await asyncio.sleep(cooldown)
+        except (Exception, asyncio.CancelledError):
+            _clear_pending_writes(hass, entry, [], desired)
+            raise
+        if _try_mqtt(hass, entry, item, desired):
+            return Transport.MQTT
 
     _record_pending_writes(hass, entry, [], desired)
     _LOGGER.debug("Writing %s via REST fallback", item.key)
     try:
         await _execute_write_rest(hass, entry, item, desired)
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         _clear_pending_writes(hass, entry, [], desired)
         raise
     return Transport.REST
@@ -1410,7 +1446,7 @@ async def set_pool_value(hass, entry, setting, value, delay_refresh=False):
         target=setting,
         payload=nested_value,
         futures=[future],
-        extra_delay=10.0 if delay_refresh else 0.0,
+        extra_delay=DELAY_REFRESH_EXTRA_DELAY_SECONDS if delay_refresh else 0.0,
     )
     await _get_write_manager(hass, entry).enqueue(item)
     await future
@@ -1433,7 +1469,7 @@ async def set_heating_value(hass, entry, key: str, value, delay_refresh: bool = 
         target=key,
         payload=value,
         futures=[future],
-        extra_delay=10.0 if delay_refresh else 0.0,
+        extra_delay=DELAY_REFRESH_EXTRA_DELAY_SECONDS if delay_refresh else 0.0,
     )
     await _get_write_manager(hass, entry).enqueue(item)
     await future

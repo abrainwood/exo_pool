@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import logging
+import sys
 
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,20 +19,28 @@ def no_write_gap_sleep(monkeypatch):
     monkeypatch.setattr(api.asyncio, "sleep", AsyncMock())
 
 
-@pytest.fixture
-def coordinator(hass, entry):
-    from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-
-    coord = DataUpdateCoordinator(hass, api._LOGGER, name="Test")
-    store = api._get_entry_store(hass, entry)
-    store["coordinator"] = coord
-    return coord
-
-
 SWC_0 = {
     "production": 0,
     "sns_1": {"value": 76},
 }
+
+
+def _install_shadow_callback(hass, entry, monkeypatch):
+    store = api._get_entry_store(hass, entry)
+    store["aws_credentials"] = {"Expiration": ""}
+    coordinator = MagicMock()
+    store["coordinator"] = coordinator
+
+    fake_mqtt_client = MagicMock()
+    fake_mqtt_client.connect.return_value = None
+    monkeypatch.setattr(
+        sys.modules["custom_components.exo_pool.mqtt_client"],
+        "ExoMqttClient",
+        MagicMock(return_value=fake_mqtt_client),
+    )
+    api._connect_mqtt(hass, entry)
+    shadow_callback = fake_mqtt_client.set_shadow_callback.call_args.args[0]
+    return coordinator, shadow_callback
 
 
 async def test_write_then_stale_echo_with_reported_still_zero_keeps_the_written_value(
@@ -116,23 +126,7 @@ async def test_update_schedule_records_pending_writes_for_each_leaf(
 
 
 async def test_connect_mqtt_shadow_callback_overlays_pending_writes(hass, entry, monkeypatch):
-    import sys
-
-    store = api._get_entry_store(hass, entry)
-    store["aws_credentials"] = {"Expiration": ""}
-    coordinator = MagicMock()
-    store["coordinator"] = coordinator
-
-    fake_mqtt_client = MagicMock()
-    fake_mqtt_client.connect.return_value = None
-    monkeypatch.setattr(
-        sys.modules["custom_components.exo_pool.mqtt_client"],
-        "ExoMqttClient",
-        MagicMock(return_value=fake_mqtt_client),
-    )
-
-    api._connect_mqtt(hass, entry)
-    shadow_callback = fake_mqtt_client.set_shadow_callback.call_args.args[0]
+    coordinator, shadow_callback = _install_shadow_callback(hass, entry, monkeypatch)
 
     api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
     stale_echo = {"equipment": {"swc_0": {"production": 0}}}
@@ -217,3 +211,226 @@ async def test_no_matching_report_before_expiry_lets_stale_reported_value_win(
     overlaid = api._overlay_pending_writes(hass, entry, still_zero_report)
 
     assert overlaid["equipment"]["swc_0"]["production"] == 0
+
+
+async def test_desired_absent_leaves_overlay_behaviour_unchanged(hass, entry):
+    api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+
+    reported = {"equipment": {"swc_0": {"production": 0}}}
+    overlaid = api._overlay_pending_writes(hass, entry, reported)
+
+    assert overlaid["equipment"]["swc_0"]["production"] == 1
+
+
+async def test_real_ticket_sequence_shows_one_throughout_and_clears_at_one(hass, entry):
+    api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+
+    for transient_value in (0, 2):
+        overlaid = api._overlay_pending_writes(
+            hass, entry, {"equipment": {"swc_0": {"production": transient_value}}}
+        )
+        assert overlaid["equipment"]["swc_0"]["production"] == 1
+
+    final = api._overlay_pending_writes(
+        hass, entry, {"equipment": {"swc_0": {"production": 1}}}
+    )
+    assert final["equipment"]["swc_0"]["production"] == 1
+    assert ("equipment", "swc_0", "production") not in api._get_entry_store(
+        hass, entry
+    )["pending_writes"]
+
+
+def test_is_settled_is_exact_match():
+    assert api._is_settled(1, 1) is True
+    assert api._is_settled(2, 1) is False
+
+
+def test_has_expired_boundary_is_inclusive_at_the_exact_tick():
+    assert api._has_expired(expires_at=100.0, now=100.0) is True
+    assert api._has_expired(expires_at=100.0, now=99.999) is False
+
+
+class TestExpiryBoundsDerivedFromConstant:
+    async def test_just_before_expiry_still_overlaid(self, hass, entry, monkeypatch):
+        clock = [1000.0]
+        monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+
+        clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS - 0.001
+        overlaid = api._overlay_pending_writes(
+            hass, entry, {"equipment": {"swc_0": {"production": 0}}}
+        )
+        assert overlaid["equipment"]["swc_0"]["production"] == 1
+
+    async def test_exactly_at_expiry_is_expired(self, hass, entry, monkeypatch):
+        clock = [1000.0]
+        monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+
+        clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS
+        overlaid = api._overlay_pending_writes(
+            hass, entry, {"equipment": {"swc_0": {"production": 0}}}
+        )
+        assert overlaid["equipment"]["swc_0"]["production"] == 0
+
+    async def test_overlay_uses_named_has_expired(self, hass, entry, monkeypatch):
+        spy = MagicMock(wraps=api._has_expired)
+        monkeypatch.setattr(api, "_has_expired", spy)
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+
+        api._overlay_pending_writes(
+            hass, entry, {"equipment": {"swc_0": {"production": 0}}}
+        )
+
+        spy.assert_called_once()
+
+
+class TestExpiryTelemetry:
+    async def test_expiry_logs_a_warning_with_path_desired_and_reported(
+        self, hass, entry, monkeypatch, caplog
+    ):
+        clock = [1000.0]
+        monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+        clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
+
+        with caplog.at_level(logging.WARNING):
+            api._overlay_pending_writes(
+                hass, entry, {"equipment": {"swc_0": {"production": 0}}}
+            )
+
+        assert "equipment.swc_0.production" in caplog.text
+        assert "desired=1" in caplog.text
+        assert "reported=0" in caplog.text
+
+    async def test_expiry_warning_renders_missing_reported_as_absent(
+        self, hass, entry, monkeypatch, caplog
+    ):
+        clock = [1000.0]
+        monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+        clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
+
+        with caplog.at_level(logging.WARNING):
+            api._overlay_pending_writes(hass, entry, {})
+
+        assert "reported=absent" in caplog.text
+        assert "object at 0x" not in caplog.text
+
+
+class TestNonDictIntermediateRobustness:
+    async def test_non_dict_intermediate_is_skipped_with_a_warning_not_raised(
+        self, hass, entry, caplog
+    ):
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+        reported = {"equipment": {"swc_0": "unexpected_string"}}
+
+        with caplog.at_level(logging.WARNING):
+            overlaid = api._overlay_pending_writes(hass, entry, reported)
+
+        assert overlaid["equipment"]["swc_0"] == "unexpected_string"
+        assert "equipment.swc_0.production" in caplog.text
+
+    async def test_non_dict_intermediate_warning_includes_node_type(
+        self, hass, entry, caplog
+    ):
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+
+        with caplog.at_level(logging.WARNING):
+            api._overlay_pending_writes(
+                hass, entry, {"equipment": {"swc_0": "unexpected_string"}}
+            )
+
+        assert "str" in caplog.text
+
+
+class TestSupersessionOnlyOnChange:
+    async def test_own_echo_through_connect_mqtt_still_shows_our_value(
+        self, hass, entry, monkeypatch
+    ):
+        mqtt_client_module = load_exo_pool_module("mqtt_client")
+        real_exo_mqtt_client = mqtt_client_module.ExoMqttClient
+        coordinator, shadow_callback = _install_shadow_callback(hass, entry, monkeypatch)
+
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+
+        client = real_exo_mqtt_client.__new__(real_exo_mqtt_client)
+        message = {
+            "previous": {"state": {"reported": {}, "desired": {}}},
+            "current": {
+                "state": {
+                    "reported": {"equipment": {"swc_0": {"production": 0}}},
+                    "desired": {"equipment": {"swc_0": {"production": 1}}},
+                }
+            },
+        }
+        reported, changed_desired = client._extract_state(
+            "$aws/things/x/shadow/update/documents", message
+        )
+        shadow_callback(reported, changed_desired)
+
+        coordinator.async_set_updated_data.assert_called_once_with(
+            {"equipment": {"swc_0": {"production": 1}}}
+        )
+
+    async def test_echo_of_our_own_first_write_after_a_second_write_still_shows_the_latest(
+        self, hass, entry
+    ):
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 0)
+
+        changed_desired = {"equipment": {"swc_0": {"production": 1}}}
+        overlaid = api._overlay_pending_writes(
+            hass, entry, {"equipment": {"swc_0": {"production": 1}}}, changed_desired
+        )
+
+        assert overlaid["equipment"]["swc_0"]["production"] == 0
+
+    async def test_desired_unchanged_from_previous_but_different_from_ours_keeps_pending(
+        self, hass, entry
+    ):
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+
+        overlaid = api._overlay_pending_writes(
+            hass, entry, {"equipment": {"swc_0": {"production": 0}}}, {}
+        )
+
+        assert overlaid["equipment"]["swc_0"]["production"] == 1
+
+    async def test_another_apps_write_not_in_our_published_values_drops_pending(
+        self, hass, entry
+    ):
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+
+        changed_desired = {"equipment": {"swc_0": {"production": 0}}}
+        overlaid = api._overlay_pending_writes(
+            hass, entry, {"equipment": {"swc_0": {"production": 0}}}, changed_desired
+        )
+
+        assert overlaid["equipment"]["swc_0"]["production"] == 0
+        assert ("equipment", "swc_0", "production") not in api._get_entry_store(
+            hass, entry
+        )["pending_writes"]
+
+    async def test_desired_missing_our_path_keeps_pending(self, hass, entry):
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+
+        changed_desired = {"equipment": {"swc_0": {"sns_1": {"value": 2}}}}
+        overlaid = api._overlay_pending_writes(
+            hass, entry, {"equipment": {"swc_0": {"production": 0}}}, changed_desired
+        )
+
+        assert overlaid["equipment"]["swc_0"]["production"] == 1
+
+    async def test_on_shadow_update_passes_changed_desired_through(
+        self, hass, entry, monkeypatch
+    ):
+        coordinator, shadow_callback = _install_shadow_callback(hass, entry, monkeypatch)
+
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+        changed_desired = {"equipment": {"swc_0": {"production": 0}}}
+        shadow_callback({"equipment": {"swc_0": {"production": 0}}}, changed_desired)
+
+        coordinator.async_set_updated_data.assert_called_once_with(
+            {"equipment": {"swc_0": {"production": 0}}}
+        )

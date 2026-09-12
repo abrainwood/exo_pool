@@ -113,8 +113,6 @@ def mock_event_loop_deferred():
 
 @pytest.fixture
 def entry(hass):
-    """A loaded config entry with an id_token, for api.py write/overlay tests."""
-    from unittest.mock import MagicMock
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
     api = load_exo_pool_module("api")
@@ -129,8 +127,7 @@ def entry(hass):
 
 
 @pytest.fixture(autouse=True)
-def fake_client_session(monkeypatch):
-    """api.py tests never hit the network - stub the HA aiohttp helper."""
+def no_network_client_session(monkeypatch):
     from unittest.mock import MagicMock
 
     api = load_exo_pool_module("api")
@@ -141,7 +138,6 @@ def fake_client_session(monkeypatch):
 
 @pytest.fixture
 def connected_mqtt(hass, entry):
-    """Install a stub MQTT client that always accepts publish_desired."""
     from unittest.mock import MagicMock
 
     api = load_exo_pool_module("api")
@@ -151,6 +147,30 @@ def connected_mqtt(hass, entry):
     client.publish_desired = MagicMock()
     store["mqtt_client"] = client
     return client
+
+
+@pytest.fixture
+def disconnected_mqtt(hass, entry):
+    from unittest.mock import MagicMock
+
+    api = load_exo_pool_module("api")
+    store = api._get_entry_store(hass, entry)
+    client = MagicMock()
+    client.connected = False
+    client.publish_desired = MagicMock()
+    store["mqtt_client"] = client
+    return client
+
+
+@pytest.fixture
+def coordinator(hass, entry):
+    from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+
+    api = load_exo_pool_module("api")
+    coord = DataUpdateCoordinator(hass, api._LOGGER, name="Test")
+    store = api._get_entry_store(hass, entry)
+    store["coordinator"] = coord
+    return coord
 
 
 @pytest.fixture
