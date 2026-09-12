@@ -125,6 +125,7 @@ READ_DEFERRAL_JITTER_MIN = 15.0
 READ_DEFERRAL_JITTER_MAX = 45.0
 DEBOUNCE_JITTER_MIN = 30.0
 DEBOUNCE_JITTER_MAX = 90.0
+PENDING_WRITE_EXPIRY_SECONDS = 30.0
 
 # AWS IoT MQTT
 IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
@@ -337,10 +338,11 @@ class _WriteManager:
             if cooldown > 0:
                 await asyncio.sleep(cooldown)
 
+            transport = None
             try:
                 store = _get_entry_store(self._hass, self._entry)
                 store["write_in_flight"] = store.get("write_in_flight", 0) + 1
-                await _execute_write(self._hass, self._entry, item)
+                transport = await _execute_write(self._hass, self._entry, item)
             except Exception as err:
                 for future in item.futures:
                     if not future.done():
@@ -349,16 +351,19 @@ class _WriteManager:
                 for future in item.futures:
                     if not future.done():
                         future.set_result(None)
-                _set_cooldown(
-                    self._hass,
-                    self._entry,
-                    POST_WRITE_COOLDOWN_SECONDS + item.extra_delay,
-                    reason="post_write",
-                )
-                store = _get_entry_store(self._hass, self._entry)
-                store["write_quiet_until"] = (
-                    time.monotonic() + POST_WRITE_COOLDOWN_SECONDS
-                )
+                # The cooldown/gap below protect the rate-limited REST
+                # fallback only - MQTT delivery has no such limit.
+                if transport != "mqtt":
+                    _set_cooldown(
+                        self._hass,
+                        self._entry,
+                        POST_WRITE_COOLDOWN_SECONDS + item.extra_delay,
+                        reason="post_write",
+                    )
+                    store = _get_entry_store(self._hass, self._entry)
+                    store["write_quiet_until"] = (
+                        time.monotonic() + POST_WRITE_COOLDOWN_SECONDS
+                    )
                 if item.kind == "schedule":
                     _schedule_debounced_refresh(
                         self._hass, self._entry, delay=SCHEDULE_REFRESH_DELAY
@@ -367,7 +372,66 @@ class _WriteManager:
                 store = _get_entry_store(self._hass, self._entry)
                 store["write_in_flight"] = max(0, store.get("write_in_flight", 0) - 1)
 
-            await asyncio.sleep(WRITE_GAP_SECONDS)
+            if transport != "mqtt":
+                await asyncio.sleep(WRITE_GAP_SECONDS)
+
+
+_MISSING = object()
+
+
+def _flatten_leaves(prefix: list[str], value) -> list[tuple[list[str], object]]:
+    """Flatten a (possibly nested) written value into (path, leaf_value) pairs."""
+    if isinstance(value, dict):
+        leaves = []
+        for key, sub_value in value.items():
+            leaves.extend(_flatten_leaves(prefix + [key], sub_value))
+        return leaves
+    return [(prefix, value)]
+
+
+def _record_pending_writes(
+    hass: HomeAssistant, entry: ConfigEntry, keys: list[str], value
+) -> None:
+    """Record the leaf paths of a write as pending-desired until they echo back."""
+    store = _get_entry_store(hass, entry)
+    pending = store.setdefault("pending_writes", {})
+    expires_at = time.monotonic() + PENDING_WRITE_EXPIRY_SECONDS
+    for leaf_keys, leaf_value in _flatten_leaves(keys, value):
+        pending[tuple(leaf_keys)] = {"value": leaf_value, "expires_at": expires_at}
+
+
+def _get_nested_value(data: dict, keys: tuple[str, ...]):
+    node = data
+    for key in keys:
+        if not isinstance(node, dict) or key not in node:
+            return _MISSING
+        node = node[key]
+    return node
+
+
+def _overlay_pending_writes(
+    hass: HomeAssistant, entry: ConfigEntry, reported: dict
+) -> dict:
+    """Overlay any still-pending desired values onto an incoming reported state.
+
+    A pending entry clears once the reported value at its path matches the
+    desired value, or once it expires - whichever happens first.
+    """
+    store = _get_entry_store(hass, entry)
+    pending = store.get("pending_writes")
+    if not pending:
+        return reported
+    now = time.monotonic()
+    for path in list(pending.keys()):
+        info = pending[path]
+        if _get_nested_value(reported, path) == info["value"]:
+            del pending[path]
+            continue
+        if now >= info["expires_at"]:
+            del pending[path]
+            continue
+        _set_nested_value(reported, list(path), info["value"])
+    return reported
 
 
 def _get_write_manager(hass: HomeAssistant, entry: ConfigEntry) -> _WriteManager:
@@ -544,7 +608,9 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
             raise UpdateFailed(f"Device data fetch failed: {redacted_error}")
         data = await response.json()
         _LOGGER.debug("Device data: %s", redact(data))
-        reported = data.get("state", {}).get("reported", {})
+        reported = _overlay_pending_writes(
+            hass, entry, data.get("state", {}).get("reported", {})
+        )
         coordinator = (
             hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinator")
         )
@@ -787,7 +853,8 @@ def _apply_schedule_update(
 
 async def _execute_write(
     hass: HomeAssistant, entry: ConfigEntry, item: _WriteItem
-) -> None:
+) -> str:
+    """Execute a write, returning which transport delivered it ("mqtt"/"rest")."""
     if item.kind == "pool":
         desired = {"equipment": {"swc_0": item.payload}}
     elif item.kind == "heating":
@@ -804,7 +871,7 @@ async def _execute_write(
         _LOGGER.debug("Writing %s via MQTT: %s", item.key, desired)
         try:
             mqtt_client.publish_desired(desired)
-            return
+            return "mqtt"
         except Exception:
             _LOGGER.warning(
                 "MQTT write failed for %s - falling back to REST",
@@ -815,6 +882,7 @@ async def _execute_write(
     # REST fallback
     _LOGGER.debug("Writing %s via REST fallback", item.key)
     await _execute_write_rest(hass, entry, item, desired)
+    return "rest"
 
 
 async def _execute_write_rest(
@@ -1105,7 +1173,7 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     def _on_shadow_update(reported: dict) -> None:
         """Called on HA event loop when MQTT delivers a shadow update."""
-        coordinator.async_set_updated_data(reported)
+        coordinator.async_set_updated_data(_overlay_pending_writes(hass, entry, reported))
 
     mqtt_client.set_shadow_callback(_on_shadow_update)
 
@@ -1286,6 +1354,7 @@ async def set_pool_value(hass, entry, setting, value, delay_refresh=False):
 
     keys = setting.split(".")
     nested_value = _build_nested_dict(keys, value)
+    _record_pending_writes(hass, entry, ["equipment", "swc_0"] + keys, value)
     coordinator = _get_entry_store(hass, entry).get("coordinator")
     if coordinator:
         _apply_desired_update(coordinator, ["equipment", "swc_0"] + keys, value)
@@ -1309,6 +1378,7 @@ async def set_heating_value(hass, entry, key: str, value, delay_refresh: bool = 
     if not id_token:
         _LOGGER.error("No id_token available for heating.%s", key)
         return
+    _record_pending_writes(hass, entry, ["heating", key], value)
     coordinator = _get_entry_store(hass, entry).get("coordinator")
     if coordinator:
         _apply_heating_update(coordinator, key, value)
@@ -1358,6 +1428,7 @@ async def update_schedule(
         _LOGGER.debug("No schedule updates provided for %s", schedule_key)
         return
 
+    _record_pending_writes(hass, entry, ["schedules", schedule_key], sched_patch)
     coordinator = _get_entry_store(hass, entry).get("coordinator")
     if coordinator:
         _apply_schedule_update(coordinator, schedule_key, sched_patch)
