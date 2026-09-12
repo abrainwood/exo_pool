@@ -268,6 +268,8 @@ class ExoMqttClient:
     def _extract_state(self, topic: str, data: dict) -> tuple[dict | None, dict]:
         if "update/documents" in topic:
             current_state = data.get("current", {}).get("state", {})
+            if "previous" not in data:
+                return current_state.get("reported"), {}
             previous_state = data.get("previous", {}).get("state", {})
             changed_desired = _diff_desired(
                 previous_state.get("desired") or {}, current_state.get("desired") or {}
@@ -340,7 +342,7 @@ class ExoMqttClient:
 
 
 def _diff_desired(previous: dict, current: dict) -> dict:
-    """Return the subtree of `current` whose leaves differ from `previous`."""
+    """Return the leaves of `current` added or changed vs `previous`; deletions omitted."""
     diff: dict = {}
     for key in set(previous.keys()) | set(current.keys()):
         old_val = previous.get(key)

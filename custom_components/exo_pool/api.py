@@ -390,16 +390,23 @@ def _flatten_leaves(prefix: list[str], value) -> list[tuple[list[str], object]]:
 
 
 def _record_pending_writes(
-    hass: HomeAssistant, entry: ConfigEntry, keys: list[str], value
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    keys: list[str],
+    value,
+    extra_seconds: float = 0.0,
 ) -> None:
-    """Record the leaf paths of a write as pending-desired until they echo back."""
     store = _get_entry_store(hass, entry)
     pending = store.setdefault("pending_writes", {})
-    expires_at = time.monotonic() + PENDING_WRITE_EXPIRY_SECONDS
+    now = time.monotonic()
+    expires_at = now + PENDING_WRITE_EXPIRY_SECONDS + extra_seconds
     for leaf_keys, leaf_value in _flatten_leaves(keys, value):
         path = tuple(leaf_keys)
         existing = pending.get(path)
-        published_values = list(existing["published_values"]) if existing else []
+        if existing and not _has_expired(existing["expires_at"], now):
+            published_values = list(existing["published_values"])
+        else:
+            published_values = []
         if leaf_value not in published_values:
             published_values.append(leaf_value)
         pending[path] = {
@@ -451,7 +458,7 @@ def _overlay_pending_writes(
     reported: dict,
     changed_desired: dict | None = None,
 ) -> dict:
-    """Mutate `reported` in place, overlaying any still-pending desired values."""
+    """Overlay pending desired values into `reported`, consuming settled/expired/superseded entries."""
     store = _get_entry_store(hass, entry)
     pending = store.get("pending_writes")
     if not pending:
@@ -921,7 +928,6 @@ def _try_mqtt(
         mqtt_client.publish_desired(desired)
         return True
     except Exception:
-        _clear_pending_writes(hass, entry, [], desired)
         _LOGGER.warning(
             "MQTT write failed for %s - falling back to REST", item.key, exc_info=True
         )
@@ -945,7 +951,7 @@ async def _execute_write(
 
     cooldown = _cooldown_remaining(hass, entry)
     if cooldown > 0:
-        _record_pending_writes(hass, entry, [], desired)
+        _record_pending_writes(hass, entry, [], desired, extra_seconds=cooldown)
         try:
             await asyncio.sleep(cooldown)
         except (Exception, asyncio.CancelledError):
@@ -1250,10 +1256,10 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         store["mqtt_client"] = mqtt_client
 
-    def _on_shadow_update(reported: dict, desired: dict) -> None:
+    def _on_shadow_update(reported: dict, changed_desired: dict) -> None:
         """Called on HA event loop when MQTT delivers a shadow update."""
         coordinator.async_set_updated_data(
-            _overlay_pending_writes(hass, entry, reported, desired)
+            _overlay_pending_writes(hass, entry, reported, changed_desired)
         )
 
     mqtt_client.set_shadow_callback(_on_shadow_update)

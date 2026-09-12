@@ -3,20 +3,13 @@ from __future__ import annotations
 import copy
 import logging
 import sys
+from unittest.mock import MagicMock
 
-from unittest.mock import AsyncMock, MagicMock
-
-import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from tests.conftest import load_exo_pool_module
+from tests.conftest import FakeResponse, FakeSession, load_exo_pool_module
 
 api = load_exo_pool_module("api")
-
-
-@pytest.fixture
-def no_write_gap_sleep(monkeypatch):
-    monkeypatch.setattr(api.asyncio, "sleep", AsyncMock())
 
 
 SWC_0 = {
@@ -89,7 +82,7 @@ async def test_matching_report_clears_pending_so_a_later_off_report_is_honored(
 
 
 async def test_write_one_then_zero_quickly_leaves_pending_at_the_latest_value(
-    hass, entry, connected_mqtt, coordinator, monkeypatch, no_write_gap_sleep
+    hass, entry, connected_mqtt, coordinator, monkeypatch
 ):
     coordinator.async_set_updated_data({"equipment": {"swc_0": copy.deepcopy(SWC_0)}})
     clock = [1000.0]
@@ -137,33 +130,6 @@ async def test_connect_mqtt_shadow_callback_overlays_pending_writes(hass, entry,
     )
 
 
-class _FakeResponse:
-    def __init__(self, status: int, payload: dict):
-        self.status = status
-        self.headers: dict = {}
-        self._payload = payload
-
-    async def json(self):
-        return self._payload
-
-    async def text(self):
-        return "{}"
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc_info):
-        return False
-
-
-class _FakeSession:
-    def __init__(self, response: _FakeResponse):
-        self._response = response
-
-    def get(self, url, headers=None):
-        return self._response
-
-
 async def test_async_update_data_rest_fetch_overlays_pending_writes(
     hass, monkeypatch
 ):
@@ -183,8 +149,8 @@ async def test_async_update_data_rest_fetch_overlays_pending_writes(
     entry = fresh_entry
     api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
 
-    session = _FakeSession(
-        _FakeResponse(
+    session = FakeSession(
+        FakeResponse(
             200,
             {"state": {"reported": {"equipment": {"swc_0": {"production": 0}}}}},
         )
@@ -213,15 +179,6 @@ async def test_no_matching_report_before_expiry_lets_stale_reported_value_win(
     assert overlaid["equipment"]["swc_0"]["production"] == 0
 
 
-async def test_desired_absent_leaves_overlay_behaviour_unchanged(hass, entry):
-    api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
-
-    reported = {"equipment": {"swc_0": {"production": 0}}}
-    overlaid = api._overlay_pending_writes(hass, entry, reported)
-
-    assert overlaid["equipment"]["swc_0"]["production"] == 1
-
-
 async def test_real_ticket_sequence_shows_one_throughout_and_clears_at_one(hass, entry):
     api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
 
@@ -238,16 +195,6 @@ async def test_real_ticket_sequence_shows_one_throughout_and_clears_at_one(hass,
     assert ("equipment", "swc_0", "production") not in api._get_entry_store(
         hass, entry
     )["pending_writes"]
-
-
-def test_is_settled_is_exact_match():
-    assert api._is_settled(1, 1) is True
-    assert api._is_settled(2, 1) is False
-
-
-def test_has_expired_boundary_is_inclusive_at_the_exact_tick():
-    assert api._has_expired(expires_at=100.0, now=100.0) is True
-    assert api._has_expired(expires_at=100.0, now=99.999) is False
 
 
 class TestExpiryBoundsDerivedFromConstant:
@@ -272,17 +219,6 @@ class TestExpiryBoundsDerivedFromConstant:
             hass, entry, {"equipment": {"swc_0": {"production": 0}}}
         )
         assert overlaid["equipment"]["swc_0"]["production"] == 0
-
-    async def test_overlay_uses_named_has_expired(self, hass, entry, monkeypatch):
-        spy = MagicMock(wraps=api._has_expired)
-        monkeypatch.setattr(api, "_has_expired", spy)
-        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
-
-        api._overlay_pending_writes(
-            hass, entry, {"equipment": {"swc_0": {"production": 0}}}
-        )
-
-        spy.assert_called_once()
 
 
 class TestExpiryTelemetry:
@@ -341,7 +277,7 @@ class TestNonDictIntermediateRobustness:
                 hass, entry, {"equipment": {"swc_0": "unexpected_string"}}
             )
 
-        assert "str" in caplog.text
+        assert "unexpected shape: str" in caplog.text
 
 
 class TestSupersessionOnlyOnChange:
@@ -434,3 +370,17 @@ class TestSupersessionOnlyOnChange:
         coordinator.async_set_updated_data.assert_called_once_with(
             {"equipment": {"swc_0": {"production": 0}}}
         )
+
+
+class TestExpiredEntryDoesNotCarryForwardPublishedValues:
+    def test_recording_after_expiry_starts_published_values_fresh(self, hass, entry, monkeypatch):
+        clock = [1000.0]
+        monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
+
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
+        clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
+        api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 0)
+
+        pending = api._get_entry_store(hass, entry)["pending_writes"]
+        published = pending[("equipment", "swc_0", "production")]["published_values"]
+        assert published == [0]

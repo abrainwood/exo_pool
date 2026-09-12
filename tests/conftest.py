@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import pathlib
 import sys
 import types
@@ -190,3 +191,33 @@ def build_client(mock_mqtt_connection, mock_event_loop):
         return client
 
     return _build
+
+
+class FakeResponse:
+    def __init__(self, status: int, payload: dict):
+        self.status = status
+        self.headers: dict = {}
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+    async def text(self):
+        return json.dumps(self._payload)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+class FakeSession:
+    def __init__(self, response: FakeResponse):
+        self._response = response
+
+    def get(self, url, headers=None):
+        return self._response
+
+    def post(self, url, json=None, headers=None):  # noqa: A002 - matches aiohttp signature
+        return self._response

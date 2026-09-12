@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -130,8 +130,10 @@ class TestRecordAtSendTime:
 
         await api.set_pool_value(hass, entry, "production", 1)
 
-        pending = api._get_entry_store(hass, entry)["pending_writes"]
-        assert pending[("equipment", "swc_0", "production")]["expires_at"] > clock[0]
+        overlaid = api._overlay_pending_writes(
+            hass, entry, {"equipment": {"swc_0": {"production": 0}}}
+        )
+        assert overlaid["equipment"]["swc_0"]["production"] == 1
 
     async def test_failed_rest_write_raises_and_clears_its_own_pending_entry(
         self, hass, entry, monkeypatch
@@ -214,54 +216,50 @@ class TestMqttReconnectDuringRestCooldownWait:
         )
         api._set_cooldown(hass, entry, 10.0, reason="post_write")
         monkeypatch.setattr(api, "_execute_write_rest", AsyncMock(return_value=None))
+        mid_wait_result = {}
 
         async def _fake_sleep(seconds):
+            if "production" in mid_wait_result:
+                return
             overlaid = api._overlay_pending_writes(
                 hass, entry, {"equipment": {"swc_0": {"production": 0}}}, {}
             )
-            coordinator.async_set_updated_data(overlaid)
+            mid_wait_result["production"] = overlaid["equipment"]["swc_0"]["production"]
 
         monkeypatch.setattr(api.asyncio, "sleep", _fake_sleep)
 
         await api.set_pool_value(hass, entry, "production", 1)
 
-        assert coordinator.data["equipment"]["swc_0"]["production"] == 1
+        assert mid_wait_result["production"] == 1
 
     async def test_no_false_expiry_warning_during_a_wait_longer_than_expiry(
-        self, hass, entry, disconnected_mqtt, monkeypatch, caplog
+        self, hass, entry, disconnected_mqtt, coordinator, monkeypatch, caplog
     ):
         clock = [1000.0]
         monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
-        api._set_cooldown(
-            hass, entry, api.PENDING_WRITE_EXPIRY_SECONDS + 5, reason="post_write"
-        )
+        cooldown = api.PENDING_WRITE_EXPIRY_SECONDS + 5
+        api._set_cooldown(hass, entry, cooldown, reason="post_write")
         monkeypatch.setattr(api, "_execute_write_rest", AsyncMock(return_value=None))
+        coordinator.async_set_updated_data({"equipment": {"swc_0": {"production": 0}}})
+        mid_wait_result = {}
 
         async def _fake_sleep(seconds):
-            clock[0] += seconds
+            if "production" in mid_wait_result:
+                clock[0] += seconds
+                return
+            clock[0] += api.PENDING_WRITE_EXPIRY_SECONDS + 1
+            overlaid = api._overlay_pending_writes(
+                hass, entry, {"equipment": {"swc_0": {"production": 0}}}
+            )
+            mid_wait_result["production"] = overlaid["equipment"]["swc_0"]["production"]
+            clock[0] += seconds - (api.PENDING_WRITE_EXPIRY_SECONDS + 1)
 
         monkeypatch.setattr(api.asyncio, "sleep", _fake_sleep)
 
         with caplog.at_level(logging.WARNING):
             await api.set_pool_value(hass, entry, "production", 1)
 
-        assert "expired unsettled" not in caplog.text
-
-
-class TestMqttPublishFailureClearsPending:
-    async def test_mqtt_publish_raises_clears_pending_before_rest_fallback(
-        self, hass, entry, connected_mqtt, monkeypatch, caplog
-    ):
-        connected_mqtt.publish_desired.side_effect = ConnectionError("dropped")
-        monkeypatch.setattr(api, "_execute_write_rest", AsyncMock(return_value=None))
-        monkeypatch.setattr(api.asyncio, "sleep", AsyncMock())
-        clear_spy = MagicMock(wraps=api._clear_pending_writes)
-        monkeypatch.setattr(api, "_clear_pending_writes", clear_spy)
-
-        with caplog.at_level(logging.WARNING):
-            await api.set_pool_value(hass, entry, "production", 1)
-
-        clear_spy.assert_called_once()
+        assert mid_wait_result["production"] == 1
         assert "expired unsettled" not in caplog.text
 
 
@@ -311,3 +309,25 @@ class TestCancelledDuringDispatchClearsPending:
         pending = api._get_entry_store(hass, entry).get("pending_writes", {})
         assert ("equipment", "swc_0", "production") not in pending
 
+
+
+class TestMqttPublishFailurePreservesPublishedValues:
+    async def test_late_echo_of_earlier_success_does_not_supersede_rest_fallback(
+        self, hass, entry, connected_mqtt, coordinator, monkeypatch
+    ):
+        monkeypatch.setattr(api.asyncio, "sleep", AsyncMock())
+        monkeypatch.setattr(api, "_execute_write_rest", AsyncMock(return_value=None))
+        coordinator.async_set_updated_data({"equipment": {"swc_0": {"production": 0}}})
+
+        connected_mqtt.publish_desired.side_effect = [None, ConnectionError("dropped")]
+        await api.set_pool_value(hass, entry, "production", 1)
+        await api.set_pool_value(hass, entry, "production", 0)
+
+        overlaid = api._overlay_pending_writes(
+            hass,
+            entry,
+            {"equipment": {"swc_0": {"production": 1}}},
+            {"equipment": {"swc_0": {"production": 1}}},
+        )
+
+        assert overlaid["equipment"]["swc_0"]["production"] == 0
