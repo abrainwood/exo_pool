@@ -183,8 +183,10 @@ def _set_cooldown(
 ) -> None:
     store = _get_entry_store(hass, entry)
     cooldown_until = time.monotonic() + seconds
-    store["cooldown_until"] = max(_get_cooldown_until(store), cooldown_until)
-    store["cooldown_reason"] = reason
+    existing_until = _get_cooldown_until(store)
+    store["cooldown_until"] = max(existing_until, cooldown_until)
+    if cooldown_until >= existing_until:
+        store["cooldown_reason"] = reason
     _LOGGER.debug(
         "Cooldown set for %s: %.1fs (%s)",
         entry.entry_id,
@@ -222,16 +224,19 @@ async def _wait_for_reconnect_or_cooldown(
     event.clear()
     sleep_task = asyncio.ensure_future(asyncio.sleep(cooldown))
     event_task = asyncio.ensure_future(event.wait())
+    tasks = {sleep_task, event_task}
     try:
-        done, pending = await asyncio.wait(
-            {sleep_task, event_task}, return_when=asyncio.FIRST_COMPLETED
-        )
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
         if sleep_task in done:
             sleep_task.result()
         return event_task in done
     finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         event.clear()
 
 
@@ -959,13 +964,18 @@ def _apply_schedule_update(
 
 
 def _try_mqtt(
-    hass: HomeAssistant, entry: ConfigEntry, item: _WriteItem, desired: dict
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    item: _WriteItem,
+    desired: dict,
+    *,
+    extra_seconds: float = 0.0,
 ) -> bool:
     store = _get_entry_store(hass, entry)
     mqtt_client = store.get("mqtt_client")
     if not (mqtt_client and mqtt_client.connected):
         return False
-    _record_pending_writes(hass, entry, [], desired)
+    _record_pending_writes(hass, entry, [], desired, extra_seconds=extra_seconds)
     _LOGGER.debug("Writing %s via MQTT: %s", item.key, desired)
     try:
         mqtt_client.publish_desired(desired)
@@ -992,8 +1002,7 @@ async def _execute_write(
     if _try_mqtt(hass, entry, item, desired):
         return Transport.MQTT
 
-    cooldown = _cooldown_remaining(hass, entry)
-    if cooldown > 0:
+    while (cooldown := _cooldown_remaining(hass, entry)) > 0:
         _record_pending_writes(hass, entry, [], desired, extra_seconds=cooldown)
         store = _get_entry_store(hass, entry)
         _LOGGER.info(
@@ -1009,7 +1018,9 @@ async def _execute_write(
             raise
         if woke_early:
             _LOGGER.info("Write %s woken early by MQTT reconnect", item.key)
-        if _try_mqtt(hass, entry, item, desired):
+        if _try_mqtt(
+            hass, entry, item, desired, extra_seconds=_cooldown_remaining(hass, entry)
+        ):
             return Transport.MQTT
 
     _record_pending_writes(hass, entry, [], desired)
