@@ -184,12 +184,55 @@ def _set_cooldown(
     store = _get_entry_store(hass, entry)
     cooldown_until = time.monotonic() + seconds
     store["cooldown_until"] = max(_get_cooldown_until(store), cooldown_until)
+    store["cooldown_reason"] = reason
     _LOGGER.debug(
         "Cooldown set for %s: %.1fs (%s)",
         entry.entry_id,
         seconds,
         reason,
     )
+
+
+def _get_reconnect_event(store: dict) -> asyncio.Event:
+    """Return the entry's MQTT-reconnect event, creating it on first use."""
+    event = store.get("mqtt_reconnect_event")
+    if event is None:
+        event = asyncio.Event()
+        store["mqtt_reconnect_event"] = event
+    return event
+
+
+def _notify_mqtt_state_changed(
+    hass: HomeAssistant, entry: ConfigEntry, connected: bool
+) -> None:
+    """Wake a write waiting out a cooldown when MQTT reports it has reconnected."""
+    if not connected:
+        return
+    event = _get_entry_store(hass, entry).get("mqtt_reconnect_event")
+    if event is not None:
+        event.set()
+
+
+async def _wait_for_reconnect_or_cooldown(
+    hass: HomeAssistant, entry: ConfigEntry, cooldown: float
+) -> bool:
+    """Wait out `cooldown`, waking early if MQTT reconnects. Returns True on early wake."""
+    store = _get_entry_store(hass, entry)
+    event = _get_reconnect_event(store)
+    event.clear()
+    sleep_task = asyncio.ensure_future(asyncio.sleep(cooldown))
+    event_task = asyncio.ensure_future(event.wait())
+    try:
+        done, pending = await asyncio.wait(
+            {sleep_task, event_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        if sleep_task in done:
+            sleep_task.result()
+        return event_task in done
+    finally:
+        event.clear()
 
 
 def _schedule_debounced_refresh(
@@ -952,11 +995,20 @@ async def _execute_write(
     cooldown = _cooldown_remaining(hass, entry)
     if cooldown > 0:
         _record_pending_writes(hass, entry, [], desired, extra_seconds=cooldown)
+        store = _get_entry_store(hass, entry)
+        _LOGGER.info(
+            "Write %s held behind cooldown: %.1fs remaining (%s)",
+            item.key,
+            cooldown,
+            store.get("cooldown_reason", "unknown"),
+        )
         try:
-            await asyncio.sleep(cooldown)
+            woke_early = await _wait_for_reconnect_or_cooldown(hass, entry, cooldown)
         except (Exception, asyncio.CancelledError):
             _clear_pending_writes(hass, entry, [], desired)
             raise
+        if woke_early:
+            _LOGGER.info("Write %s woken early by MQTT reconnect", item.key)
         if _try_mqtt(hass, entry, item, desired):
             return Transport.MQTT
 
@@ -1267,6 +1319,7 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     def _on_mqtt_state_changed(_connected: bool) -> None:
         """Called on HA event loop when the transport connected state flips."""
         coordinator.async_update_listeners()
+        _notify_mqtt_state_changed(hass, entry, _connected)
 
     mqtt_client.set_state_changed_callback(_on_mqtt_state_changed)
 
