@@ -277,6 +277,49 @@ async def test_reconnect_refreshes_credentials_when_they_are_expired(
     refresh.assert_called_once()
 
 
+async def test_trigger_mqtt_reconnect_is_a_no_op_while_a_reconnect_is_already_in_flight(
+    hass, entry
+):
+    store = api._get_entry_store(hass, entry)
+    store["mqtt_reconnect_in_progress"] = True
+
+    api._trigger_mqtt_reconnect(hass, entry, name="exo_pool_reconnect_refresh")
+
+    assert store.get("mqtt_retry_task") is None
+
+
+async def test_reconnect_failed_callback_racing_the_synchronous_failure_does_not_leak_a_task(
+    hass, entry, monkeypatch
+):
+    store = api._get_entry_store(hass, entry)
+    store["aws_credentials"] = {"Expiration": ""}
+    monkeypatch.setattr(api, "_refresh_authentication", AsyncMock(return_value=None))
+
+    def fake_connect_mqtt(hass_, entry_):
+        hass_.loop.call_soon_threadsafe(
+            lambda: api._trigger_mqtt_reconnect(
+                hass_, entry_, name="exo_pool_reconnect_refresh"
+            )
+        )
+        return False
+
+    monkeypatch.setattr(api, "_connect_mqtt", fake_connect_mqtt)
+
+    try:
+        await api._async_refresh_and_reconnect(hass, entry)
+        await hass.async_block_till_done()
+
+        retry_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() in ("exo_pool_mqtt_retry", "exo_pool_reconnect_refresh")
+            and not task.done()
+        ]
+        assert len(retry_tasks) == 1
+    finally:
+        await _cancel_retry_task(hass, entry)
+
+
 async def test_a_fully_failed_subscribe_does_not_reset_the_backoff(
     hass, entry, monkeypatch
 ):
@@ -434,6 +477,15 @@ async def test_connect_mqtt_wires_the_state_changed_callback_to_coordinator_list
     state_changed(False)
 
     coordinator.async_update_listeners.assert_called_once()
+
+
+async def test_reconnect_after_unload_does_not_recreate_the_entry_store(hass, entry):
+    api._get_entry_store(hass, entry)
+    del hass.data[api.DOMAIN][entry.entry_id]
+
+    api._wake_held_write_on_reconnect(hass, entry, True)
+
+    assert entry.entry_id not in hass.data[api.DOMAIN]
 
 
 async def test_cleanup_entry_cancels_the_pending_mqtt_retry_task(hass, entry):

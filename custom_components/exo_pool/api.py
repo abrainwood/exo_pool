@@ -204,21 +204,24 @@ def _get_reconnect_event(store: dict) -> asyncio.Event:
     return event
 
 
-def _notify_mqtt_state_changed(
+def _wake_held_write_on_reconnect(
     hass: HomeAssistant, entry: ConfigEntry, connected: bool
 ) -> None:
     """Wake a write waiting out a cooldown when MQTT reports it has reconnected."""
     if not connected:
         return
-    event = _get_entry_store(hass, entry).get("mqtt_reconnect_event")
+    store = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if store is None:
+        return
+    event = store.get("mqtt_reconnect_event")
     if event is not None:
         event.set()
 
 
-async def _wait_for_reconnect_or_cooldown(
+async def _woke_early_from_cooldown(
     hass: HomeAssistant, entry: ConfigEntry, cooldown: float
 ) -> bool:
-    """Wait out `cooldown`, waking early if MQTT reconnects. Returns True on early wake."""
+    """Wait out `cooldown`, waking early if MQTT reconnects."""
     store = _get_entry_store(hass, entry)
     event = _get_reconnect_event(store)
     event.clear()
@@ -231,13 +234,12 @@ async def _wait_for_reconnect_or_cooldown(
             task.cancel()
         if sleep_task in done:
             sleep_task.result()
-        return event_task in done
+        return event.is_set() and _cooldown_remaining(hass, entry) > 0
     finally:
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        event.clear()
 
 
 def _schedule_debounced_refresh(
@@ -968,14 +970,12 @@ def _try_mqtt(
     entry: ConfigEntry,
     item: _WriteItem,
     desired: dict,
-    *,
-    extra_seconds: float = 0.0,
 ) -> bool:
     store = _get_entry_store(hass, entry)
     mqtt_client = store.get("mqtt_client")
     if not (mqtt_client and mqtt_client.connected):
         return False
-    _record_pending_writes(hass, entry, [], desired, extra_seconds=extra_seconds)
+    _record_pending_writes(hass, entry, [], desired)
     _LOGGER.debug("Writing %s via MQTT: %s", item.key, desired)
     try:
         mqtt_client.publish_desired(desired)
@@ -1012,15 +1012,13 @@ async def _execute_write(
             store.get("cooldown_reason", "unknown"),
         )
         try:
-            woke_early = await _wait_for_reconnect_or_cooldown(hass, entry, cooldown)
+            woke_early = await _woke_early_from_cooldown(hass, entry, cooldown)
         except (Exception, asyncio.CancelledError):
             _clear_pending_writes(hass, entry, [], desired)
             raise
         if woke_early:
             _LOGGER.info("Write %s woken early by MQTT reconnect", item.key)
-        if _try_mqtt(
-            hass, entry, item, desired, extra_seconds=_cooldown_remaining(hass, entry)
-        ):
+        if _try_mqtt(hass, entry, item, desired):
             return Transport.MQTT
 
     _record_pending_writes(hass, entry, [], desired)
@@ -1180,6 +1178,7 @@ async def _async_refresh_and_reconnect(
         return
 
     store = _get_entry_store(hass, entry)
+    store["mqtt_reconnect_in_progress"] = True
     connected = False
     error: Exception | None = None
     try:
@@ -1189,6 +1188,8 @@ async def _async_refresh_and_reconnect(
         connected = await hass.async_add_executor_job(_connect_mqtt, hass, entry)
     except Exception as err:
         error = err
+    finally:
+        store["mqtt_reconnect_in_progress"] = False
 
     if not _entry_is_loaded(hass, entry):
         return
@@ -1259,6 +1260,8 @@ def _trigger_mqtt_reconnect(hass: HomeAssistant, entry: ConfigEntry, *, name: st
     if not _entry_is_loaded(hass, entry):
         return
     store = _get_entry_store(hass, entry)
+    if store.get("mqtt_reconnect_in_progress"):
+        return
     task = store.get("mqtt_retry_task")
     if task is not None and not task.done():
         if not store.get("mqtt_retry_sleeping"):
@@ -1327,10 +1330,10 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     mqtt_client.set_shadow_callback(_on_shadow_update)
 
-    def _on_mqtt_state_changed(_connected: bool) -> None:
+    def _on_mqtt_state_changed(connected: bool) -> None:
         """Called on HA event loop when the transport connected state flips."""
         coordinator.async_update_listeners()
-        _notify_mqtt_state_changed(hass, entry, _connected)
+        _wake_held_write_on_reconnect(hass, entry, connected)
 
     mqtt_client.set_state_changed_callback(_on_mqtt_state_changed)
 

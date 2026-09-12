@@ -9,7 +9,7 @@ import pytest
 from tests.conftest import load_exo_pool_module
 
 api = load_exo_pool_module("api")
-_real_sleep = asyncio.sleep  # captured before any test monkeypatches api.asyncio.sleep
+_unpatched_asyncio_sleep = asyncio.sleep
 
 
 async def test_two_back_to_back_mqtt_writes_are_both_delivered(
@@ -340,7 +340,7 @@ class TestNoRestInsideCooldownAfterEarlyWake:
             if calls["n"] == 1:
                 fake_clock[0] += 3
                 disconnected_mqtt.connected = True
-                api._notify_mqtt_state_changed(hass, entry, True)
+                api._wake_held_write_on_reconnect(hass, entry, True)
                 disconnected_mqtt.connected = False
                 await asyncio.Future()
             else:
@@ -369,7 +369,7 @@ class TestNoRestInsideCooldownAfterEarlyWake:
                 woken["once"] = True
                 fake_clock[0] += 3
                 disconnected_mqtt.connected = True
-                api._notify_mqtt_state_changed(hass, entry, True)
+                api._wake_held_write_on_reconnect(hass, entry, True)
                 await asyncio.Future()
             fake_clock[0] += seconds
 
@@ -381,6 +381,40 @@ class TestNoRestInsideCooldownAfterEarlyWake:
         execute_rest.assert_called_once()
         assert fake_clock[0] == pytest.approx(1055.0 + api.WRITE_GAP_SECONDS)
         assert "expired unsettled" not in caplog.text
+
+
+class TestStateChangedCallbackWiring:
+    async def test_reconnect_callback_wakes_a_held_write_before_the_cooldown_ends(
+        self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock
+    ):
+        from unittest.mock import MagicMock
+
+        store = api._get_entry_store(hass, entry)
+        store["aws_credentials"] = {"Expiration": ""}
+        store["coordinator"] = MagicMock()
+        api._connect_mqtt(hass, entry)
+        state_changed = disconnected_mqtt.set_state_changed_callback.call_args.args[0]
+
+        api._set_cooldown(hass, entry, 55.0, reason="post_write")
+
+        woken = {"once": False}
+
+        async def fake_sleep(seconds):
+            if woken["once"]:
+                await _unpatched_asyncio_sleep(0)
+                return
+            woken["once"] = True
+            fake_clock[0] += 3
+            disconnected_mqtt.connected = True
+            state_changed(True)
+            await asyncio.Future()
+
+        monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+
+        await api.set_pool_value(hass, entry, "production", 1)
+
+        disconnected_mqtt.publish_desired.assert_called_once()
+        assert fake_clock[0] == pytest.approx(1003.0)
 
 
 class TestCancelDuringCooldownWaitClosesInnerTasks:
@@ -399,13 +433,13 @@ class TestCancelDuringCooldownWaitClosesInnerTasks:
 
         async def slow_sleep(seconds):
             entered_wait.set()
-            await _real_sleep(seconds)
+            await _unpatched_asyncio_sleep(seconds)
 
         monkeypatch.setattr(api.asyncio, "sleep", slow_sleep)
         monkeypatch.setattr(api.asyncio, "ensure_future", tracking_ensure_future)
 
         wait_task = asyncio.ensure_future(
-            api._wait_for_reconnect_or_cooldown(hass, entry, 5.0)
+            api._woke_early_from_cooldown(hass, entry, 5.0)
         )
         await entered_wait.wait()
 
@@ -413,9 +447,33 @@ class TestCancelDuringCooldownWaitClosesInnerTasks:
         with pytest.raises(asyncio.CancelledError):
             await wait_task
 
-        await _real_sleep(0)
+        await _unpatched_asyncio_sleep(0)
         assert created_tasks
         assert all(task.done() for task in created_tasks)
+
+
+class TestEarlyWakeDecidedByEventNotTaskCompletionOrder:
+    async def test_full_cooldown_elapsing_is_not_reported_as_early_wake_even_if_the_event_also_completes(
+        self, hass, entry, monkeypatch, fake_clock
+    ):
+        api._set_cooldown(hass, entry, 5.0, reason="post_write")
+        store = api._get_entry_store(hass, entry)
+        event = api._get_reconnect_event(store)
+        real_wait = api.asyncio.wait
+
+        async def fake_sleep(seconds):
+            event.set()
+
+        async def fake_wait(tasks, **kwargs):
+            return await real_wait(tasks, return_when=asyncio.ALL_COMPLETED)
+
+        monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(api.asyncio, "wait", fake_wait)
+        fake_clock[0] += 5.0
+
+        woke_early = await api._woke_early_from_cooldown(hass, entry, 5.0)
+
+        assert woke_early is False
 
 
 class TestCooldownReasonMatchesLongestHold:
@@ -444,22 +502,20 @@ class TestCooldownReasonMatchesLongestHold:
 
 class TestWakeHeldWriteOnMqttReconnect:
     async def test_mqtt_reconnect_wakes_the_wait_before_the_full_cooldown_elapses(
-        self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock
+        self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock,
+        post_write_cooldown_seconds, fake_sleep_that_wakes_at_full_cooldown,
     ):
-        api._set_cooldown(hass, entry, 55.0, reason="post_write")
+        api._set_cooldown(hass, entry, post_write_cooldown_seconds, reason="post_write")
         execute_rest = AsyncMock(return_value=None)
         monkeypatch.setattr(api, "_execute_write_rest", execute_rest)
 
-        async def fake_sleep(seconds):
-            if seconds != pytest.approx(55.0):
-                await _real_sleep(0)
-                return
-            fake_clock[0] += 3
+        def wake():
             disconnected_mqtt.connected = True
-            api._notify_mqtt_state_changed(hass, entry, True)
-            await asyncio.Future()
+            api._wake_held_write_on_reconnect(hass, entry, True)
 
-        monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(
+            api.asyncio, "sleep", fake_sleep_that_wakes_at_full_cooldown(wake)
+        )
 
         await api.set_pool_value(hass, entry, "production", 1)
 
@@ -468,9 +524,9 @@ class TestWakeHeldWriteOnMqttReconnect:
         assert fake_clock[0] == pytest.approx(1003.0)
 
     async def test_no_reconnect_waits_the_full_cooldown_then_falls_back_to_rest(
-        self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock
+        self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock, post_write_cooldown_seconds
     ):
-        api._set_cooldown(hass, entry, 55.0, reason="post_write")
+        api._set_cooldown(hass, entry, post_write_cooldown_seconds, reason="post_write")
         execute_rest = AsyncMock(return_value=None)
         monkeypatch.setattr(api, "_execute_write_rest", execute_rest)
 
@@ -483,12 +539,14 @@ class TestWakeHeldWriteOnMqttReconnect:
 
         disconnected_mqtt.publish_desired.assert_not_called()
         execute_rest.assert_called_once()
-        assert fake_clock[0] == pytest.approx(1055.0 + api.WRITE_GAP_SECONDS)
+        assert fake_clock[0] == pytest.approx(
+            1000.0 + post_write_cooldown_seconds + api.WRITE_GAP_SECONDS
+        )
 
     async def test_spurious_reconnect_signal_while_still_disconnected_falls_back_to_rest(
-        self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock
+        self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock, post_write_cooldown_seconds
     ):
-        api._set_cooldown(hass, entry, 55.0, reason="post_write")
+        api._set_cooldown(hass, entry, post_write_cooldown_seconds, reason="post_write")
         execute_rest = AsyncMock(return_value=None)
         monkeypatch.setattr(api, "_execute_write_rest", execute_rest)
         notified = {"once": False}
@@ -497,7 +555,7 @@ class TestWakeHeldWriteOnMqttReconnect:
             if not notified["once"]:
                 notified["once"] = True
                 fake_clock[0] += 3
-                api._notify_mqtt_state_changed(hass, entry, True)
+                api._wake_held_write_on_reconnect(hass, entry, True)
                 await asyncio.Future()
             fake_clock[0] += seconds
 
@@ -507,32 +565,38 @@ class TestWakeHeldWriteOnMqttReconnect:
 
         disconnected_mqtt.publish_desired.assert_not_called()
         execute_rest.assert_called_once()
-        assert fake_clock[0] == pytest.approx(1055.0 + api.WRITE_GAP_SECONDS)
+        assert fake_clock[0] == pytest.approx(
+            1000.0 + post_write_cooldown_seconds + api.WRITE_GAP_SECONDS
+        )
 
     async def test_hold_and_early_wake_are_logged_at_info(
-        self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock, caplog
+        self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock, caplog,
+        post_write_cooldown_seconds, fake_sleep_that_wakes_at_full_cooldown,
     ):
-        api._set_cooldown(hass, entry, 55.0, reason="post_write")
+        api._set_cooldown(hass, entry, post_write_cooldown_seconds, reason="post_write")
         monkeypatch.setattr(api, "_execute_write_rest", AsyncMock(return_value=None))
 
-        async def fake_sleep(seconds):
-            if seconds != pytest.approx(55.0):
-                await _real_sleep(0)
-                return
-            fake_clock[0] += 3
+        def wake():
             disconnected_mqtt.connected = True
-            api._notify_mqtt_state_changed(hass, entry, True)
-            await asyncio.Future()
+            api._wake_held_write_on_reconnect(hass, entry, True)
 
-        monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(
+            api.asyncio, "sleep", fake_sleep_that_wakes_at_full_cooldown(wake)
+        )
 
         with caplog.at_level(logging.INFO):
             await api.set_pool_value(hass, entry, "production", 1)
 
-        assert "held behind cooldown" in caplog.text
-        assert "pool:production" in caplog.text
-        assert "55.0" in caplog.text
-        assert "woken early" in caplog.text
+        hold_record = next(
+            r for r in caplog.records if "held behind cooldown" in r.getMessage()
+        )
+        wake_record = next(
+            r for r in caplog.records if "woken early" in r.getMessage()
+        )
+        assert "pool:production" in hold_record.getMessage()
+        assert str(post_write_cooldown_seconds) in hold_record.getMessage()
+        assert hold_record.levelno == logging.INFO
+        assert wake_record.levelno == logging.INFO
 
     async def test_stale_reconnect_signal_does_not_wake_a_later_held_write(
         self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock, caplog
@@ -544,7 +608,7 @@ class TestWakeHeldWriteOnMqttReconnect:
         async def fake_sleep_first(seconds):
             fake_clock[0] += 3
             disconnected_mqtt.connected = True
-            api._notify_mqtt_state_changed(hass, entry, True)
+            api._wake_held_write_on_reconnect(hass, entry, True)
             await asyncio.Future()
 
         monkeypatch.setattr(api.asyncio, "sleep", fake_sleep_first)
@@ -552,7 +616,7 @@ class TestWakeHeldWriteOnMqttReconnect:
             await api.set_pool_value(hass, entry, "production", 1)
         disconnected_mqtt.publish_desired.assert_called_once()
 
-        api._notify_mqtt_state_changed(hass, entry, True)
+        api._wake_held_write_on_reconnect(hass, entry, True)
 
         disconnected_mqtt.connected = False
         disconnected_mqtt.publish_desired.reset_mock()
@@ -583,7 +647,7 @@ class TestWakeHeldWriteOnMqttReconnect:
         woke_during_wait = {"value": None}
 
         async def fake_sleep(seconds):
-            api._notify_mqtt_state_changed(hass, entry, False)
+            api._wake_held_write_on_reconnect(hass, entry, False)
             woke_during_wait["value"] = event.is_set()
             fake_clock[0] += seconds
 
