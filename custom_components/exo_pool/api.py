@@ -1177,7 +1177,6 @@ async def _async_refresh_and_reconnect(
     if not _entry_is_loaded(hass, entry):
         return
 
-    store = _get_entry_store(hass, entry)
     connected = False
     error: Exception | None = None
     try:
