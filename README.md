@@ -201,7 +201,7 @@ make stop       # stop the container
 ### Running tests
 
 ```bash
-pip install pytest pytest-asyncio awsiotsdk
+pip install pytest pytest-asyncio pytest-timeout awsiotsdk
 python3 -m pytest tests/ -v
 ```
 

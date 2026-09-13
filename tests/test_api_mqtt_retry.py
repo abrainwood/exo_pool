@@ -35,7 +35,6 @@ def fake_client_session(monkeypatch):
 
 
 async def _cancel_retry_task(hass, entry) -> None:
-    """Cancel and await any pending mqtt_retry_task so teardown sees no lingering task."""
     store = api._get_entry_store(hass, entry)
     task = store.pop("mqtt_retry_task", None)
     if isinstance(task, asyncio.Task):
@@ -308,6 +307,7 @@ async def test_a_fully_failed_subscribe_does_not_reset_the_backoff(
             loop=loop, endpoint=endpoint, region=region, serial=serial
         )
         client._build_connection = MagicMock(return_value=mock_connection)
+        client.set_reconnect_failed_callback = MagicMock()
         return client
 
     monkeypatch.setattr(mqtt_client_mod, "ExoMqttClient", _build_real_client)
@@ -315,9 +315,6 @@ async def test_a_fully_failed_subscribe_does_not_reset_the_backoff(
     try:
         await api._async_refresh_and_reconnect(hass, entry)
 
-        # A fully-failed subscribe (real mqtt_client.connect(), driven all
-        # the way through) must not look like a successful connect - the
-        # backoff must keep climbing, not reset to base.
         assert store["mqtt_retry_delay"] > 120.0
         assert store["mqtt_retry_attempts"] == 3
     finally:
@@ -410,6 +407,34 @@ async def test_connect_mqtt_wires_the_watchdog_callback_to_force_a_reconnect(
     reconnect.assert_called_once_with(hass, entry, force_credential_refresh=True)
 
 
+async def test_connect_mqtt_wires_the_reconnect_failed_callback_to_force_a_reconnect(
+    hass, entry, monkeypatch
+):
+    store = api._get_entry_store(hass, entry)
+    store["aws_credentials"] = {"Expiration": ""}
+    store["coordinator"] = MagicMock()
+
+    fake_mqtt_client = MagicMock()
+    fake_mqtt_client.connect.return_value = None
+    fake_client_cls = MagicMock(return_value=fake_mqtt_client)
+    monkeypatch.setattr(
+        sys.modules["custom_components.exo_pool.mqtt_client"],
+        "ExoMqttClient",
+        fake_client_cls,
+    )
+    trigger = MagicMock()
+    monkeypatch.setattr(api, "_trigger_mqtt_reconnect", trigger)
+
+    api._connect_mqtt(hass, entry)
+
+    fake_mqtt_client.set_reconnect_failed_callback.assert_called_once()
+    reconnect_failed = fake_mqtt_client.set_reconnect_failed_callback.call_args.args[0]
+
+    reconnect_failed()
+
+    trigger.assert_called_once_with(hass, entry, name="exo_pool_reconnect_refresh")
+
+
 async def test_connect_mqtt_wires_the_state_changed_callback_to_coordinator_listeners(
     hass, entry, monkeypatch
 ):
@@ -434,6 +459,15 @@ async def test_connect_mqtt_wires_the_state_changed_callback_to_coordinator_list
     state_changed(False)
 
     coordinator.async_update_listeners.assert_called_once()
+
+
+async def test_reconnect_after_unload_does_not_recreate_the_entry_store(hass, entry):
+    api._get_entry_store(hass, entry)
+    del hass.data[api.DOMAIN][entry.entry_id]
+
+    api._wake_held_write_on_reconnect(hass, entry, True)
+
+    assert entry.entry_id not in hass.data[api.DOMAIN]
 
 
 async def test_cleanup_entry_cancels_the_pending_mqtt_retry_task(hass, entry):

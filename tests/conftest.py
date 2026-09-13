@@ -1,6 +1,7 @@
 """Shared fixtures for exo_pool tests."""
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import pathlib
@@ -8,6 +9,8 @@ import sys
 import types
 
 import pytest
+
+_UNPATCHED_ASYNCIO_SLEEP = asyncio.sleep
 
 # Stub out the homeassistant package so mqtt_client.py can be imported
 # without a full HA installation. mqtt_client.py itself has no HA deps,
@@ -239,3 +242,25 @@ def fake_clock(monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr(api.time, "monotonic", lambda: clock[0])
     return clock
+
+
+@pytest.fixture
+def post_write_cooldown_seconds():
+    api = load_exo_pool_module("api")
+    return api.POST_WRITE_COOLDOWN_SECONDS + api.DELAY_REFRESH_EXTRA_DELAY_SECONDS
+
+
+@pytest.fixture
+def build_full_cooldown_fake_sleep(fake_clock, post_write_cooldown_seconds):
+    def _build(wake, elapsed=3):
+        async def fake_sleep(seconds):
+            if seconds != pytest.approx(post_write_cooldown_seconds):
+                await _UNPATCHED_ASYNCIO_SLEEP(0)
+                return
+            fake_clock[0] += elapsed
+            wake()
+            await asyncio.Future()
+
+        return fake_sleep
+
+    return _build

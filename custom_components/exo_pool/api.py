@@ -134,6 +134,12 @@ class Transport(StrEnum):
     MQTT = "mqtt"
     REST = "rest"
 
+
+class CooldownWait(StrEnum):
+    RECONNECTED = "reconnected"
+    ELAPSED = "elapsed"
+
+
 # AWS IoT MQTT
 IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
 IOT_REGION = "us-east-1"
@@ -183,13 +189,62 @@ def _set_cooldown(
 ) -> None:
     store = _get_entry_store(hass, entry)
     cooldown_until = time.monotonic() + seconds
-    store["cooldown_until"] = max(_get_cooldown_until(store), cooldown_until)
+    existing_until = _get_cooldown_until(store)
+    store["cooldown_until"] = max(existing_until, cooldown_until)
+    if cooldown_until >= existing_until:
+        store["cooldown_reason"] = reason
     _LOGGER.debug(
         "Cooldown set for %s: %.1fs (%s)",
         entry.entry_id,
         seconds,
         reason,
     )
+
+
+def _get_reconnect_event(store: dict) -> asyncio.Event:
+    event = store.get("mqtt_reconnect_event")
+    if event is None:
+        event = asyncio.Event()
+        store["mqtt_reconnect_event"] = event
+    return event
+
+
+def _wake_held_write_on_reconnect(
+    hass: HomeAssistant, entry: ConfigEntry, connected: bool
+) -> None:
+    if not connected:
+        return
+    store = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if store is None:
+        return
+    event = store.get("mqtt_reconnect_event")
+    if event is not None:
+        event.set()
+
+
+async def _wait_out_cooldown(
+    hass: HomeAssistant, entry: ConfigEntry, cooldown: float
+) -> CooldownWait:
+    store = _get_entry_store(hass, entry)
+    event = _get_reconnect_event(store)
+    event.clear()
+    sleep_task = asyncio.ensure_future(asyncio.sleep(cooldown))
+    event_task = asyncio.ensure_future(event.wait())
+    tasks = {sleep_task, event_task}
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        if sleep_task in done:
+            sleep_task.result()
+        if event.is_set() and _cooldown_remaining(hass, entry) > 0:
+            return CooldownWait.RECONNECTED
+        return CooldownWait.ELAPSED
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _schedule_debounced_refresh(
@@ -927,10 +982,8 @@ def _try_mqtt(
     try:
         mqtt_client.publish_desired(desired)
         return True
-    except Exception:
-        _LOGGER.warning(
-            "MQTT write failed for %s - falling back to REST", item.key, exc_info=True
-        )
+    except Exception as err:
+        _LOGGER.warning("MQTT publish failed for %s: %s", item.key, err)
         return False
 
 
@@ -949,19 +1002,27 @@ async def _execute_write(
     if _try_mqtt(hass, entry, item, desired):
         return Transport.MQTT
 
-    cooldown = _cooldown_remaining(hass, entry)
-    if cooldown > 0:
+    while (cooldown := _cooldown_remaining(hass, entry)) > 0:
         _record_pending_writes(hass, entry, [], desired, extra_seconds=cooldown)
+        store = _get_entry_store(hass, entry)
+        _LOGGER.info(
+            "Write %s held behind cooldown: %.1fs remaining (%s)",
+            item.key,
+            cooldown,
+            store.get("cooldown_reason", "unknown"),
+        )
         try:
-            await asyncio.sleep(cooldown)
+            outcome = await _wait_out_cooldown(hass, entry, cooldown)
         except (Exception, asyncio.CancelledError):
             _clear_pending_writes(hass, entry, [], desired)
             raise
         if _try_mqtt(hass, entry, item, desired):
+            if outcome is CooldownWait.RECONNECTED:
+                _LOGGER.info("Write %s woken early by MQTT reconnect", item.key)
             return Transport.MQTT
 
     _record_pending_writes(hass, entry, [], desired)
-    _LOGGER.debug("Writing %s via REST fallback", item.key)
+    _LOGGER.info("Writing %s via REST fallback", item.key)
     try:
         await _execute_write_rest(hass, entry, item, desired)
     except (Exception, asyncio.CancelledError):
@@ -1264,9 +1325,10 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     mqtt_client.set_shadow_callback(_on_shadow_update)
 
-    def _on_mqtt_state_changed(_connected: bool) -> None:
+    def _on_mqtt_state_changed(connected: bool) -> None:
         """Called on HA event loop when the transport connected state flips."""
         coordinator.async_update_listeners()
+        _wake_held_write_on_reconnect(hass, entry, connected)
 
     mqtt_client.set_state_changed_callback(_on_mqtt_state_changed)
 
