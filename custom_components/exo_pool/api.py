@@ -1373,8 +1373,9 @@ def _schedule_credential_refresh(hass: HomeAssistant, entry: ConfigEntry) -> Non
     if not credentials:
         return
 
-    # Cancel any existing refresh task
-    if task := store.get("credential_refresh_task"):
+    if (task := store.get("credential_refresh_task")) and not store.get(
+        "credential_refresh_running"
+    ):
         task.cancel()
 
     expiration_str = credentials.get("Expiration", "")
@@ -1395,7 +1396,11 @@ def _schedule_credential_refresh(hass: HomeAssistant, entry: ConfigEntry) -> Non
     async def _proactive_refresh() -> None:
         await asyncio.sleep(delay)
         _LOGGER.info("Refreshing AWS credentials for MQTT")
-        await _async_refresh_and_reconnect(hass, entry)
+        store["credential_refresh_running"] = True
+        try:
+            await _async_refresh_and_reconnect(hass, entry)
+        finally:
+            store["credential_refresh_running"] = False
 
     store["credential_refresh_task"] = hass.async_create_background_task(
         _proactive_refresh(),

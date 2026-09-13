@@ -102,7 +102,7 @@ class TestConnect:
 
         assert client.connected is False
 
-    def test_connect_with_all_subscribes_failing_calls_reconnect_failed_callback(
+    def test_connect_with_all_subscribes_failing_does_not_also_call_reconnect_failed_callback(
         self, build_client, mock_mqtt_connection, mock_event_loop
     ):
         reconnect_cb = MagicMock()
@@ -115,7 +115,8 @@ class TestConnect:
         with pytest.raises(ConnectionError):
             client.connect(SAMPLE_CREDENTIALS)
 
-        mock_event_loop.call_soon_threadsafe.assert_any_call(reconnect_cb)
+        for call in mock_event_loop.call_soon_threadsafe.call_args_list:
+            assert reconnect_cb not in call.args
 
     def test_connect_with_all_subscribes_failing_raises(
         self, build_client, mock_mqtt_connection

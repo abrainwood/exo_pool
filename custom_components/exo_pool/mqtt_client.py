@@ -127,8 +127,6 @@ class ExoMqttClient:
                 "All subscribes failed after connect - credentials may have expired"
             )
             self._set_connected(False)
-            if self._reconnect_failed_callback is not None:
-                self._loop.call_soon_threadsafe(self._reconnect_failed_callback)
             raise ConnectionError(
                 "All shadow subscribes failed after connect - credentials may have expired"
             )
