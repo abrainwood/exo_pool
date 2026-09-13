@@ -8,6 +8,11 @@ test:
 test-v:
 	python3 -m pytest tests/ -v
 
+lint-dup:
+	python3 -m pylint --disable=all --enable=duplicate-code \
+		--min-similarity-lines=10 \
+		tests custom_components
+
 # --- Dev environment ---
 
 dev:

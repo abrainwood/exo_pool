@@ -1195,6 +1195,14 @@ async def _async_refresh_and_reconnect(
         _reset_mqtt_retry_backoff(hass, entry)
         return
 
+    _record_mqtt_failure_and_retry(hass, entry, error)
+
+
+def _record_mqtt_failure_and_retry(
+    hass: HomeAssistant, entry: ConfigEntry, error: Exception | None = None
+) -> None:
+    """Count a failed connect/reconnect attempt, log it and arm the next retry."""
+    store = _get_entry_store(hass, entry)
     attempt = store.get("mqtt_retry_attempts", 0) + 1
     store["mqtt_retry_attempts"] = attempt
     next_delay = store.get("mqtt_retry_delay", MQTT_RETRY_BASE_DELAY)
@@ -1358,10 +1366,8 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "MQTT connection failed - continuing with REST polling",
             exc_info=True,
         )
-        # Schedule credential refresh on the HA event loop (not from this worker thread)
         hass.loop.call_soon_threadsafe(_schedule_credential_refresh, hass, entry)
         return False
-    # Schedule credential refresh on the HA event loop (not from this worker thread)
     hass.loop.call_soon_threadsafe(_schedule_credential_refresh, hass, entry)
     return True
 
@@ -1373,9 +1379,7 @@ def _schedule_credential_refresh(hass: HomeAssistant, entry: ConfigEntry) -> Non
     if not credentials:
         return
 
-    if (task := store.get("credential_refresh_task")) and not store.get(
-        "credential_refresh_running"
-    ):
+    if task := store.get("credential_refresh_task"):
         task.cancel()
 
     expiration_str = credentials.get("Expiration", "")
@@ -1396,11 +1400,9 @@ def _schedule_credential_refresh(hass: HomeAssistant, entry: ConfigEntry) -> Non
     async def _proactive_refresh() -> None:
         await asyncio.sleep(delay)
         _LOGGER.info("Refreshing AWS credentials for MQTT")
-        store["credential_refresh_running"] = True
-        try:
-            await _async_refresh_and_reconnect(hass, entry)
-        finally:
-            store["credential_refresh_running"] = False
+        if store.get("credential_refresh_task") is asyncio.current_task():
+            store["credential_refresh_task"] = None
+        _trigger_mqtt_reconnect(hass, entry, name="exo_pool_credential_refresh")
 
     store["credential_refresh_task"] = hass.async_create_background_task(
         _proactive_refresh(),
@@ -1471,8 +1473,11 @@ async def get_coordinator(hass: HomeAssistant, entry: ConfigEntry):
                 )
                 await coordinator.async_config_entry_first_refresh()
         else:
-            # MQTT failed - fall back to REST for initial data
-            _LOGGER.info("MQTT not available - loading initial data via REST")
+            _record_mqtt_failure_and_retry(hass, entry)
+            _LOGGER.warning(
+                "MQTT not available at setup - loading initial data via REST, "
+                "reconnect armed"
+            )
             await coordinator.async_config_entry_first_refresh()
     return store["coordinator"]
 

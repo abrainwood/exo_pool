@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -115,8 +115,7 @@ class TestConnect:
         with pytest.raises(ConnectionError):
             client.connect(SAMPLE_CREDENTIALS)
 
-        for call in mock_event_loop.call_soon_threadsafe.call_args_list:
-            assert reconnect_cb not in call.args
+        assert call(reconnect_cb) not in mock_event_loop.call_soon_threadsafe.call_args_list
 
     def test_connect_with_all_subscribes_failing_raises(
         self, build_client, mock_mqtt_connection
