@@ -123,7 +123,7 @@ class ExoMqttClient:
             self._request_shadow()
             self._start_heartbeat()
         else:
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "All subscribes failed after connect - credentials may have expired"
             )
             self._set_connected(False)
@@ -198,7 +198,7 @@ class ExoMqttClient:
                 _LOGGER.debug("Subscribed to %s", topic)
                 success_count += 1
             except Exception:
-                _LOGGER.warning("Failed to subscribe to %s", topic, exc_info=True)
+                _LOGGER.debug("Failed to subscribe to %s", topic, exc_info=True)
             time.sleep(_SUBSCRIBE_DELAY)
         return success_count > 0
 

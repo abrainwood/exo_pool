@@ -130,6 +130,47 @@ def entry(hass):
     return config_entry
 
 
+SECRET_ENTRY_DATA = {
+    "serial_number": "JT00000000",
+    "email": "pool.owner@example.com",
+    "password": "hunter2",
+    "auth_token": "auth-tok-abc123",
+    "id_token": "id-tok-abc123",
+    "refresh_token": "refresh-tok-abc123",
+    "user_id": 42,
+}
+
+
+@pytest.fixture
+def secret_entry(hass):
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    api = load_exo_pool_module("api")
+    config_entry = MockConfigEntry(domain=api.DOMAIN, data=SECRET_ENTRY_DATA, options={})
+    config_entry.add_to_hass(hass)
+    return config_entry
+
+
+@pytest.fixture
+def wired_fake_mqtt_client(hass, entry, monkeypatch):
+    """Wire ExoMqttClient to a MagicMock and seed the store so _connect_mqtt succeeds."""
+    from unittest.mock import MagicMock
+
+    api = load_exo_pool_module("api")
+    store = api._get_entry_store(hass, entry)
+    store["aws_credentials"] = {"Expiration": ""}
+    coordinator = MagicMock()
+    store["coordinator"] = coordinator
+    fake_mqtt_client = MagicMock()
+    fake_mqtt_client.connect.return_value = None
+    monkeypatch.setattr(
+        sys.modules["custom_components.exo_pool.mqtt_client"],
+        "ExoMqttClient",
+        MagicMock(return_value=fake_mqtt_client),
+    )
+    return fake_mqtt_client, coordinator
+
+
 @pytest.fixture(autouse=True)
 def no_network_client_session(monkeypatch):
     from unittest.mock import MagicMock
