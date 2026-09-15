@@ -27,7 +27,7 @@ jobs:
         run: pip install --require-hashes --no-deps -r requirements-test-sdist.lock
 
       - name: Install test dependencies
-        run: pip install --require-hashes --only-binary :all: -r requirements-test.lock
+        run: "pip install --require-hashes --only-binary :all: -r requirements-test.lock"
 
       - name: Run pytest
         run: python -m pytest tests/ -n 4
