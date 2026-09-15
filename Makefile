@@ -1,9 +1,14 @@
-.PHONY: test test-v test-install dev dev-stop dev-logs dev-restart
+.PHONY: test test-v test-install test-lock-regen dev dev-stop dev-logs dev-restart
 
 # --- Tests ---
 
 test-install:
-	pip install -r requirements-test.txt
+	pip install --require-hashes --no-deps -r requirements-test-sdist.lock
+	pip install --require-hashes --only-binary :all: -r requirements-test.lock
+
+test-lock-regen:
+	pip install -q uv
+	python3 scripts/regen_test_lock.py
 
 test:
 	python3 -m pytest tests/ -q

@@ -1,0 +1,16 @@
+#
+# packages below publish no wheel (sdist only); hash-pinned, no deps.
+# Regenerate both lock files with: make test-lock-regen
+#
+fnvhash==0.1.0 \
+    --hash=sha256:3e82d505054f9f3987b2b5b649f7e7b6f48349f6af8a1b8e4d66779699c85a8e
+    # via fnv-hash-fast
+mock-open==1.4.0 \
+    --hash=sha256:c3ecb6b8c32a5899a4f5bf4495083b598b520c698bba00e1ce2ace6e9c239100
+    # via pytest-homeassistant-custom-component
+paho-mqtt==1.6.1 \
+    --hash=sha256:2a8291c81623aec00372b5a85558a372c747cbca8e9934dfe218638b8eefc26f
+    # via pytest-homeassistant-custom-component
+pyric==0.1.6.3 \
+    --hash=sha256:b539b01cafebd2406c00097f94525ea0f8ecd1dd92f7731f43eac0ef16c2ccc9
+    # via bluetooth-auto-recovery

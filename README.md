@@ -201,9 +201,15 @@ make stop       # stop the container
 ### Running tests
 
 ```bash
-pip install -r requirements-test.txt
+make test-install
 python3 -m pytest tests/ -v
 ```
+
+`requirements-test.txt` is the human-edited top-level list. `requirements-test.lock` and
+`requirements-test-sdist.lock` are the fully pinned, hash-checked locks that CI, the
+Makefile and this install step all use (the second file covers the handful of test
+dependencies that publish no wheel at all). Regenerate both after changing
+`requirements-test.txt` with `make test-lock-regen`.
 
 ### Verifying the MQTT outage-reconnect fix
 
