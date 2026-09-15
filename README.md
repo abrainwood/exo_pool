@@ -201,11 +201,13 @@ make stop       # stop the container
 ### Running tests
 
 ```bash
-pip install pytest pytest-asyncio pytest-timeout awsiotsdk
+make test-install
 python3 -m pytest tests/ -v
 ```
 
-Tests are isolated from Home Assistant - no HA installation required to run them.
+`requirements-test.txt` is the human-edited top-level list. `requirements-test.lock` is
+the fully pinned, hash-checked lock that CI, the Makefile and this install step all use.
+Regenerate it after changing `requirements-test.txt` with `make test-lock-regen`.
 
 ### Verifying the MQTT outage-reconnect fix
 

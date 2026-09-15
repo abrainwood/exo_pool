@@ -1,6 +1,23 @@
-.PHONY: test dev dev-stop dev-logs dev-restart
+SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
+
+.PHONY: test test-v test-install test-lock-regen dev stop logs restart
 
 # --- Tests ---
+
+SDIST_ONLY := fnvhash,mock-open,paho-mqtt,pyric
+
+test-install:
+	awk '/^setuptools==/{f=1} f && $$0 !~ /^setuptools==/ && /^[A-Za-z0-9_.-]+==/{exit} f{print} \
+		END{if (!f) { print "setuptools not found in requirements-test.lock" > "/dev/stderr"; exit 1 }}' \
+		requirements-test.lock | pip install --require-hashes -r /dev/stdin
+	pip install --require-hashes --no-build-isolation --only-binary :all: --no-binary $(SDIST_ONLY) -r requirements-test.lock
+
+test-lock-regen:
+	pip install -q uv==0.5.8
+	uv pip compile --universal --python-version 3.12 --generate-hashes \
+		--custom-compile-command "make test-lock-regen" \
+		requirements-test.txt -o requirements-test.lock
 
 test:
 	python3 -m pytest tests/ -q
