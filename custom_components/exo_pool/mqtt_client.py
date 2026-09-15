@@ -123,12 +123,10 @@ class ExoMqttClient:
             self._request_shadow()
             self._start_heartbeat()
         else:
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "All subscribes failed after connect - credentials may have expired"
             )
             self._set_connected(False)
-            if self._reconnect_failed_callback is not None:
-                self._loop.call_soon_threadsafe(self._reconnect_failed_callback)
             raise ConnectionError(
                 "All shadow subscribes failed after connect - credentials may have expired"
             )
@@ -188,6 +186,7 @@ class ExoMqttClient:
         Returns True if at least one topic was subscribed successfully.
         """
         success_count = 0
+        failed_topics = []
         for topic_template in _SUBSCRIBE_TOPICS:
             topic = topic_template.format(serial=self._serial)
             try:
@@ -200,8 +199,16 @@ class ExoMqttClient:
                 _LOGGER.debug("Subscribed to %s", topic)
                 success_count += 1
             except Exception:
-                _LOGGER.warning("Failed to subscribe to %s", topic, exc_info=True)
+                _LOGGER.debug("Failed to subscribe to %s", topic, exc_info=True)
+                failed_topics.append(topic)
             time.sleep(_SUBSCRIBE_DELAY)
+        if failed_topics and success_count:
+            _LOGGER.warning(
+                "Subscribed %d/%d shadow topics; failed: %s",
+                success_count,
+                len(_SUBSCRIBE_TOPICS),
+                ", ".join(failed_topics),
+            )
         return success_count > 0
 
     def _request_shadow(self) -> None:

@@ -201,8 +201,9 @@ make stop       # stop the container
 ### Running tests
 
 ```bash
-pip install pytest pytest-asyncio pytest-timeout awsiotsdk
+pip install pytest pytest-asyncio pytest-timeout awsiotsdk pylint
 python3 -m pytest tests/ -v
+make lint-dup   # pylint duplicate-code check (across files only, not within one file)
 ```
 
 Tests are isolated from Home Assistant - no HA installation required to run them.
