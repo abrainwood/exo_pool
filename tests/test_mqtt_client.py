@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from custom_components.exo_pool.mqtt_client import _diff_desired
+from custom_components.exo_pool.mqtt_client import _SUBSCRIBE_TOPICS, _diff_desired
 from tests.conftest import (
     IOT_ENDPOINT,
     IOT_REGION,
@@ -151,7 +151,7 @@ class TestConnect:
         assert client.connected is True
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1
-        assert "3/4" in warnings[0].getMessage()
+        assert f"{len(_SUBSCRIBE_TOPICS) - 1}/{len(_SUBSCRIBE_TOPICS)}" in warnings[0].getMessage()
         assert "shadow/update/delta" in warnings[0].getMessage()
 
 
@@ -614,7 +614,7 @@ class TestReconnection:
         assert client.connected is True
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1
-        assert "3/4" in warnings[0].getMessage()
+        assert f"{len(_SUBSCRIBE_TOPICS) - 1}/{len(_SUBSCRIBE_TOPICS)}" in warnings[0].getMessage()
 
     def test_on_connection_resumed_calls_reconnect_failed_on_subscribe_error(
         self, build_client, mock_mqtt_connection, mock_event_loop

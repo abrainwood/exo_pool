@@ -84,7 +84,6 @@ def _fresh_aws_credentials(*, minutes: int = 60) -> dict:
 
 @pytest.fixture
 def stubbed_coordinator_setup(monkeypatch):
-    """Stub DataUpdateCoordinator + _refresh_authentication for get_coordinator tests."""
     from unittest.mock import AsyncMock, MagicMock
 
     api = load_exo_pool_module("api")
@@ -180,7 +179,6 @@ def secret_entry(hass):
 
 @pytest.fixture
 def wired_fake_mqtt_client(hass, entry, monkeypatch):
-    """Wire ExoMqttClient to a MagicMock and seed the store so _connect_mqtt succeeds."""
     from unittest.mock import MagicMock
 
     api = load_exo_pool_module("api")
