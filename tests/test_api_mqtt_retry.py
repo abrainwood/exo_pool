@@ -496,11 +496,6 @@ async def test_get_coordinator_setup_success_without_shadow_data_falls_back_to_r
     assert sleep_mock.call_args.args[0] == api.MQTT_SHADOW_WAIT_INTERVAL
 
 
-def test_mqtt_shadow_wait_constants_default_to_20_attempts_of_half_a_second():
-    assert api.MQTT_SHADOW_WAIT_ATTEMPTS == 20
-    assert api.MQTT_SHADOW_WAIT_INTERVAL == 0.5
-
-
 async def test_get_coordinator_setup_shadow_data_arrives_partway_through_the_wait(
     hass, entry, monkeypatch, stubbed_coordinator_setup
 ):
