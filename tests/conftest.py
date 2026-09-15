@@ -69,6 +69,33 @@ def _fast_subscribe(monkeypatch):
     monkeypatch.setattr(load_exo_pool_module("mqtt_client"), "_SUBSCRIBE_DELAY", 0)
 
 
+def _fresh_aws_credentials(*, minutes: int = 60) -> dict:
+    import datetime as _dt
+
+    return {
+        "AccessKeyId": "x",
+        "SecretKey": "y",
+        "SessionToken": "z",
+        "Expiration": (
+            _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=minutes)
+        ).isoformat(),
+    }
+
+
+@pytest.fixture
+def stubbed_coordinator_setup(monkeypatch):
+    """Stub DataUpdateCoordinator + _refresh_authentication for get_coordinator tests."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    api = load_exo_pool_module("api")
+    coord = MagicMock()
+    coord.data = None
+    coord.async_config_entry_first_refresh = AsyncMock()
+    monkeypatch.setattr(api, "DataUpdateCoordinator", MagicMock(return_value=coord))
+    monkeypatch.setattr(api, "_refresh_authentication", AsyncMock(return_value=None))
+    return coord
+
+
 @pytest.fixture
 def mock_mqtt_connection():
     """Create a mock MQTT connection that behaves like awscrt mqtt."""

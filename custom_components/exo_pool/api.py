@@ -10,7 +10,6 @@ from homeassistant.helpers import aiohttp_client
 from datetime import datetime, timedelta
 import aiohttp
 import async_timeout
-import contextlib
 import logging
 import json
 import time
@@ -149,7 +148,6 @@ REST_FALLBACK_INTERVAL = 3600  # 1 hour REST poll - last resort when MQTT is dea
 MQTT_RETRY_BASE_DELAY = 30.0
 MQTT_RETRY_MAX_DELAY = 900.0
 MQTT_RETRY_JITTER_FRACTION = 0.2
-MQTT_CREDENTIAL_REFRESH_RETRY_DELAY = 1.0  # re-check a deferred handoff after this long
 
 
 async def _async_rate_limit(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -1200,28 +1198,25 @@ def _record_mqtt_failure_and_retry(
     hass: HomeAssistant,
     entry: ConfigEntry,
     error: Exception | str | None = None,
-    *,
-    initial_setup: bool = False,
 ) -> None:
     store = _get_entry_store(hass, entry)
     attempt = store.get("mqtt_retry_attempts", 0) + 1
-    store["mqtt_retry_attempts"] = attempt
     next_delay = store.get("mqtt_retry_delay", MQTT_RETRY_BASE_DELAY)
     detail = f": {error}" if error is not None else ""
-    if initial_setup:
-        _LOGGER.warning(
-            "MQTT not available at setup%s - retrying in ~%.0fs",
-            detail,
-            next_delay,
-        )
-    else:
-        _LOGGER.warning(
-            "MQTT reconnect attempt %d to %s failed%s - retrying in ~%.0fs",
-            attempt,
-            IOT_ENDPOINT,
-            detail,
-            next_delay,
-        )
+    _LOGGER.warning(
+        "MQTT reconnect attempt %d to %s failed%s - retrying in ~%.0fs",
+        attempt,
+        IOT_ENDPOINT,
+        detail,
+        next_delay,
+    )
+    _arm_mqtt_retry(hass, entry)
+
+
+def _arm_mqtt_retry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Count the attempt and schedule the next backoff retry, without logging."""
+    store = _get_entry_store(hass, entry)
+    store["mqtt_retry_attempts"] = store.get("mqtt_retry_attempts", 0) + 1
     _schedule_mqtt_retry(hass, entry)
 
 
@@ -1283,9 +1278,7 @@ def _trigger_mqtt_reconnect(hass: HomeAssistant, entry: ConfigEntry, *, name: st
             return False
         _LOGGER.info("Preempting a sleeping MQTT retry backoff for %s", name)
         task.cancel()
-    # eager_start=False - an eager run could finish and re-arm its own
-    # retry before this assignment executes, overwriting the slot with the
-    # now-finished handoff task and orphaning the retry it just armed.
+        store["mqtt_retry_sleeping"] = False
     store["mqtt_retry_task"] = hass.async_create_background_task(
         _async_refresh_and_reconnect(hass, entry, force_credential_refresh=True),
         name=name,
@@ -1318,9 +1311,9 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         future = asyncio.run_coroutine_threadsafe(_fetch_credentials(), hass.loop)
         try:
             future.result(timeout=30)
-        except Exception:
+        except Exception as err:
             _LOGGER.debug("Failed to obtain AWS credentials", exc_info=True)
-            store["mqtt_last_connect_error"] = "no AWS credentials"
+            store["mqtt_last_connect_error"] = f"no AWS credentials: {err}"
             return False
         credentials = store.get("aws_credentials")
         if not credentials:
@@ -1391,6 +1384,23 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
+async def _async_refresh_credentials_after(
+    hass: HomeAssistant, entry: ConfigEntry, delay: float
+) -> None:
+    """Sleep until credentials near expiry, then hand off to a reconnect."""
+    await asyncio.sleep(delay)
+    while True:
+        _LOGGER.info("Refreshing AWS credentials for MQTT")
+        if _trigger_mqtt_reconnect(hass, entry, name="exo_pool_credential_refresh"):
+            return
+        if not _entry_is_loaded(hass, entry):
+            return
+        store = _get_entry_store(hass, entry)
+        in_flight = store.get("mqtt_retry_task")
+        if in_flight is not None and not in_flight.done():
+            await asyncio.wait({in_flight})
+
+
 def _schedule_credential_refresh(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Schedule MQTT credential refresh before they expire."""
     store = _get_entry_store(hass, entry)
@@ -1416,26 +1426,8 @@ def _schedule_credential_refresh(hass: HomeAssistant, entry: ConfigEntry) -> Non
     delay = max(0, expires_at - time.time() - MQTT_CREDENTIAL_REFRESH_BUFFER)
     _LOGGER.debug("Scheduling MQTT credential refresh in %.0fs", delay)
 
-    async def _proactive_refresh() -> None:
-        await asyncio.sleep(delay)
-        while True:
-            _LOGGER.info("Refreshing AWS credentials for MQTT")
-            if _trigger_mqtt_reconnect(hass, entry, name="exo_pool_credential_refresh"):
-                return
-            if not _entry_is_loaded(hass, entry):
-                return
-            # A retry attempt was already in flight - the handoff deferred
-            # to it. Re-arm rather than vanish: without this, credentials
-            # can cross the expiry buffer with nothing left to refresh them.
-            in_flight = store.get("mqtt_retry_task")
-            if in_flight is not None and not in_flight.done():
-                with contextlib.suppress(asyncio.CancelledError):
-                    await in_flight
-            else:
-                await asyncio.sleep(MQTT_CREDENTIAL_REFRESH_RETRY_DELAY)
-
     store["credential_refresh_task"] = hass.async_create_background_task(
-        _proactive_refresh(),
+        _async_refresh_credentials_after(hass, entry, delay),
         name="exo_pool_credential_refresh",
     )
 
@@ -1504,7 +1496,13 @@ async def get_coordinator(hass: HomeAssistant, entry: ConfigEntry):
                 await coordinator.async_config_entry_first_refresh()
         else:
             reason = store.pop("mqtt_last_connect_error", None)
-            _record_mqtt_failure_and_retry(hass, entry, reason, initial_setup=True)
+            detail = f": {reason}" if reason is not None else ""
+            _LOGGER.warning(
+                "MQTT not available at setup%s - retrying in ~%.0fs",
+                detail,
+                store.get("mqtt_retry_delay", MQTT_RETRY_BASE_DELAY),
+            )
+            _arm_mqtt_retry(hass, entry)
             await coordinator.async_config_entry_first_refresh()
     return store["coordinator"]
 

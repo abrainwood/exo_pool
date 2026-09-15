@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from tests.conftest import load_exo_pool_module
+from tests.conftest import _fresh_aws_credentials, load_exo_pool_module
 
 api = load_exo_pool_module("api")
 
@@ -300,6 +300,24 @@ async def test_reconnect_refreshes_credentials_when_they_are_expired(
     refresh.assert_called_once()
 
 
+async def test_reconnect_failure_warning_carries_the_reason(
+    hass, entry, monkeypatch, caplog
+):
+    monkeypatch.setattr(
+        api, "_refresh_authentication", AsyncMock(side_effect=OSError("DNS timeout"))
+    )
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            await api._async_refresh_and_reconnect(hass, entry)
+
+        warnings = _exo_warnings(caplog)
+        assert len(warnings) == 1
+        assert "DNS timeout" in warnings[0].getMessage()
+    finally:
+        await _cancel_retry_task(hass, entry)
+
+
 async def test_a_fully_failed_subscribe_does_not_reset_the_backoff(
     hass, entry, monkeypatch, real_mqtt_client_with_rejected_subscribes
 ):
@@ -324,21 +342,26 @@ async def test_a_fully_failed_subscribe_does_not_reset_the_backoff(
         await _cancel_retry_task(hass, entry)
 
 
+async def test_connect_mqtt_credential_refresh_failure_includes_the_error_in_the_reason(
+    hass, entry, monkeypatch
+):
+    monkeypatch.setattr(
+        api, "_refresh_authentication", AsyncMock(side_effect=OSError("DNS timeout"))
+    )
+
+    result = await hass.async_add_executor_job(api._connect_mqtt, hass, entry)
+
+    assert result is False
+    store = api._get_entry_store(hass, entry)
+    assert store["mqtt_last_connect_error"] == "no AWS credentials: DNS timeout"
+
+
 async def test_get_coordinator_setup_subscribe_failure_arms_exactly_one_retry(
-    hass, entry, monkeypatch, real_mqtt_client_with_rejected_subscribes
+    hass, entry, real_mqtt_client_with_rejected_subscribes, stubbed_coordinator_setup
 ):
     store = api._get_entry_store(hass, entry)
-    store["aws_credentials"] = {
-        "AccessKeyId": "x",
-        "SecretKey": "y",
-        "SessionToken": "z",
-        "Expiration": (datetime.now(timezone.utc) + timedelta(minutes=60)).isoformat(),
-    }
-    monkeypatch.setattr(api, "_refresh_authentication", AsyncMock(return_value=None))
-    coord = MagicMock()
-    coord.data = None
-    coord.async_config_entry_first_refresh = AsyncMock()
-    monkeypatch.setattr(api, "DataUpdateCoordinator", MagicMock(return_value=coord))
+    store["aws_credentials"] = _fresh_aws_credentials()
+    coord = stubbed_coordinator_setup
 
     try:
         await api.get_coordinator(hass, entry)
@@ -356,12 +379,7 @@ async def test_credential_refresh_reconnect_arms_exactly_one_retry_on_subscribe_
     hass, entry, monkeypatch, real_mqtt_client_with_rejected_subscribes
 ):
     store = api._get_entry_store(hass, entry)
-    store["aws_credentials"] = {
-        "AccessKeyId": "x",
-        "SecretKey": "y",
-        "SessionToken": "z",
-        "Expiration": (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
-    }
+    store["aws_credentials"] = _fresh_aws_credentials(minutes=2)
     store["coordinator"] = MagicMock()
     monkeypatch.setattr(api, "_refresh_authentication", AsyncMock(return_value=None))
 
@@ -397,20 +415,10 @@ def _exo_warnings(caplog):
 
 
 async def test_get_coordinator_setup_failure_logs_exactly_one_warning_no_traceback(
-    hass, entry, monkeypatch, real_mqtt_client_with_rejected_subscribes, caplog
+    hass, entry, real_mqtt_client_with_rejected_subscribes, stubbed_coordinator_setup, caplog
 ):
     store = api._get_entry_store(hass, entry)
-    store["aws_credentials"] = {
-        "AccessKeyId": "x",
-        "SecretKey": "y",
-        "SessionToken": "z",
-        "Expiration": (datetime.now(timezone.utc) + timedelta(minutes=60)).isoformat(),
-    }
-    monkeypatch.setattr(api, "_refresh_authentication", AsyncMock(return_value=None))
-    coord = MagicMock()
-    coord.data = None
-    coord.async_config_entry_first_refresh = AsyncMock()
-    monkeypatch.setattr(api, "DataUpdateCoordinator", MagicMock(return_value=coord))
+    store["aws_credentials"] = _fresh_aws_credentials()
 
     try:
         with caplog.at_level(logging.WARNING):
@@ -425,14 +433,8 @@ async def test_get_coordinator_setup_failure_logs_exactly_one_warning_no_traceba
 
 
 async def test_get_coordinator_setup_with_no_credentials_logs_the_reason_at_warning(
-    hass, entry, monkeypatch, caplog
+    hass, entry, stubbed_coordinator_setup, caplog
 ):
-    coord = MagicMock()
-    coord.data = None
-    coord.async_config_entry_first_refresh = AsyncMock()
-    monkeypatch.setattr(api, "DataUpdateCoordinator", MagicMock(return_value=coord))
-    monkeypatch.setattr(api, "_refresh_authentication", AsyncMock(return_value=None))
-
     try:
         with caplog.at_level(logging.WARNING):
             await api.get_coordinator(hass, entry)
@@ -464,52 +466,167 @@ async def test_credential_refresh_handoff_failure_leaves_the_armed_retry_in_the_
         await asyncio.sleep(0)
 
         slot = store.get("mqtt_retry_task")
-        # An eager handoff task can run far enough to arm its own retry and
-        # overwrite the slot with itself (now finished) before the trigger's
-        # own assignment lands, orphaning the retry it just armed outside
-        # the slot cleanup_entry and _schedule_mqtt_retry both key off.
         assert slot is not None
         assert not slot.done()
     finally:
         await _cancel_retry_task(hass, entry)
 
 
-async def test_credential_refresh_rearms_itself_when_deferred_to_an_in_flight_retry(
+async def _settle():
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+async def test_cancelling_the_refresh_while_it_waits_does_not_cancel_the_in_flight_attempt(
     hass, entry, monkeypatch
 ):
     store = api._get_entry_store(hass, entry)
     store["aws_credentials"] = {
         "Expiration": (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
     }
-    monkeypatch.setattr(api.asyncio, "sleep", AsyncMock())
+    auth_calls = []
+    gate = hass.loop.create_future()
+
+    async def _gated_refresh_authentication(hass_, entry_, session):
+        auth_calls.append(1)
+        await gate
+        return None
+
+    monkeypatch.setattr(api, "_refresh_authentication", _gated_refresh_authentication)
+    monkeypatch.setattr(api, "_connect_mqtt", MagicMock(return_value=True))
+
+    in_flight = hass.async_create_background_task(
+        api._async_refresh_and_reconnect(hass, entry), name="exo_pool_mqtt_retry"
+    )
+    store["mqtt_retry_task"] = in_flight
+    await _settle()
+    assert auth_calls == [1]
+
+    refresh_task = asyncio.ensure_future(
+        api._async_refresh_credentials_after(hass, entry, 0)
+    )
+    await _settle()
+
+    refresh_task.cancel()
+
+    gate.set_result(None)
+    await asyncio.wait_for(in_flight, 1)
+
+    assert auth_calls == [1]
+    assert in_flight.cancelled() is False
+    with pytest.raises(asyncio.CancelledError):
+        await refresh_task
+
+
+async def test_cancelling_the_refresh_leaves_the_attempt_running_with_no_new_handoff(
+    hass, entry, monkeypatch
+):
+    store = api._get_entry_store(hass, entry)
+    store["aws_credentials"] = {
+        "Expiration": (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
+    }
+    gate = hass.loop.create_future()
+
+    async def _gated_refresh_authentication(hass_, entry_, session):
+        await gate
+        return None
+
+    monkeypatch.setattr(api, "_refresh_authentication", _gated_refresh_authentication)
+    monkeypatch.setattr(api, "_connect_mqtt", MagicMock(return_value=True))
+
+    in_flight = hass.async_create_background_task(
+        api._async_refresh_and_reconnect(hass, entry), name="exo_pool_mqtt_retry"
+    )
+    store["mqtt_retry_task"] = in_flight
+    await _settle()
+
+    refresh_task = asyncio.ensure_future(
+        api._async_refresh_credentials_after(hass, entry, 0)
+    )
+    await _settle()
+
+    refresh_task.cancel()
+    await _settle()
+
+    assert in_flight.done() is False
+    assert store.get("mqtt_retry_task") is in_flight
+
+    gate.set_result(None)
+    await asyncio.wait_for(in_flight, 1)
+
+    with pytest.raises(asyncio.CancelledError):
+        await refresh_task
+    assert refresh_task.cancelled()
+
+
+async def test_credential_refresh_triggers_its_own_reconnect_after_an_in_flight_attempt_fails(
+    hass, entry, monkeypatch
+):
+    store = api._get_entry_store(hass, entry)
+    store["aws_credentials"] = {
+        "Expiration": (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
+    }
+    auth_calls = []
+    gate = hass.loop.create_future()
+
+    async def _refresh_authentication_stub(hass_, entry_, session):
+        auth_calls.append(1)
+        if len(auth_calls) == 1:
+            await gate
+            raise OSError("still down")
+        return None
+
+    monkeypatch.setattr(api, "_refresh_authentication", _refresh_authentication_stub)
+    monkeypatch.setattr(api, "_connect_mqtt", MagicMock(return_value=True))
+
+    in_flight = hass.async_create_background_task(
+        api._async_refresh_and_reconnect(hass, entry), name="exo_pool_mqtt_retry"
+    )
+    store["mqtt_retry_task"] = in_flight
+    await _settle()
+    assert auth_calls == [1]
+
+    refresh_task = asyncio.ensure_future(
+        api._async_refresh_credentials_after(hass, entry, 0)
+    )
+    await _settle()
+
+    gate.set_result(None)
+    await asyncio.wait_for(refresh_task, 1)
+    await _settle()
+
+    assert len(auth_calls) == 2
+    await _cancel_retry_task(hass, entry)
+
+
+async def test_entry_unloaded_while_refresh_waits_on_attempt_triggers_no_reconnect(
+    hass, entry, monkeypatch
+):
+    store = api._get_entry_store(hass, entry)
+    store["aws_credentials"] = {
+        "Expiration": (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
+    }
     calls = []
 
     def _trigger(hass_, entry_, *, name):
         calls.append(name)
-        # First call defers to an in-flight retry attempt (as
-        # _trigger_mqtt_reconnect does when one is already running); the
-        # second succeeds once that attempt has cleared.
-        return len(calls) > 1
+        return False
 
     monkeypatch.setattr(api, "_trigger_mqtt_reconnect", _trigger)
+    in_flight = hass.loop.create_future()
+    store["mqtt_retry_task"] = in_flight
 
-    api._schedule_credential_refresh(hass, entry)
-    task = store["credential_refresh_task"]
+    refresh_task = asyncio.ensure_future(
+        api._async_refresh_credentials_after(hass, entry, 0)
+    )
+    await _settle()
+    assert calls == ["exo_pool_credential_refresh"]
 
-    try:
-        await task
+    del hass.data[api.DOMAIN][entry.entry_id]
+    in_flight.set_result(True)
+    await asyncio.wait_for(refresh_task, 1)
 
-        # A proactive refresh deferred to an in-flight retry must not
-        # vanish - a simpler impl that returns on the first False leaves
-        # credentials to expire with nothing armed to refresh them.
-        assert calls == ["exo_pool_credential_refresh", "exo_pool_credential_refresh"]
-    finally:
-        await _cancel_retry_task(hass, entry)
-        rescheduled = store.get("credential_refresh_task")
-        if rescheduled is not None and not rescheduled.done():
-            rescheduled.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await rescheduled
+    assert calls == ["exo_pool_credential_refresh", "exo_pool_credential_refresh"]
 
 
 async def test_schedule_credential_refresh_does_not_cancel_the_task_currently_running_it(
@@ -574,7 +691,7 @@ async def test_scheduling_credential_refresh_twice_cancels_the_first_task(
 
     try:
         with contextlib.suppress(asyncio.CancelledError):
-            await first_task
+            await asyncio.wait_for(first_task, 1)
 
         assert first_task.cancelled()
         assert second_task is not first_task
@@ -656,6 +773,23 @@ async def test_trigger_mqtt_reconnect_preempts_a_sleeping_backoff_wait(
     api._trigger_mqtt_reconnect(hass, entry, name="exo_pool_watchdog_reconnect")
 
     sleeping_task.cancel.assert_called_once()
+    assert len(captured_reconnect_coros) == 1
+
+
+async def test_two_triggers_preempting_a_sleeping_backoff_in_the_same_tick_log_once(
+    hass, entry, monkeypatch, captured_reconnect_coros, caplog
+):
+    store = api._get_entry_store(hass, entry)
+    sleeping_task = MagicMock(done=MagicMock(return_value=False))
+    store["mqtt_retry_task"] = sleeping_task
+    store["mqtt_retry_sleeping"] = True
+
+    with caplog.at_level(logging.INFO):
+        api._trigger_mqtt_reconnect(hass, entry, name="watchdog")
+        api._trigger_mqtt_reconnect(hass, entry, name="reconnect_failed")
+
+    preempting = [r for r in caplog.records if "Preempting" in r.getMessage()]
+    assert len(preempting) == 1
     assert len(captured_reconnect_coros) == 1
 
 
@@ -784,10 +918,6 @@ async def test_connect_mqtt_failure_does_not_reschedule_credential_refresh(
 
     monkeypatch.setattr(hass.loop, "call_soon_threadsafe", _spy)
 
-    # A failure-path reschedule with the same, still-soon-expiring
-    # credentials races the backoff-retry it also arms: each preempts the
-    # other's sleep and re-arms again, a tight cascade that only ends
-    # non-deterministically at test teardown.
     ok = api._connect_mqtt(hass, entry)
 
     assert ok is False

@@ -186,6 +186,7 @@ class ExoMqttClient:
         Returns True if at least one topic was subscribed successfully.
         """
         success_count = 0
+        failed_topics = []
         for topic_template in _SUBSCRIBE_TOPICS:
             topic = topic_template.format(serial=self._serial)
             try:
@@ -199,7 +200,15 @@ class ExoMqttClient:
                 success_count += 1
             except Exception:
                 _LOGGER.debug("Failed to subscribe to %s", topic, exc_info=True)
+                failed_topics.append(topic)
             time.sleep(_SUBSCRIBE_DELAY)
+        if failed_topics and success_count:
+            _LOGGER.warning(
+                "Subscribed %d/%d shadow topics; failed: %s",
+                success_count,
+                len(_SUBSCRIBE_TOPICS),
+                ", ".join(failed_topics),
+            )
         return success_count > 0
 
     def _request_shadow(self) -> None:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -127,6 +128,31 @@ class TestConnect:
 
         with pytest.raises(ConnectionError):
             client.connect(SAMPLE_CREDENTIALS)
+
+    def test_connect_with_one_subscribe_failing_logs_a_partial_warning(
+        self, build_client, mock_mqtt_connection, caplog
+    ):
+        ok_future = MagicMock()
+        ok_future.result.return_value = None
+        failed_future = MagicMock()
+        failed_future.result.side_effect = Exception("Forbidden")
+
+        def _subscribe(*, topic, **_kwargs):
+            if topic.endswith("/shadow/update/delta"):
+                return (failed_future, 1)
+            return (ok_future, 1)
+
+        mock_mqtt_connection.subscribe.side_effect = _subscribe
+        client = build_client()
+
+        with caplog.at_level(logging.WARNING):
+            client.connect(SAMPLE_CREDENTIALS)
+
+        assert client.connected is True
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "3/4" in warnings[0].getMessage()
+        assert "shadow/update/delta" in warnings[0].getMessage()
 
 
 class TestDisconnect:
@@ -559,6 +585,36 @@ class TestReconnection:
             session_present=False,
         )
         assert client.connected is True
+
+    def test_on_connection_resumed_with_one_subscribe_failing_logs_a_partial_warning(
+        self, build_client, mock_mqtt_connection, caplog
+    ):
+        client = build_client()
+        client.connect(SAMPLE_CREDENTIALS)
+
+        ok_future = MagicMock()
+        ok_future.result.return_value = None
+        failed_future = MagicMock()
+        failed_future.result.side_effect = Exception("Forbidden")
+
+        def _subscribe(*, topic, **_kwargs):
+            if topic.endswith("/shadow/update/delta"):
+                return (failed_future, 1)
+            return (ok_future, 1)
+
+        mock_mqtt_connection.subscribe.side_effect = _subscribe
+
+        with caplog.at_level(logging.WARNING):
+            client._on_connection_resumed(
+                connection=mock_mqtt_connection,
+                return_code=0,
+                session_present=False,
+            )
+
+        assert client.connected is True
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "3/4" in warnings[0].getMessage()
 
     def test_on_connection_resumed_calls_reconnect_failed_on_subscribe_error(
         self, build_client, mock_mqtt_connection, mock_event_loop
