@@ -45,11 +45,22 @@ async def _cancel_retry_task(hass, entry) -> None:
             await task
 
 
-@pytest.fixture
-def real_mqtt_client_with_rejected_subscribes(monkeypatch):
+def _patch_real_mqtt_client_connection(monkeypatch, mock_connection):
     mqtt_client_mod = sys.modules["custom_components.exo_pool.mqtt_client"]
     real_exo_mqtt_client = mqtt_client_mod.ExoMqttClient
 
+    def _build_real_client(*, loop, endpoint, region, serial):
+        client = real_exo_mqtt_client(
+            loop=loop, endpoint=endpoint, region=region, serial=serial
+        )
+        client._build_connection = MagicMock(return_value=mock_connection)
+        return client
+
+    monkeypatch.setattr(mqtt_client_mod, "ExoMqttClient", _build_real_client)
+
+
+@pytest.fixture
+def real_mqtt_client_with_rejected_subscribes(monkeypatch):
     mock_connection = MagicMock()
     connect_future = MagicMock()
     connect_future.result.return_value = None
@@ -58,35 +69,18 @@ def real_mqtt_client_with_rejected_subscribes(monkeypatch):
     sub_future.result.side_effect = Exception("Forbidden")
     mock_connection.subscribe.return_value = (sub_future, 1)
 
-    def _build_real_client(*, loop, endpoint, region, serial):
-        client = real_exo_mqtt_client(
-            loop=loop, endpoint=endpoint, region=region, serial=serial
-        )
-        client._build_connection = MagicMock(return_value=mock_connection)
-        return client
-
-    monkeypatch.setattr(mqtt_client_mod, "ExoMqttClient", _build_real_client)
+    _patch_real_mqtt_client_connection(monkeypatch, mock_connection)
     return mock_connection
 
 
 @pytest.fixture
 def real_mqtt_client_with_connect_timeout(monkeypatch):
-    mqtt_client_mod = sys.modules["custom_components.exo_pool.mqtt_client"]
-    real_exo_mqtt_client = mqtt_client_mod.ExoMqttClient
-
     mock_connection = MagicMock()
     connect_future = MagicMock()
     connect_future.result.side_effect = TimeoutError()
     mock_connection.connect.return_value = connect_future
 
-    def _build_real_client(*, loop, endpoint, region, serial):
-        client = real_exo_mqtt_client(
-            loop=loop, endpoint=endpoint, region=region, serial=serial
-        )
-        client._build_connection = MagicMock(return_value=mock_connection)
-        return client
-
-    monkeypatch.setattr(mqtt_client_mod, "ExoMqttClient", _build_real_client)
+    _patch_real_mqtt_client_connection(monkeypatch, mock_connection)
     return mock_connection
 
 
@@ -357,6 +351,27 @@ async def test_reconnect_failure_with_a_bare_timeout_error_logs_the_type_name(
         await _cancel_retry_task(hass, entry)
 
 
+async def test_reconnect_failure_logs_the_attempt_number_and_delay_exactly(
+    hass, entry, monkeypatch, caplog
+):
+    monkeypatch.setattr(
+        api, "_refresh_authentication", AsyncMock(side_effect=OSError("DNS timeout"))
+    )
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            await api._async_refresh_and_reconnect(hass, entry)
+
+        warnings = _exo_warnings(caplog)
+        assert len(warnings) == 1
+        assert warnings[0].getMessage() == (
+            f"MQTT reconnect attempt 1 to {api.IOT_ENDPOINT} failed: DNS timeout "
+            f"- retrying in ~{api.MQTT_RETRY_BASE_DELAY:.0f}s"
+        )
+    finally:
+        await _cancel_retry_task(hass, entry)
+
+
 async def test_a_fully_failed_subscribe_does_not_reset_the_backoff(
     hass, entry, monkeypatch, real_mqtt_client_with_rejected_subscribes
 ):
@@ -461,7 +476,8 @@ async def test_get_coordinator_setup_success_without_shadow_data_falls_back_to_r
 ):
     store = api._get_entry_store(hass, entry)
     monkeypatch.setattr(api, "_connect_mqtt", MagicMock(return_value=True))
-    monkeypatch.setattr(api.asyncio, "sleep", AsyncMock())
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(api.asyncio, "sleep", sleep_mock)
     coord = stubbed_coordinator_setup
     coord.data = None
 
@@ -473,6 +489,31 @@ async def test_get_coordinator_setup_success_without_shadow_data_falls_back_to_r
     assert "falling back to REST" in warnings[0].getMessage()
     coord.async_config_entry_first_refresh.assert_awaited_once()
     assert store.get("mqtt_retry_task") is None
+    assert sleep_mock.call_count == api.MQTT_SHADOW_WAIT_ATTEMPTS
+    assert sleep_mock.call_args.args[0] == api.MQTT_SHADOW_WAIT_INTERVAL
+
+
+async def test_get_coordinator_setup_shadow_data_arrives_partway_through_the_wait(
+    hass, entry, monkeypatch, stubbed_coordinator_setup
+):
+    store = api._get_entry_store(hass, entry)
+    monkeypatch.setattr(api, "_connect_mqtt", MagicMock(return_value=True))
+    coord = stubbed_coordinator_setup
+    coord.data = None
+    sleep_calls = []
+
+    async def _sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) == 3:
+            coord.data = {"arrived": "late"}
+
+    monkeypatch.setattr(api.asyncio, "sleep", _sleep)
+
+    await api.get_coordinator(hass, entry)
+
+    coord.async_config_entry_first_refresh.assert_not_awaited()
+    assert store.get("mqtt_retry_task") is None
+    assert sleep_calls == [api.MQTT_SHADOW_WAIT_INTERVAL] * 3
 
 
 async def test_get_coordinator_setup_subscribe_failure_arms_exactly_one_retry(
@@ -591,7 +632,7 @@ async def test_credential_refresh_handoff_failure_leaves_the_armed_retry_in_the_
         await _cancel_retry_task(hass, entry)
 
 
-async def _settle(predicate=None, *, timeout=2):
+async def _settle(predicate=None):
     async def _poll():
         if predicate is None:
             for _ in range(50):
@@ -600,7 +641,7 @@ async def _settle(predicate=None, *, timeout=2):
             while not predicate():
                 await asyncio.sleep(0)
 
-    await asyncio.wait_for(_poll(), timeout)
+    await asyncio.wait_for(_poll(), 2)
 
 
 async def test_cancelling_the_refresh_while_it_waits_does_not_cancel_the_in_flight_attempt(
@@ -623,11 +664,12 @@ async def test_cancelling_the_refresh_while_it_waits_does_not_cancel_the_in_flig
     )
     store["mqtt_retry_task"] = in_flight
     await _settle(lambda: auth_calls == [1])
-    assert auth_calls == [1]
 
     refresh_task = asyncio.ensure_future(
         api._async_refresh_credentials_after(hass, entry, 0)
     )
+    assert store.get("mqtt_retry_task") is in_flight
+    assert not in_flight.done()
     await _settle()
 
     refresh_task.cancel()
@@ -646,7 +688,6 @@ async def test_cancelling_the_refresh_while_it_waits_does_not_cancel_the_in_flig
     assert refresh_task.cancelled()
 
 
-@pytest.mark.timeout(2)
 async def test_credential_refresh_triggers_its_own_reconnect_after_an_in_flight_attempt_fails(
     hass, entry, monkeypatch
 ):
@@ -670,11 +711,12 @@ async def test_credential_refresh_triggers_its_own_reconnect_after_an_in_flight_
     store["mqtt_retry_task"] = in_flight
     try:
         await _settle(lambda: auth_calls == [1])
-        assert auth_calls == [1]
 
         refresh_task = asyncio.ensure_future(
             api._async_refresh_credentials_after(hass, entry, 0)
         )
+        assert store.get("mqtt_retry_task") is in_flight
+        assert not in_flight.done()
         await _settle()
 
         gate.set_result(None)
@@ -701,6 +743,8 @@ async def test_entry_unloaded_while_refresh_waits_on_attempt_exits_without_recre
     refresh_task = asyncio.ensure_future(
         api._async_refresh_credentials_after(hass, entry, 0)
     )
+    assert store.get("mqtt_retry_task") is in_flight_task
+    assert not in_flight_task.done()
     await _settle()
 
     del hass.data[api.DOMAIN][entry.entry_id]
@@ -781,7 +825,7 @@ async def test_scheduling_credential_refresh_twice_cancels_the_first_task(
         live = [
             t
             for t in asyncio.all_tasks()
-            if t.get_name() == "exo_pool_credential_refresh" and not t.done()
+            if t.get_name() == "exo_pool_credential_refresh_timer" and not t.done()
         ]
         assert live == [second_task]
     finally:

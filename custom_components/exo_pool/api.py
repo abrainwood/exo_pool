@@ -148,6 +148,8 @@ REST_FALLBACK_INTERVAL = 3600  # 1 hour REST poll - last resort when MQTT is dea
 MQTT_RETRY_BASE_DELAY = 30.0
 MQTT_RETRY_MAX_DELAY = 900.0
 MQTT_RETRY_JITTER_FRACTION = 0.2
+MQTT_SHADOW_WAIT_ATTEMPTS = 20
+MQTT_SHADOW_WAIT_INTERVAL = 0.5
 
 
 async def _async_rate_limit(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -1177,14 +1179,14 @@ async def _async_refresh_and_reconnect(
         return
 
     connected = False
-    error: Exception | str | None = None
+    reason: str | None = None
     try:
         if force_credential_refresh or _aws_credentials_need_refresh(hass, entry):
             session = aiohttp_client.async_get_clientsession(hass)
             await _refresh_authentication(hass, entry, session)
         connected = await hass.async_add_executor_job(_connect_mqtt, hass, entry)
     except Exception as err:
-        error = err
+        reason = _format_error_reason(err)
 
     if not _entry_is_loaded(hass, entry):
         return
@@ -1193,24 +1195,19 @@ async def _async_refresh_and_reconnect(
         _reset_mqtt_retry_backoff(hass, entry)
         return
 
-    if error is None:
-        error = _get_entry_store(hass, entry).pop("mqtt_last_connect_error", None)
-    _record_mqtt_failure_and_retry(hass, entry, error)
+    if reason is None:
+        reason = _get_entry_store(hass, entry).pop("mqtt_last_connect_error", None)
+    _record_mqtt_failure_and_retry(hass, entry, reason)
 
 
 def _record_mqtt_failure_and_retry(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    error: Exception | str | None,
+    reason: str | None,
 ) -> None:
     store = _get_entry_store(hass, entry)
     next_delay = store.get("mqtt_retry_delay", MQTT_RETRY_BASE_DELAY)
-    if error is None:
-        detail = ""
-    elif isinstance(error, BaseException):
-        detail = f": {_format_error_reason(error)}"
-    else:
-        detail = f": {error}"
+    detail = f": {reason}" if reason else ""
     attempt = _arm_mqtt_retry(hass, entry)
     _LOGGER.warning(
         "MQTT reconnect attempt %d to %s failed%s - retrying in ~%.0fs",
@@ -1434,7 +1431,7 @@ def _schedule_credential_refresh(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
     store["credential_refresh_task"] = hass.async_create_background_task(
         _async_refresh_credentials_after(hass, entry, delay),
-        name="exo_pool_credential_refresh",
+        name="exo_pool_credential_refresh_timer",
     )
 
 
@@ -1469,10 +1466,10 @@ def get_mqtt_client(hass: HomeAssistant, entry: ConfigEntry):
 
 
 async def _wait_for_shadow_or_fall_back_to_rest(coordinator) -> None:
-    for _ in range(20):
+    for _ in range(MQTT_SHADOW_WAIT_ATTEMPTS):
         if coordinator.data:
             break
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(MQTT_SHADOW_WAIT_INTERVAL)
     if coordinator.data:
         _LOGGER.info("Initial data loaded via MQTT - skipping REST fetch")
     else:
