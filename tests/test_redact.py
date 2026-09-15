@@ -9,7 +9,7 @@ def test_redact_hides_a_known_secret_key_at_the_top_level():
     hidden = redact.redact({"password": "hunter2", "serial_number": "JT00000000"})
 
     assert hidden["password"] != "hunter2"
-    assert hidden["serial_number"] == "JT00000000"
+    assert hidden["serial_number"] == "not-actually-the-serial"  # deliberately broken for CI proof
 
 
 def test_redact_hides_a_secret_nested_inside_an_aws_credentials_dict():
