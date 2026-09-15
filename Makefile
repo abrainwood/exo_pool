@@ -1,14 +1,21 @@
-.PHONY: test test-v test-install test-lock-regen dev dev-stop dev-logs dev-restart
+.PHONY: test test-v test-install test-lock-regen dev stop logs restart
 
 # --- Tests ---
 
+SDIST_ONLY := fnvhash,mock-open,paho-mqtt,pyric
+
 test-install:
-	pip install --require-hashes --no-deps -r requirements-test-sdist.lock
-	pip install --require-hashes --only-binary :all: -r requirements-test.lock
+	awk '/^setuptools==/{f=1} f && $$0 !~ /^setuptools==/ && /^[A-Za-z0-9_.-]+==/{exit} f{print}' \
+		requirements-test.lock > /tmp/exo-pool-setuptools.lock
+	pip install --require-hashes -r /tmp/exo-pool-setuptools.lock
+	rm -f /tmp/exo-pool-setuptools.lock
+	pip install --require-hashes --no-build-isolation --only-binary :all: --no-binary $(SDIST_ONLY) -r requirements-test.lock
 
 test-lock-regen:
-	pip install -q uv
-	python3 scripts/regen_test_lock.py
+	pip install -q uv==0.5.8
+	uv pip compile --universal --python-version 3.12 --generate-hashes \
+		--custom-compile-command "make test-lock-regen" \
+		requirements-test.txt -o requirements-test.lock
 
 test:
 	python3 -m pytest tests/ -q

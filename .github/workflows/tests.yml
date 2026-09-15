@@ -11,23 +11,18 @@ permissions:
 jobs:
   pytest:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: |
-            requirements-test.lock
-            requirements-test-sdist.lock
-
-      - name: Install sdist-only test dependencies
-        # packages below publish no wheel (sdist only); hash-pinned, no deps
-        run: pip install --require-hashes --no-deps -r requirements-test-sdist.lock
+          cache-dependency-path: requirements-test.lock
 
       - name: Install test dependencies
-        run: "pip install --require-hashes --only-binary :all: -r requirements-test.lock"
+        run: make test-install
 
       - name: Run pytest
         run: python -m pytest tests/ -n 4
