@@ -867,7 +867,7 @@ def _get_configured_interval_seconds(entry: ConfigEntry) -> int:
     return max(REFRESH_MIN, min(REFRESH_MAX, seconds))
 
 
-def _format_error_reason(err) -> str:
+def _format_error_reason(err: BaseException) -> str:
     return str(err) or type(err).__name__
 
 
@@ -1177,7 +1177,7 @@ async def _async_refresh_and_reconnect(
         return
 
     connected = False
-    error: Exception | None = None
+    error: Exception | str | None = None
     try:
         if force_credential_refresh or _aws_credentials_need_refresh(hass, entry):
             session = aiohttp_client.async_get_clientsession(hass)
@@ -1201,11 +1201,16 @@ async def _async_refresh_and_reconnect(
 def _record_mqtt_failure_and_retry(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    error: Exception | str | None = None,
+    error: Exception | str | None,
 ) -> None:
     store = _get_entry_store(hass, entry)
     next_delay = store.get("mqtt_retry_delay", MQTT_RETRY_BASE_DELAY)
-    detail = f": {_format_error_reason(error)}" if error is not None else ""
+    if error is None:
+        detail = ""
+    elif isinstance(error, BaseException):
+        detail = f": {_format_error_reason(error)}"
+    else:
+        detail = f": {error}"
     attempt = _arm_mqtt_retry(hass, entry)
     _LOGGER.warning(
         "MQTT reconnect attempt %d to %s failed%s - retrying in ~%.0fs",
@@ -1217,7 +1222,6 @@ def _record_mqtt_failure_and_retry(
 
 
 def _arm_mqtt_retry(hass: HomeAssistant, entry: ConfigEntry) -> int:
-    """Count the attempt and schedule the next backoff retry, without logging."""
     store = _get_entry_store(hass, entry)
     attempt = store.get("mqtt_retry_attempts", 0) + 1
     store["mqtt_retry_attempts"] = attempt
@@ -1385,7 +1389,7 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.debug(
             "MQTT connection failed - continuing with REST polling", exc_info=True
         )
-        store["mqtt_last_connect_error"] = str(err)
+        store["mqtt_last_connect_error"] = _format_error_reason(err)
         return False
     hass.loop.call_soon_threadsafe(_schedule_credential_refresh, hass, entry)
     return True
@@ -1464,8 +1468,7 @@ def get_mqtt_client(hass: HomeAssistant, entry: ConfigEntry):
     return _get_entry_store(hass, entry).get("mqtt_client")
 
 
-async def _await_initial_mqtt_shadow(hass: HomeAssistant, entry: ConfigEntry, coordinator) -> None:
-    """Wait briefly for the get/accepted shadow, then fall back to REST if it never arrives."""
+async def _wait_for_shadow_or_fall_back_to_rest(coordinator) -> None:
     for _ in range(20):
         if coordinator.data:
             break
@@ -1479,11 +1482,12 @@ async def _await_initial_mqtt_shadow(hass: HomeAssistant, entry: ConfigEntry, co
         await coordinator.async_config_entry_first_refresh()
 
 
-async def _handle_mqtt_setup_failure(hass: HomeAssistant, entry: ConfigEntry, coordinator) -> None:
-    """Log the setup failure, arm a backoff retry, and fall back to REST."""
+async def _fall_back_to_rest_and_arm_mqtt_retry(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator
+) -> None:
     store = _get_entry_store(hass, entry)
     reason = store.pop("mqtt_last_connect_error", None)
-    detail = f": {_format_error_reason(reason)}" if reason is not None else ""
+    detail = f": {reason}" if reason else ""
     _LOGGER.warning(
         "MQTT not available at setup%s - retrying in ~%.0fs",
         detail,
@@ -1512,9 +1516,9 @@ async def get_coordinator(hass: HomeAssistant, entry: ConfigEntry):
             _connect_mqtt, hass, entry
         )
         if mqtt_connected:
-            await _await_initial_mqtt_shadow(hass, entry, coordinator)
+            await _wait_for_shadow_or_fall_back_to_rest(coordinator)
         else:
-            await _handle_mqtt_setup_failure(hass, entry, coordinator)
+            await _fall_back_to_rest_and_arm_mqtt_retry(hass, entry, coordinator)
     return store["coordinator"]
 
 
