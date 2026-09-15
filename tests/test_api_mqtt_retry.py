@@ -462,6 +462,8 @@ async def test_get_coordinator_setup_success_with_shadow_data_skips_rest_and_arm
 ):
     store = api._get_entry_store(hass, entry)
     monkeypatch.setattr(api, "_connect_mqtt", MagicMock(return_value=True))
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(api.asyncio, "sleep", sleep_mock)
     coord = stubbed_coordinator_setup
     coord.data = {"already": "there"}
 
@@ -469,6 +471,7 @@ async def test_get_coordinator_setup_success_with_shadow_data_skips_rest_and_arm
 
     coord.async_config_entry_first_refresh.assert_not_awaited()
     assert store.get("mqtt_retry_task") is None
+    sleep_mock.assert_not_awaited()
 
 
 async def test_get_coordinator_setup_success_without_shadow_data_falls_back_to_rest_and_arms_no_retry(
@@ -493,11 +496,18 @@ async def test_get_coordinator_setup_success_without_shadow_data_falls_back_to_r
     assert sleep_mock.call_args.args[0] == api.MQTT_SHADOW_WAIT_INTERVAL
 
 
+def test_mqtt_shadow_wait_constants_default_to_20_attempts_of_half_a_second():
+    assert api.MQTT_SHADOW_WAIT_ATTEMPTS == 20
+    assert api.MQTT_SHADOW_WAIT_INTERVAL == 0.5
+
+
 async def test_get_coordinator_setup_shadow_data_arrives_partway_through_the_wait(
     hass, entry, monkeypatch, stubbed_coordinator_setup
 ):
     store = api._get_entry_store(hass, entry)
     monkeypatch.setattr(api, "_connect_mqtt", MagicMock(return_value=True))
+    monkeypatch.setattr(api, "MQTT_SHADOW_WAIT_ATTEMPTS", 5)
+    monkeypatch.setattr(api, "MQTT_SHADOW_WAIT_INTERVAL", 0.123)
     coord = stubbed_coordinator_setup
     coord.data = None
     sleep_calls = []
@@ -513,7 +523,7 @@ async def test_get_coordinator_setup_shadow_data_arrives_partway_through_the_wai
 
     coord.async_config_entry_first_refresh.assert_not_awaited()
     assert store.get("mqtt_retry_task") is None
-    assert sleep_calls == [api.MQTT_SHADOW_WAIT_INTERVAL] * 3
+    assert sleep_calls == [0.123] * 3
 
 
 async def test_get_coordinator_setup_subscribe_failure_arms_exactly_one_retry(
