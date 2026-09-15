@@ -25,4 +25,5 @@ jobs:
         run: make test-install
 
       - name: Run pytest
+        timeout-minutes: 5
         run: python -m pytest tests/ -n 4
