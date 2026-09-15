@@ -201,11 +201,9 @@ make stop       # stop the container
 ### Running tests
 
 ```bash
-pip install pytest pytest-asyncio pytest-timeout awsiotsdk
+pip install -r requirements-test.txt
 python3 -m pytest tests/ -v
 ```
-
-Tests are isolated from Home Assistant - no HA installation required to run them.
 
 ### Verifying the MQTT outage-reconnect fix
 

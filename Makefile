@@ -1,6 +1,9 @@
-.PHONY: test dev dev-stop dev-logs dev-restart
+.PHONY: test test-v test-install dev dev-stop dev-logs dev-restart
 
 # --- Tests ---
+
+test-install:
+	pip install -r requirements-test.txt
 
 test:
 	python3 -m pytest tests/ -q
