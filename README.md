@@ -205,8 +205,9 @@ make stop       # stop the container
 ### Running tests
 
 ```bash
-make test-install
+pip install pytest pytest-asyncio pytest-timeout awsiotsdk pylint
 python3 -m pytest tests/ -v
+make lint-dup   # pylint duplicate-code check (across files only, not within one file)
 ```
 
 `requirements-test.txt` is the human-edited top-level list. `requirements-test.lock` is

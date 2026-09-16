@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import sys
 from unittest.mock import MagicMock
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -10,6 +9,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from tests.conftest import FakeResponse, FakeSession, load_exo_pool_module
 
 api = load_exo_pool_module("api")
+_REAL_EXO_MQTT_CLIENT = load_exo_pool_module("mqtt_client").ExoMqttClient
 
 
 SWC_0 = {
@@ -18,19 +18,8 @@ SWC_0 = {
 }
 
 
-def _install_shadow_callback(hass, entry, monkeypatch):
-    store = api._get_entry_store(hass, entry)
-    store["aws_credentials"] = {"Expiration": ""}
-    coordinator = MagicMock()
-    store["coordinator"] = coordinator
-
-    fake_mqtt_client = MagicMock()
-    fake_mqtt_client.connect.return_value = None
-    monkeypatch.setattr(
-        sys.modules["custom_components.exo_pool.mqtt_client"],
-        "ExoMqttClient",
-        MagicMock(return_value=fake_mqtt_client),
-    )
+def _install_shadow_callback(hass, entry, wired_fake_mqtt_client):
+    fake_mqtt_client, coordinator = wired_fake_mqtt_client
     api._connect_mqtt(hass, entry)
     shadow_callback = fake_mqtt_client.set_shadow_callback.call_args.args[0]
     return coordinator, shadow_callback
@@ -116,8 +105,10 @@ async def test_update_schedule_records_pending_writes_for_each_leaf(
     assert pending[("schedules", "sch3", "timer", "end")]["value"] == "18:00"
 
 
-async def test_connect_mqtt_shadow_callback_overlays_pending_writes(hass, entry, monkeypatch):
-    coordinator, shadow_callback = _install_shadow_callback(hass, entry, monkeypatch)
+async def test_connect_mqtt_shadow_callback_overlays_pending_writes(
+    hass, entry, wired_fake_mqtt_client
+):
+    coordinator, shadow_callback = _install_shadow_callback(hass, entry, wired_fake_mqtt_client)
 
     api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
     stale_echo = {"equipment": {"swc_0": {"production": 0}}}
@@ -270,15 +261,13 @@ class TestNonDictIntermediateRobustness:
 
 class TestSupersessionOnlyOnChange:
     async def test_own_echo_through_connect_mqtt_still_shows_our_value(
-        self, hass, entry, monkeypatch
+        self, hass, entry, monkeypatch, wired_fake_mqtt_client
     ):
-        mqtt_client_module = load_exo_pool_module("mqtt_client")
-        real_exo_mqtt_client = mqtt_client_module.ExoMqttClient
-        coordinator, shadow_callback = _install_shadow_callback(hass, entry, monkeypatch)
+        coordinator, shadow_callback = _install_shadow_callback(hass, entry, wired_fake_mqtt_client)
 
         api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
 
-        client = real_exo_mqtt_client.__new__(real_exo_mqtt_client)
+        client = _REAL_EXO_MQTT_CLIENT.__new__(_REAL_EXO_MQTT_CLIENT)
         message = {
             "previous": {"state": {"reported": {}, "desired": {}}},
             "current": {
@@ -347,9 +336,9 @@ class TestSupersessionOnlyOnChange:
         assert overlaid["equipment"]["swc_0"]["production"] == 1
 
     async def test_on_shadow_update_passes_changed_desired_through(
-        self, hass, entry, monkeypatch
+        self, hass, entry, wired_fake_mqtt_client
     ):
-        coordinator, shadow_callback = _install_shadow_callback(hass, entry, monkeypatch)
+        coordinator, shadow_callback = _install_shadow_callback(hass, entry, wired_fake_mqtt_client)
 
         api._record_pending_writes(hass, entry, ["equipment", "swc_0", "production"], 1)
         changed_desired = {"equipment": {"swc_0": {"production": 0}}}

@@ -7,7 +7,6 @@ import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from tests.conftest import load_exo_pool_module
 
@@ -40,22 +39,10 @@ def _load_real_exo_pool_init():
 
 exo_init = _load_real_exo_pool_init()
 
-SECRET_ENTRY_DATA = {
-    "serial_number": "JT00000000",
-    "email": "pool.owner@example.com",
-    "password": "hunter2",
-    "auth_token": "auth-tok-abc123",
-    "id_token": "id-tok-abc123",
-    "refresh_token": "refresh-tok-abc123",
-    "user_id": 42,
-}
-
 
 @pytest.fixture
-def entry(hass):
-    config_entry = MockConfigEntry(domain=api.DOMAIN, data=SECRET_ENTRY_DATA, options={})
-    config_entry.add_to_hass(hass)
-    return config_entry
+def entry(secret_entry):
+    return secret_entry
 
 
 async def test_setup_entry_does_not_log_any_secret_value(hass, entry, monkeypatch, caplog):
