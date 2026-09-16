@@ -4,6 +4,10 @@ A custom integration to connect your Zodiac iAqualink **Exo** pool system to Hom
 
 ## 🆕 What’s New
 
+- **15 Sep 2026**
+1) MQTT now reconnects after connection drops, previously causing fallback to REST
+2) Race conditions between regular MQTT status updates and changes made in HA are now handled
+
 - **15 Apr 2026**
 1) **Real-time updates via AWS IoT MQTT.** The integration now connects to the same AWS IoT shadow endpoint used by the official iAqualink app, giving sub-second state sync instead of REST polling. No additional setup required - it uses credentials already provided by the Zodiac login API.
 2) Writes (set points, switches, schedules) now go via MQTT when connected, eliminating 429 rate limit errors on writes.
