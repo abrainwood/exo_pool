@@ -206,7 +206,9 @@ python3 -m pytest tests/ -v
 make lint-dup   # pylint duplicate-code check (across files only, not within one file)
 ```
 
-Tests are isolated from Home Assistant - no HA installation required to run them.
+`requirements-test.txt` is the human-edited top-level list. `requirements-test.lock` is
+the fully pinned, hash-checked lock that CI, the Makefile and this install step all use.
+Regenerate it after changing `requirements-test.txt` with `make test-lock-regen`.
 
 ### Verifying the MQTT outage-reconnect fix
 
