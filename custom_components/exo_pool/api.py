@@ -10,8 +10,11 @@ from datetime import timedelta
 import aiohttp
 import async_timeout
 import logging
+import json
 import time
 import asyncio
+
+from .redact import redact
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +62,17 @@ def _log_response_headers(
     }
     if rate_headers:
         _LOGGER.info("%s rate-limit headers found: %s", label, rate_headers)
+
+
+def _redact_response_body(body: str) -> str | dict | list:
+    """Return a loggable form of a response body with secret keys redacted."""
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return f"<non-JSON body, {len(body)} chars>"
+    if isinstance(parsed, (dict, list)):
+        return redact(parsed)
+    return "<non-object JSON body>"
 
 
 # API endpoints and keys from config_flow.py and REST sensors
@@ -413,7 +427,7 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
             await _full_login(hass, entry, session)
 
         id_token = entry.data.get("id_token")  # Update after refresh/login
-        _LOGGER.debug("Authentication token refreshed: %s", id_token[:10] + "...")
+        _LOGGER.debug("Authentication token refreshed")
 
     # Fetch device data
     headers = {
@@ -434,7 +448,10 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
                 error_text
             )
             if is_rate_limited:
-                _LOGGER.warning("Rate limited fetching device data: %s", error_text)
+                _LOGGER.warning(
+                    "Rate limited fetching device data: %s",
+                    _redact_response_body(error_text),
+                )
                 coordinator = (
                     hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinator")
                 )
@@ -506,12 +523,13 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
                     return coordinator.data or {}
                 return {}
 
-            _LOGGER.error("Failed to fetch device data: %s", error_text)
+            redacted_error = _redact_response_body(error_text)
+            _LOGGER.error("Failed to fetch device data: %s", redacted_error)
             if "The incoming token has expired" in error_text:
-                _last_auth_error = error_text
-            raise UpdateFailed(f"Device data fetch failed: {error_text}")
+                _last_auth_error = redacted_error
+            raise UpdateFailed(f"Device data fetch failed: {redacted_error}")
         data = await response.json()
-        _LOGGER.debug("Device data: %s", data)
+        _LOGGER.debug("Device data: %s", redact(data))
         reported = data.get("state", {}).get("reported", {})
         coordinator = (
             hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinator")
@@ -547,23 +565,21 @@ async def _full_login(
         "email": entry.data["email"],
         "password": entry.data["password"],
     }
-    _LOGGER.debug("Login payload: %s", {**payload, "password": "REDACTED"})
+    _LOGGER.debug("Login payload: %s", redact(payload))
     await _async_rate_limit(hass, entry)
     async with session.post(LOGIN_URL, json=payload, headers=headers) as response:
         _LOGGER.debug("Login response status: %s", response.status)
         _log_response_headers(response, label="Login")
         if response.status != 200:
             error_text = await response.text()
-            _LOGGER.error("Failed to authenticate: %s", error_text)
+            redacted_error = _redact_response_body(error_text)
+            _LOGGER.error("Failed to authenticate: %s", redacted_error)
             global _authentication_failed, _last_auth_error
             _authentication_failed = True
-            _last_auth_error = error_text
-            raise Exception(f"Authentication failed: {error_text}")
+            _last_auth_error = redacted_error
+            raise Exception(f"Authentication failed: {redacted_error}")
         data = await response.json()
-        _LOGGER.debug(
-            "Login response data: %s",
-            {k: v if k != "id_token" else v[:10] + "..." for k, v in data.items()},
-        )
+        _LOGGER.debug("Login response data: %s", redact(data))
         id_token = data.get("userPoolOAuth", {}).get("IdToken")
         refresh_token = data.get("userPoolOAuth", {}).get("RefreshToken")
         auth_token = data.get("authentication_token")
@@ -572,12 +588,12 @@ async def _full_login(
             "ExpiresIn", 3600
         )  # Default to 1 hour if not present
         if not id_token:
-            _LOGGER.error("No userPoolOAuth.IdToken in response: %s", data)
+            _LOGGER.error("No userPoolOAuth.IdToken in response: %s", redact(data))
             _authentication_failed = True
             _last_auth_error = "No userPoolOAuth.IdToken received"
             raise Exception("No userPoolOAuth.IdToken received")
         if not auth_token:
-            _LOGGER.error("No authentication_token in response: %s", data)
+            _LOGGER.error("No authentication_token in response: %s", redact(data))
             _authentication_failed = True
             _last_auth_error = "No authentication_token received"
             raise Exception("No authentication_token received")
@@ -605,20 +621,17 @@ async def _refresh_token(
         "email": entry.data["email"],
         "refresh_token": entry.data["refresh_token"],
     }
-    _LOGGER.debug("Refresh token payload: %s", {**payload, "refresh_token": "REDACTED"})
+    _LOGGER.debug("Refresh token payload: %s", redact(payload))
     await _async_rate_limit(hass, entry)
     async with session.post(REFRESH_URL, json=payload, headers=headers) as response:
         _LOGGER.debug("Refresh response status: %s", response.status)
         _log_response_headers(response, label="Token refresh")
         if response.status != 200:
             error_text = await response.text()
-            _LOGGER.error("Failed to refresh token: %s", error_text)
+            _LOGGER.error("Failed to refresh token: %s", _redact_response_body(error_text))
             return False
         data = await response.json()
-        _LOGGER.debug(
-            "Refresh response data: %s",
-            {k: v if k != "id_token" else v[:10] + "..." for k, v in data.items()},
-        )
+        _LOGGER.debug("Refresh response data: %s", redact(data))
         id_token = data.get("userPoolOAuth", {}).get("IdToken")
         refresh_token = data.get("userPoolOAuth", {}).get(
             "RefreshToken"
@@ -627,7 +640,9 @@ async def _refresh_token(
         user_id = data.get("id")
         expires_in = data.get("userPoolOAuth", {}).get("ExpiresIn", 3600)
         if not id_token:
-            _LOGGER.error("No userPoolOAuth.IdToken in refresh response: %s", data)
+            _LOGGER.error(
+                "No userPoolOAuth.IdToken in refresh response: %s", redact(data)
+            )
             return False
         update_data = {
             **entry.data,
@@ -831,23 +846,27 @@ async def _execute_write_rest(
             hass, entry, session, url, payload, headers, item.key
         )
     if response_status == 429:
-        _LOGGER.warning("Rate limited during write %s: %s", item.key, response_text)
+        redacted_body = _redact_response_body(response_text)
+        _LOGGER.warning(
+            "Rate limited during write %s: %s", item.key, redacted_body
+        )
         _set_cooldown(
             hass,
             entry,
             _get_configured_interval_seconds(entry),
             reason="write_429",
         )
-        raise Exception(f"Rate limited for write {item.key}: {response_text}")
+        raise Exception(f"Rate limited for write {item.key}: {redacted_body}")
     if response_status != 200:
+        redacted_body = _redact_response_body(response_text)
         _LOGGER.error(
             "Write failed for %s: %s (Status: %s)",
             item.key,
-            response_text,
+            redacted_body,
             response_status,
         )
         raise Exception(
-            f"Write failed for {item.key}: {response_text} (Status: {response_status})"
+            f"Write failed for {item.key}: {redacted_body} (Status: {response_status})"
         )
 
 
@@ -894,7 +913,7 @@ async def _post_write(
             "Write response for %s: %s %s",
             item_key,
             response.status,
-            response_text,
+            _redact_response_body(response_text),
         )
         return response.status, response_text
 

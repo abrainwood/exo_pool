@@ -27,6 +27,29 @@ for pkg in ("custom_components", "custom_components.exo_pool"):
 sys.modules["custom_components.exo_pool.mqtt_client"] = _mqtt_mod
 _mqtt_spec.loader.exec_module(_mqtt_mod)
 
+# Real __path__ so a module loaded standalone below can resolve `from .foo import bar`.
+sys.modules["custom_components.exo_pool"].__path__ = [
+    str(_REPO_ROOT / "custom_components" / "exo_pool")
+]
+
+
+def load_exo_pool_module(name: str):
+    """Load a custom_components.exo_pool submodule directly.
+
+    custom_components.exo_pool is the fake stub package registered above, so
+    its __init__ can't be reached through a normal `from .foo import bar`.
+    """
+    full_name = f"custom_components.exo_pool.{name}"
+    if full_name in sys.modules:
+        return sys.modules[full_name]
+    spec = importlib.util.spec_from_file_location(
+        full_name, _REPO_ROOT / "custom_components" / "exo_pool" / f"{name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[full_name] = module
+    spec.loader.exec_module(module)
+    return module
+
 
 SAMPLE_CREDENTIALS = {
     "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
