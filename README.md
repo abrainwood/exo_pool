@@ -218,8 +218,13 @@ Regenerate it after changing `requirements-test.txt` with `make test-lock-regen`
 
 `scripts/verify_outage_reconnect.py` drives the running dev container through
 a simulated WAN outage - only ever against `ha-exo-pool-dev` on port 8125,
-never a live instance. It never writes to any entity - only reads state and
-blocks/unblocks network traffic. It runs four scenarios:
+never a live instance. It never calls an HA service: every HA API call
+goes through `_ha_request`, which allows only GETs and a POST to the
+config-entry reload path, raising before any request goes out for
+anything else. Container `exec` calls (network-namespace and `getent`
+work) aren't guarded the same way - they're scoped to
+iptables/ss/getent/docker-image commands only, never anything
+HA-facing. It runs four scenarios:
 
 - **reconnect-from-connected** (issue #2's actual reproduction): MQTT is
   connected, every one of its actual established peers is blocked (and
@@ -240,12 +245,12 @@ blocks/unblocks network traffic. It runs four scenarios:
 The #12 early-wake-on-reconnect behaviour (a held write retries the instant
 MQTT reconnects rather than waiting out the rest of its cooldown) is unit
 tested in `tests/test_api_write_manager_mqtt_throttle.py` instead of driven
-through this harness - it doesn't need a real device write to prove, and an
-earlier version of this harness that did force one against the dev
-container's real chlorinator left it stuck off-target for hours. This
-harness makes no writes to any entity, ever; a source-scan test in
-`tests/test_verify_outage_reconnect.py` fails if a write service call is
-ever reintroduced.
+through this harness - it doesn't need a real device write to prove.
+`_ha_request`'s GET/reload-only allow-list is what keeps this harness from
+ever writing: `tests/test_verify_outage_reconnect.py` proves a write-service
+POST (and PUT/DELETE) never reach `urlopen`, that `urlopen` is called from
+nowhere but `_ha_request`, and that the script imports no alternate HTTP
+client that could route around it.
 
 Before any scenario runs, `assert_mounted_code_is_loaded()` checks the
 container against this checkout: that its mounted
@@ -260,6 +265,9 @@ if the mount points elsewhere, repoint it with
 `docker compose -p exo_pool -f docker-compose.dev.yml up -d --force-recreate`
 run from the checkout you want mounted. Restart with
 `docker restart ha-exo-pool-dev` if only the staleness check fires.
+`make dev` always passes `-p exo_pool`, so running it from a worktree
+reuses this same project and config volume instead of standing up a
+second, empty one under the worktree directory's own name.
 
 Two blocking mechanisms, deliberately not unified: reconnect-from-connected
 and interrupt-resume-recovers block by address - read from the container's
