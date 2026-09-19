@@ -32,9 +32,6 @@ from typing import Callable
 from urllib.parse import urlparse
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -213,8 +210,6 @@ def matches_transport_reconnected(log_text: str) -> bool:
     return bool(_TRANSPORT_RECONNECTED_RE.search(log_text))
 
 
-
-
 # --- Teardown (unit tested) ----------------------------------------------
 
 
@@ -261,8 +256,6 @@ class ScenarioFailure(Exception):
     """Raised when a scenario's assertion doesn't hold."""
 
 
-# A scenario or the preflight guard failing this way is a FAIL line in
-# main()'s summary, not a traceback.
 SCENARIO_EXCEPTIONS = (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError)
 
 
@@ -353,13 +346,7 @@ def assert_mounted_code_is_loaded(
     mounted_destination: str = MOUNTED_EXO_POOL_DESTINATION,
     expected_source: pathlib.Path = EXPECTED_EXO_POOL_SOURCE,
 ) -> None:
-    """Fail loudly if `container` predates its own mounted code.
-
-    Config-entry reloads re-run setup but never re-import Python modules, so
-    a container started before a mounted .py file's last edit keeps running
-    the old code with no error - a false negative that looks like a
-    production bug until the container is restarted.
-    """
+    """Fail loudly if `container` mounts the wrong checkout, or predates its own mounted code."""
     started_at = container.started_at()
     source_dir = pathlib.Path(container.mount_source(mounted_destination))
     if source_dir.resolve() != expected_source.resolve():
@@ -394,42 +381,38 @@ DEFAULT_PRINT_INTERVAL = 20.0
 
 def wait_for_log_pattern(
     container: Container,
-    pattern: re.Pattern | Callable[[str], bool],
+    pattern: re.Pattern,
     since_iso: str,
     timeout: float,
     poll_interval: float = 3.0,
     print_interval: float = DEFAULT_PRINT_INTERVAL,
     label: str = "log pattern",
     on_tick: Callable[[], None] | None = None,
-    now: Callable[[], float] = time.monotonic,
-    sleep: Callable[[float], None] = time.sleep,
 ) -> str:
-    """Poll container logs since `since_iso` until `pattern` matches or `timeout` elapses.
+    """Poll container logs since `since_iso` until `pattern` is found or `timeout` elapses.
 
-    `pattern` is a compiled regex or a `text -> bool` predicate. `on_tick`,
-    if given, runs once per poll - used to top up IP blocks that might
-    rotate out from under a wait.
+    `on_tick`, if given, runs once per poll - used to top up IP blocks that
+    might rotate out from under a wait.
     """
-    matches = pattern.search if isinstance(pattern, re.Pattern) else pattern
-    deadline = now() + timeout
-    start = now()
+    deadline = time.monotonic() + timeout
+    start = time.monotonic()
     last_print: float | None = None
     while True:
         if on_tick is not None:
             on_tick()
         text = container.logs_since(since_iso)
-        if matches(text):
+        if pattern.search(text):
             return text
-        remaining = deadline - now()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ScenarioFailure(
                 f"timed out after {timeout:.0f}s waiting for {label}"
             )
-        elapsed = now() - start
+        elapsed = time.monotonic() - start
         if should_print_tick(elapsed, last_print, print_interval):
             print(f"  ... waiting for {label} ({elapsed:.0f}s elapsed, {remaining:.0f}s left)")
             last_print = elapsed
-        sleep(min(poll_interval, remaining))
+        time.sleep(min(poll_interval, remaining))
 
 
 # --- MQTT entity resolution (unit tested) ---------------------------------
@@ -744,28 +727,6 @@ def get_established_peer_ips(
     if result.returncode != 0:
         raise RuntimeError(f"failed to list established connections via netns sidecar: {result.stderr}")
     return select_established_peer_ips(result.stdout, port=port)
-
-
-def resolve_host_ips(container: Container, hostname: str) -> list[str]:
-    """Resolve every IPv4 address `hostname` has via the container's own
-    resolver (`getent ahosts`, deduplicated), so a block matches every
-    address the container itself could actually connect to."""
-    result = container.exec(["getent", "ahosts", hostname])
-    if result.returncode != 0:
-        raise RuntimeError(f"failed to resolve {hostname} in {container.name}: {result.stderr}")
-    seen: dict[str, None] = {}
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        ip = parts[0]
-        try:
-            if ipaddress.ip_address(ip).version != 4:
-                continue
-        except ValueError:
-            continue
-        seen[ip] = None
-    return list(seen)
 
 
 def get_established_peer_ips_with_retry(
@@ -1381,8 +1342,7 @@ def main() -> int:
     token = load_ha_token()
 
     try:
-        entity_ids = list_entity_ids(token)
-        mqtt_entity = resolve_mqtt_entity_id(entity_ids)
+        mqtt_entity = resolve_mqtt_entity_id(list_entity_ids(token))
         entry_id = get_exo_pool_entry_id(token)
     except (MqttEntityResolutionError, RuntimeError) as e:
         print(f"FATAL: could not resolve the exo_pool entity/entry: {e}")
