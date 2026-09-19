@@ -18,7 +18,6 @@ import concurrent.futures
 import ipaddress
 import json
 import logging
-from datetime import datetime
 import os
 import pathlib
 import re
@@ -29,17 +28,21 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Callable
 from urllib.parse import urlparse
 
-# Needed to import the production cooldown constant below - this script
-# isn't run as part of the `custom_components` package, so its own
-# directory (not the repo root) is on sys.path by default.
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from custom_components.exo_pool.api import POST_WRITE_COOLDOWN_SECONDS  # noqa: E402
+from custom_components.exo_pool.api import (  # noqa: E402
+    DATA_URL_TEMPLATE,
+    POST_WRITE_COOLDOWN_SECONDS,
+    WRITE_HELD_BEHIND_COOLDOWN_LOG,
+    WRITE_VIA_REST_FALLBACK_LOG,
+    WRITE_WOKEN_EARLY_LOG,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -217,13 +220,32 @@ def matches_transport_reconnected(log_text: str) -> bool:
     return bool(_TRANSPORT_RECONNECTED_RE.search(log_text))
 
 
-# Anchored on api.py's _execute_write/_execute_write_rest logging. Each
-# line includes the write's `item.key` (e.g. "pool:swc" for the SWC-output
-# number), so matching is keyed rather than a bare substring search, in
-# case another write is in flight too.
-_WRITE_REST_FALLBACK_RE = re.compile(r"Writing (?P<key>\S+) via REST fallback")
-_WRITE_HELD_RE = re.compile(r"Write (?P<key>\S+) held behind cooldown")
-_WRITE_WOKEN_EARLY_RE = re.compile(r"Write (?P<key>\S+) woken early by MQTT reconnect")
+_LOG_FORMAT_TOKEN_RE = re.compile(r"%\.1fs|%s")
+
+
+def _pattern_from_log_format(fmt: str) -> re.Pattern:
+    """Build a search regex from an api.py `_LOGGER.info` %-style format string,
+    keyed on its first %s (always `item.key`) so the two stay in lockstep."""
+    parts = []
+    key_captured = False
+    pos = 0
+    for m in _LOG_FORMAT_TOKEN_RE.finditer(fmt):
+        parts.append(re.escape(fmt[pos:m.start()]))
+        if m.group() == "%s" and not key_captured:
+            parts.append(r"(?P<key>\S+)")
+            key_captured = True
+        elif m.group() == "%s":
+            parts.append(r"\S+")
+        else:
+            parts.append(r"[\d.]+s")
+        pos = m.end()
+    parts.append(re.escape(fmt[pos:]))
+    return re.compile("".join(parts))
+
+
+_WRITE_REST_FALLBACK_RE = _pattern_from_log_format(WRITE_VIA_REST_FALLBACK_LOG)
+_WRITE_HELD_RE = _pattern_from_log_format(WRITE_HELD_BEHIND_COOLDOWN_LOG)
+_WRITE_WOKEN_EARLY_RE = _pattern_from_log_format(WRITE_WOKEN_EARLY_LOG)
 
 
 def matches_write_via_rest_fallback(log_text: str, key: str) -> bool:
@@ -247,13 +269,7 @@ def wait_for_early_wake_or_fail(
     now: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = lambda s: time.sleep(s),
 ) -> str:
-    """Poll for `key`'s early-wake log line, failing the instant `deadline` passes.
-
-    A deadline cutoff rather than a fixed timeout: an implementation that
-    only ever waits out the cooldown - never actually the early-wake path -
-    would apply the write exactly when `deadline` is reached, the same
-    moment this stops looking for the line, so it can never pass by luck.
-    """
+    """Poll for `key`'s early-wake log line, failing the instant `deadline` passes."""
     while True:
         text = container.logs_since(since)
         if matches_write_woken_early(text, key):
@@ -387,10 +403,17 @@ def _parse_docker_timestamp(value: str) -> float:
     return datetime.fromisoformat(value).timestamp()
 
 
+def _epoch_to_iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+
+EXPECTED_EXO_POOL_SOURCE = _REPO_ROOT / "custom_components" / "exo_pool"
+
+
 def assert_mounted_code_is_loaded(
     container: Container,
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     mounted_destination: str = MOUNTED_EXO_POOL_DESTINATION,
+    expected_source: pathlib.Path = EXPECTED_EXO_POOL_SOURCE,
 ) -> None:
     """Fail loudly if `container` predates its own mounted code.
 
@@ -400,16 +423,22 @@ def assert_mounted_code_is_loaded(
     production bug until the container is restarted.
     """
     started_at = container.started_at()
-    source_dir = container.mount_source(mounted_destination)
-    py_files = sorted(pathlib.Path(source_dir).glob("*.py"))
+    source_dir = pathlib.Path(container.mount_source(mounted_destination))
+    if source_dir.resolve() != expected_source.resolve():
+        raise StaleContainerError(
+            f"{container.name} mounts {source_dir} at {mounted_destination}, not "
+            f"this repo's {expected_source} - point the dev container at this "
+            "checkout before running scenarios."
+        )
+    py_files = sorted(source_dir.glob("*.py"))
     if not py_files:
         raise RuntimeError(f"no .py files found under {source_dir}")
     newest_mtime = max(p.stat().st_mtime for p in py_files)
     if newest_mtime > started_at:
         raise StaleContainerError(
-            f"{container.name} started at {started_at} but {source_dir} has code "
-            f"modified at {newest_mtime} - restart the dev container "
-            f"(`docker restart {container.name}`) before running scenarios."
+            f"{container.name} started at {_epoch_to_iso(started_at)} but {source_dir} "
+            f"has code modified at {_epoch_to_iso(newest_mtime)} - restart the dev "
+            f"container (`docker restart {container.name}`) before running scenarios."
         )
 
 
@@ -427,7 +456,7 @@ DEFAULT_PRINT_INTERVAL = 20.0
 
 def wait_for_log_pattern(
     container: Container,
-    pattern: re.Pattern,
+    pattern: re.Pattern | Callable[[str], bool],
     since_iso: str,
     timeout: float,
     poll_interval: float = 3.0,
@@ -437,12 +466,13 @@ def wait_for_log_pattern(
     now: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> str:
-    """Poll container logs since `since_iso` until `pattern` is found or `timeout` elapses.
+    """Poll container logs since `since_iso` until `pattern` matches or `timeout` elapses.
 
-    `on_tick`, if given, runs once per poll - used to top up IP blocks that
-    might rotate out from under a wait. `now`/`sleep` are injectable so a
-    test can drive a real timeout to completion without a real wait.
+    `pattern` is a compiled regex or a `text -> bool` predicate. `on_tick`,
+    if given, runs once per poll - used to top up IP blocks that might
+    rotate out from under a wait.
     """
+    matches = pattern.search if isinstance(pattern, re.Pattern) else pattern
     deadline = now() + timeout
     start = now()
     last_print: float | None = None
@@ -450,7 +480,7 @@ def wait_for_log_pattern(
         if on_tick is not None:
             on_tick()
         text = container.logs_since(since_iso)
-        if pattern.search(text):
+        if matches(text):
             return text
         remaining = deadline - now()
         if remaining <= 0:
@@ -570,11 +600,8 @@ def get_entity_state(token: str, entity_id: str) -> str:
     return state["state"]
 
 
-# A service call blocks until HA's own write completes, which for a write
-# forced onto the REST fallback path means a real round trip to the cloud
-# API - stays generous since that round trip's latency varies and this
-# should not be tuned to the fastest case seen so far.
-SERVICE_CALL_TIMEOUT = 60.0
+SERVICE_CALL_TIMEOUT_MARGIN_SECONDS = 15.0
+SERVICE_CALL_TIMEOUT = POST_WRITE_COOLDOWN_SECONDS + SERVICE_CALL_TIMEOUT_MARGIN_SECONDS
 
 
 def call_service(token: str, domain: str, service: str, entity_id: str, data: dict | None = None) -> None:
@@ -819,12 +846,25 @@ def get_established_peer_ips(
 
 
 def resolve_host_ips(container: Container, hostname: str) -> list[str]:
-    """Resolve `hostname` using the container's own resolver via `getent hosts`,
-    so a block matches the address the container itself will actually connect to."""
-    result = container.exec(["getent", "hosts", hostname])
+    """Resolve every IPv4 address `hostname` has via the container's own
+    resolver (`getent ahosts`, deduplicated), so a block matches every
+    address the container itself could actually connect to."""
+    result = container.exec(["getent", "ahosts", hostname])
     if result.returncode != 0:
         raise RuntimeError(f"failed to resolve {hostname} in {container.name}: {result.stderr}")
-    return [line.split()[0] for line in result.stdout.splitlines() if line.split()]
+    seen: dict[str, None] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        ip = parts[0]
+        try:
+            if ipaddress.ip_address(ip).version != 4:
+                continue
+        except ValueError:
+            continue
+        seen[ip] = None
+    return list(seen)
 
 
 def get_established_peer_ips_with_retry(
@@ -980,14 +1020,7 @@ def block_mqtt_via_rest_allowlist(
     port: int = 443,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> None:
-    """Cut off every outbound connection on `port` except `rest_ips` - a
-    peer-IP block can't hold MQTT down reliably, since AWS IoT's automatic
-    reconnect can pick a fresh address from its rotating pool that was never
-    blocked. Inverting it (block everything, then allow only the already-
-    resolved REST host) closes that gap: REST keeps working, MQTT has
-    nowhere left to go. Removes every rule added here in `finally`, even if
-    the caller raises.
-    """
+    """Cut off every outbound connection on `port` except `rest_ips`, deferring each rule's removal onto `teardown`."""
     block_port_total_outage(container_name, teardown, port=port, runner=runner)
     for ip in rest_ips:
         add_accept = run_netns_sidecar(container_name, accept_ip_shell_cmd(ip, "-I"), runner=runner)
@@ -1448,8 +1481,36 @@ def scenario_watchdog(container: Container, token: str, teardown: BestEffortTear
 # number.py's ExoPoolSwcOutputNumber.async_set_native_value.
 WRITE_KEY_SWC_OUTPUT = "pool:swc"
 
+REST_HOST = urlparse(DATA_URL_TEMPLATE).hostname
 
-REST_HOST = "prod.zodiac-io.com"
+# Mirrors number.py's ExoPoolSwcOutputNumber._attr_native_max_value.
+SWC_OUTPUT_MAX = 100
+
+CONNECTION_INTERRUPT_TIMEOUT = 60.0
+HELD_WAIT_MARGIN_SECONDS = 25.0
+HELD_WAIT_TIMEOUT = POST_WRITE_COOLDOWN_SECONDS - HELD_WAIT_MARGIN_SECONDS
+
+
+def _resumed_diagnostic(log_text: str) -> str:
+    match = _CONNECTION_RESUMED_RE.search(log_text)
+    if not match:
+        return "MQTT connection resumed never appeared in the logs"
+    line_start = log_text.rfind("\n", 0, match.start()) + 1
+    ts_match = _LOG_LINE_TS_RE.match(log_text[line_start:])
+    when = ts_match.group(1) if ts_match else "unknown time"
+    return f"MQTT connection resumed at {when}"
+
+
+def _verify_restored(token: str, entity_id: str, original_value: int) -> str | None:
+    """None if `entity_id` reads back as `original_value`, else a message naming both."""
+    state = get_entity_state(token, entity_id)
+    try:
+        current_value = int(float(state))
+    except (TypeError, ValueError):
+        return f"{entity_id} restore check failed: state is {state!r}, not numeric"
+    if current_value != original_value:
+        return f"{entity_id} did not return to its original value {original_value} (got {current_value})"
+    return None
 
 
 def scenario_forced_held_write(
@@ -1460,6 +1521,8 @@ def scenario_forced_held_write(
     ),
     held_wait_now: Callable[[], float] = time.monotonic,
     held_wait_sleep: Callable[[float], None] = time.sleep,
+    early_wake_now: Callable[[], float] = time.monotonic,
+    early_wake_sleep: Callable[[float], None] = time.sleep,
 ) -> bool | None:
     """Forces a write to be held behind its post-write cooldown while MQTT is
     down, then proves it applies the instant MQTT reconnects rather than
@@ -1480,31 +1543,36 @@ def scenario_forced_held_write(
     ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
     rest_ips = resolve_host_ips(container, REST_HOST)
 
-    original_value = int(float(get_entity_state(token, swc_entity)))
-    teardown.defer(lambda: set_number_value(token, swc_entity, original_value))
+    state = get_entity_state(token, swc_entity)
+    try:
+        original_value = int(float(state))
+    except (TypeError, ValueError):
+        raise ScenarioFailure(f"{swc_entity} has a non-numeric state ({state!r}) - cannot force a write")
 
-    # The first write must land via REST to start the cooldown - it only
-    # does that if MQTT is already unreachable, so the block goes up before
-    # it, not after. A healthy MQTT connection would just publish that
-    # write with no cooldown at all, leaving nothing for the second write
-    # to be held behind. Everything on the port is cut except the
-    # already-resolved REST host: a peer-address block can't hold MQTT down
-    # reliably, since its automatic reconnect can pick a fresh, unblocked
-    # address from AWS IoT's rotating pool.
-    since = now_utc_iso()
+    write1_target = original_value - 1 if original_value >= SWC_OUTPUT_MAX else original_value + 1
+
+    teardown.defer(lambda: set_number_value(token, swc_entity, original_value))
     block_teardown = BestEffortTeardown()
+    teardown.defer(block_teardown.run)
+
+    since = now_utc_iso()
     executor = make_executor()
+    since_write2 = since
+    second_write: concurrent.futures.Future | None = None
+    deadline = 0.0
+    unblock_at = 0.0
+    scenario_error: Exception | None = None
     try:
         block_mqtt_via_rest_allowlist(container.name, block_teardown, rest_ips=rest_ips)
 
         wait_for_log_pattern(
             container, _CONNECTION_INTERRUPTED_RE, since,
-            timeout=60.0, label="connection interrupt",
+            timeout=CONNECTION_INTERRUPT_TIMEOUT, label="connection interrupt",
         )
         print("PASS MQTT connection interrupted - now unreachable")
 
-        set_number_value(token, swc_entity, original_value + 1)
-        deadline = time.monotonic() + POST_WRITE_COOLDOWN_SECONDS
+        set_number_value(token, swc_entity, write1_target)
+        deadline = early_wake_now() + POST_WRITE_COOLDOWN_SECONDS
 
         if not matches_write_via_rest_fallback(container.logs_since(since), WRITE_KEY_SWC_OUTPUT):
             raise ScenarioFailure(
@@ -1513,34 +1581,49 @@ def scenario_forced_held_write(
             )
         print(f"PASS first write via REST fallback: cooldown started for {WRITE_KEY_SWC_OUTPUT}")
 
-        # The second write's own service call blocks inside HA until the
-        # write actually applies - either woken early or after the full
-        # cooldown - so it has to run in the background for "held behind
-        # cooldown" to be observable at all before we choose to unblock.
         since_write2 = now_utc_iso()
-        second_write = executor.submit(set_number_value, token, swc_entity, original_value - 1)
+        second_write = executor.submit(set_number_value, token, swc_entity, original_value)
 
         wait_for_log_pattern(
-            container, _WRITE_HELD_RE, since_write2, timeout=20.0,
+            container, lambda text: matches_write_held(text, WRITE_KEY_SWC_OUTPUT), since_write2,
+            timeout=HELD_WAIT_TIMEOUT,
             label=f"'{WRITE_KEY_SWC_OUTPUT}' held behind cooldown",
             now=held_wait_now, sleep=held_wait_sleep,
         )
         print(f"PASS second write held behind cooldown: {WRITE_KEY_SWC_OUTPUT}")
+    except Exception as exc:
+        scenario_error = exc
     finally:
+        unblock_at = early_wake_now()
         block_teardown.run()
         executor.shutdown(wait=True)
 
-    wait_for_early_wake_or_fail(container, since_write2, deadline, key=WRITE_KEY_SWC_OUTPUT)
-    print(f"PASS woken early by MQTT reconnect before cooldown deadline: {WRITE_KEY_SWC_OUTPUT}")
-
-    second_write.result(timeout=SERVICE_CALL_TIMEOUT)
+    if scenario_error is None:
+        try:
+            wait_for_early_wake_or_fail(
+                container, since_write2, deadline, key=WRITE_KEY_SWC_OUTPUT,
+                now=early_wake_now, sleep=early_wake_sleep,
+            )
+            print(f"PASS woken early by MQTT reconnect before cooldown deadline: {WRITE_KEY_SWC_OUTPUT}")
+            second_write.result(timeout=SERVICE_CALL_TIMEOUT)
+        except Exception as exc:
+            cooldown_left = deadline - unblock_at
+            diagnostic = _resumed_diagnostic(container.logs_since(since_write2))
+            scenario_error = ScenarioFailure(
+                f"{exc} ({diagnostic}; {cooldown_left:.1f}s of cooldown remained when unblocked)"
+            )
 
     teardown.run()
-    if not _wait_for_entity_state(token, swc_entity, str(original_value), timeout=30.0):
-        raise ScenarioFailure(
-            f"{swc_entity} did not return to its original value {original_value} after restore"
-        )
-    print(f"PASS restore: {swc_entity} back at its original value")
+    restore_error = _verify_restored(token, swc_entity, original_value)
+
+    if scenario_error is not None:
+        if restore_error is not None:
+            raise ScenarioFailure(f"{scenario_error}; additionally, {restore_error}") from scenario_error
+        raise scenario_error
+    if restore_error is not None:
+        raise ScenarioFailure(restore_error)
+
+    print(f"PASS restore: {swc_entity} back at its original value ({original_value})")
     return True
 
 
@@ -1563,7 +1646,7 @@ def main() -> int:
 
     try:
         assert_mounted_code_is_loaded(container)
-    except StaleContainerError as e:
+    except (StaleContainerError, RuntimeError) as e:
         print(f"FATAL: {e}")
         return 1
 
@@ -1611,7 +1694,7 @@ def main() -> int:
         try:
             scenario_baseline(token, entry_id, mqtt_entity, container)
             results["baseline"] = "PASS"
-        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+        except (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError) as e:
             results["baseline"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1620,7 +1703,7 @@ def main() -> int:
             results["reconnect_from_connected"] = "PASS" if outcome else (
                 "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
             )
-        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+        except (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError) as e:
             results["reconnect_from_connected"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1629,7 +1712,7 @@ def main() -> int:
             results["interrupt_resume_recovers"] = "PASS" if outcome else (
                 "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
             )
-        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+        except (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError) as e:
             results["interrupt_resume_recovers"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1638,7 +1721,7 @@ def main() -> int:
             results["setup_under_outage"] = "PASS" if outcome else (
                 "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
             )
-        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+        except (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError) as e:
             results["setup_under_outage"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1650,7 +1733,7 @@ def main() -> int:
                 results["watchdog"] = "PASS" if outcome else (
                     "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
                 )
-            except (ScenarioFailure, AssertionError, RuntimeError) as e:
+            except (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError) as e:
                 results["watchdog"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1659,7 +1742,7 @@ def main() -> int:
             results["forced_held_write"] = "PASS" if outcome else (
                 "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
             )
-        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+        except (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError) as e:
             results["forced_held_write"] = f"FAIL: {e}"
     finally:
         teardown.run()

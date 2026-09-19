@@ -11,8 +11,10 @@ import concurrent.futures
 import importlib.util
 import os
 import pathlib
+import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -736,6 +738,27 @@ def test_block_mqtt_via_rest_allowlist_teardown_removes_accept_and_drop_rules():
     ])
 
 
+def test_block_mqtt_via_rest_allowlist_still_tears_down_drop_when_accept_fails():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv[-1])
+        if argv[-1].endswith("-j ACCEPT"):
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="rule exists")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    teardown = harness.BestEffortTeardown()
+    with pytest.raises(RuntimeError, match="ACCEPT"):
+        harness.block_mqtt_via_rest_allowlist(
+            "ha-exo-pool-dev", teardown, rest_ips=["45.60.157.189"], port=443, runner=fake_runner,
+        )
+    calls.clear()
+
+    teardown.run()
+
+    assert "iptables -D OUTPUT -p tcp --dport 443 -j DROP" in calls
+
+
 def test_ensure_harness_tools_image_skips_build_when_already_present():
     calls = []
 
@@ -872,7 +895,6 @@ def test_get_established_peer_ips_runs_ss_with_no_apk_install():
 
 
 class _FakeExecContainer:
-    """Container stand-in whose exec() returns a canned CompletedProcess."""
 
     def __init__(self, name, result):
         self.name = name
@@ -884,12 +906,12 @@ class _FakeExecContainer:
         return self._result
 
 
-def test_resolve_host_ips_parses_getent_hosts_output():
+def test_resolve_host_ips_parses_getent_ahosts_output():
     container = _FakeExecContainer(
         "ha-exo-pool-dev",
         subprocess.CompletedProcess(
             args=[], returncode=0,
-            stdout="45.60.157.189     5dkmh5g.impervadns.net  5dkmh5g.impervadns.net prod.zodiac-io.com\n",
+            stdout="45.60.157.189   STREAM prod.zodiac-io.com\n45.60.157.189   DGRAM\n45.60.157.189   RAW\n",
             stderr="",
         ),
     )
@@ -897,7 +919,42 @@ def test_resolve_host_ips_parses_getent_hosts_output():
     ips = harness.resolve_host_ips(container, "prod.zodiac-io.com")
 
     assert ips == ["45.60.157.189"]
-    assert container.calls == [["getent", "hosts", "prod.zodiac-io.com"]]
+    assert container.calls == [["getent", "ahosts", "prod.zodiac-io.com"]]
+
+
+def test_resolve_host_ips_deduplicates_and_returns_every_resolved_address():
+    container = _FakeExecContainer(
+        "ha-exo-pool-dev",
+        subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=(
+                "45.60.157.189   STREAM prod.zodiac-io.com\n"
+                "45.60.157.189   DGRAM\n"
+                "104.20.1.1      STREAM\n"
+                "104.20.1.1      DGRAM\n"
+            ),
+            stderr="",
+        ),
+    )
+
+    ips = harness.resolve_host_ips(container, "prod.zodiac-io.com")
+
+    assert ips == ["45.60.157.189", "104.20.1.1"]
+
+
+def test_resolve_host_ips_excludes_ipv6_addresses():
+    container = _FakeExecContainer(
+        "ha-exo-pool-dev",
+        subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="2606:4700::1  STREAM\n45.60.157.189   STREAM prod.zodiac-io.com\n",
+            stderr="",
+        ),
+    )
+
+    ips = harness.resolve_host_ips(container, "prod.zodiac-io.com")
+
+    assert ips == ["45.60.157.189"]
 
 
 def test_resolve_host_ips_raises_when_getent_fails():
@@ -1066,8 +1123,6 @@ def test_set_number_value_calls_the_number_set_value_service(monkeypatch):
 
 
 class _FakeContainerLogs:
-    """Container stand-in whose logs_since() returns canned text per call."""
-
     def __init__(self, name: str, texts: list[str]):
         self.name = name
         self._texts = iter(texts)
@@ -1106,10 +1161,6 @@ def test_wait_for_early_wake_or_fail_returns_when_pattern_appears_before_deadlin
 
 
 def test_wait_for_early_wake_or_fail_rejects_a_write_that_only_waits_out_the_cooldown():
-    # A materially-simpler impl never wakes early: the write only applies
-    # once the cooldown elapses on its own, logged as a plain REST-fallback
-    # retry, never "woken early". Must fail at `deadline`, not keep polling
-    # past it and mistake that later line for success.
     container = _FakeContainerLogs(
         "ha-exo-pool-dev",
         texts=["no match yet\n"] * 10 + ["Writing pool:swc via REST fallback\n"] * 10,
@@ -1127,11 +1178,6 @@ def test_wait_for_early_wake_or_fail_rejects_a_write_that_only_waits_out_the_coo
 
 
 class _ImmediateExecutor:
-    """Executor stand-in that runs a submitted call synchronously and hands
-    back an already-resolved future - keeps the scenario's own choreography
-    (submit the second write, poll for "held", unblock, poll for the early
-    wake, then join) testable without a real thread or a real sleep anywhere."""
-
     def submit(self, fn, *args, **kwargs):
         future = concurrent.futures.Future()
         try:
@@ -1144,12 +1190,8 @@ class _ImmediateExecutor:
         pass
 
 
-def _forced_held_write_fixture(monkeypatch, staged_logs):
-    """Wires the collaborators scenario_forced_held_write needs, without touching
-    docker or a live HA instance: entity state lives in `current`, every HA
-    REST call is recorded in `calls`, and the container's log reads step
-    through `staged_logs` in call order (sticking on the last one)."""
-    current = [50]
+def _forced_held_write_fixture(monkeypatch, staged_logs, original_value=50):
+    current = [original_value]
     calls = []
     swc_entity = "number.exo_pool_swc_output"
 
@@ -1200,47 +1242,237 @@ def test_scenario_forced_held_write_wakes_early_and_restores_the_original_value(
     assert current[0] == 50
     assert ("block", ("45.60.157.189",), None) in calls
     assert ("unblock", None, None) in calls
+    posted_values = [data["value"] for method, path, data in calls if method == "POST"]
+    assert posted_values[:2] == [51, 50]
 
 
-def test_scenario_forced_held_write_fails_and_still_restores_when_early_wake_never_fires(monkeypatch):
-    # A materially-simpler impl (just waits out the cooldown) never logs
-    # "woken early" - the scenario must fail rather than pass once its
-    # deadline is reached, and the original value must still be restored.
+def test_scenario_forced_held_write_first_write_points_away_from_the_upper_bound(monkeypatch):
     container, swc_entity, current, calls = _forced_held_write_fixture(
         monkeypatch,
         staged_logs=[
             "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
             "Writing pool:swc via REST fallback\n",
             "Write pool:swc held behind cooldown: 40.0s remaining (post_write)\n",
-            "Writing pool:swc via REST fallback\n",  # cooldown elapsed, applied plainly
+            "Write pool:swc woken early by MQTT reconnect\n",
         ],
+        original_value=100,
     )
-    monkeypatch.setattr(harness, "POST_WRITE_COOLDOWN_SECONDS", 0.0)
     teardown = harness.BestEffortTeardown()
 
-    with pytest.raises(harness.ScenarioFailure, match="pool:swc"):
-        harness.scenario_forced_held_write(
-            container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
-            make_executor=_ImmediateExecutor,
-        )
+    harness.scenario_forced_held_write(
+        container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+        make_executor=_ImmediateExecutor,
+    )
 
-    teardown.run()  # main() always runs the shared teardown in its own outer finally
-
-    assert current[0] == 50
-    assert ("unblock", None, None) in calls
+    posted_values = [data["value"] for method, path, data in calls if method == "POST"]
+    assert posted_values[:2] == [99, 100]
 
 
-def test_scenario_forced_held_write_fails_if_never_seen_held_before_unblocking(monkeypatch):
-    # The call-then-poll bug this scenario used to have: an impl that moves
-    # on to unblocking without ever having observed "held behind cooldown"
-    # for the second write must fail loudly, not silently accept whatever
-    # that write ends up doing.
+def test_scenario_forced_held_write_unblocks_only_after_observing_held(monkeypatch):
     container, swc_entity, current, calls = _forced_held_write_fixture(
         monkeypatch,
         staged_logs=[
             "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
             "Writing pool:swc via REST fallback\n",
-            # No "held behind cooldown" line ever appears for the second write.
+            "Write pool:swc held behind cooldown: 40.0s remaining (post_write)\n",
+            "Write pool:swc woken early by MQTT reconnect\n",
+        ],
+    )
+    read_count = [0]
+    real_logs_since = container.logs_since
+
+    def counting_logs_since(since_iso):
+        read_count[0] += 1
+        return real_logs_since(since_iso)
+
+    container.logs_since = counting_logs_since
+    unblock_read_counts = []
+    calls.clear()
+
+    def fake_block(container_name, teardown, rest_ips, port=443, **kwargs):
+        teardown.defer(lambda: unblock_read_counts.append(read_count[0]))
+
+    monkeypatch.setattr(harness, "block_mqtt_via_rest_allowlist", fake_block)
+    teardown = harness.BestEffortTeardown()
+
+    harness.scenario_forced_held_write(
+        container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+        make_executor=_ImmediateExecutor,
+    )
+
+    reads_before_held_line_seen = 3
+    assert unblock_read_counts == [reads_before_held_line_seen]
+
+
+def test_scenario_forced_held_write_unblocks_before_restoring_on_a_signal(monkeypatch):
+    container, swc_entity, current, calls = _forced_held_write_fixture(
+        monkeypatch,
+        staged_logs=[
+            "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
+            "Writing pool:swc via REST fallback\n",
+        ],
+    )
+    teardown = harness.BestEffortTeardown()
+
+    def fake_signal_during_held_wait(seconds):
+        teardown.run()
+        raise SystemExit(130)
+
+    with pytest.raises(SystemExit):
+        harness.scenario_forced_held_write(
+            container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+            make_executor=_ImmediateExecutor, held_wait_sleep=fake_signal_during_held_wait,
+        )
+
+    unblock_index = calls.index(("unblock", None, None))
+    restore_index = max(
+        i for i, c in enumerate(calls) if c[0] == "POST" and c[2].get("value") == 50
+    )
+    assert unblock_index < restore_index
+
+
+def test_scenario_forced_held_write_fails_when_original_state_is_non_numeric(monkeypatch):
+    container, swc_entity, current, calls = _forced_held_write_fixture(monkeypatch, staged_logs=[])
+    monkeypatch.setattr(harness, "get_entity_state", lambda token, entity_id: "unavailable")
+    teardown = harness.BestEffortTeardown()
+
+    with pytest.raises(harness.ScenarioFailure, match="unavailable"):
+        harness.scenario_forced_held_write(
+            container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+            make_executor=_ImmediateExecutor,
+        )
+
+    assert calls == []
+
+
+def test_scenario_forced_held_write_fails_when_the_restore_does_not_take(monkeypatch):
+    container, swc_entity, current, calls = _forced_held_write_fixture(
+        monkeypatch,
+        staged_logs=[
+            "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
+            "Writing pool:swc via REST fallback\n",
+            "Write pool:swc held behind cooldown: 40.0s remaining (post_write)\n",
+            "Write pool:swc woken early by MQTT reconnect\n",
+        ],
+    )
+    real_get_entity_state = harness.get_entity_state
+    reads_so_far = [0]
+
+    def get_entity_state_that_goes_unavailable_after_the_first_read(token, entity_id):
+        reads_so_far[0] += 1
+        if reads_so_far[0] == 1:
+            return real_get_entity_state(token, entity_id)
+        return "unavailable"
+
+    monkeypatch.setattr(harness, "get_entity_state", get_entity_state_that_goes_unavailable_after_the_first_read)
+    teardown = harness.BestEffortTeardown()
+
+    with pytest.raises(harness.ScenarioFailure, match=f"{swc_entity}.*unavailable"):
+        harness.scenario_forced_held_write(
+            container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+            make_executor=_ImmediateExecutor,
+        )
+
+
+def test_scenario_forced_held_write_fails_and_still_restores_when_early_wake_never_fires(monkeypatch):
+    container, swc_entity, current, calls = _forced_held_write_fixture(
+        monkeypatch,
+        staged_logs=[
+            "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
+            "Writing pool:swc via REST fallback\n",
+            "Write pool:swc held behind cooldown: 40.0s remaining (post_write)\n",
+            "Writing pool:swc via REST fallback\n",
+        ],
+    )
+    monkeypatch.setattr(harness, "POST_WRITE_COOLDOWN_SECONDS", 0.0)
+    teardown = harness.BestEffortTeardown()
+    clock = [0.0]
+
+    with pytest.raises(harness.ScenarioFailure, match="pool:swc"):
+        harness.scenario_forced_held_write(
+            container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+            make_executor=_ImmediateExecutor,
+            early_wake_now=lambda: clock[0], early_wake_sleep=lambda s: clock.__setitem__(0, clock[0] + s),
+        )
+
+    teardown.run()
+
+    assert current[0] == 50
+    assert ("unblock", None, None) in calls
+
+
+def test_scenario_forced_held_write_names_resumed_time_and_cooldown_left_on_early_wake_failure(monkeypatch):
+    container, swc_entity, current, calls = _forced_held_write_fixture(
+        monkeypatch,
+        staged_logs=[
+            "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
+            "Writing pool:swc via REST fallback\n",
+            "Write pool:swc held behind cooldown: 40.0s remaining (post_write)\n",
+            "2026-09-19 10:00:05.000 INFO (MainThread) [custom_components.exo_pool.mqtt_client] "
+            "MQTT connection resumed\n",
+        ],
+    )
+    monkeypatch.setattr(harness, "POST_WRITE_COOLDOWN_SECONDS", 10.0)
+    teardown = harness.BestEffortTeardown()
+    clock = [0.0]
+
+    def fake_sleep(seconds):
+        clock[0] += seconds
+
+    with pytest.raises(harness.ScenarioFailure, match=r"2026-09-19 10:00:05.*cooldown remained"):
+        harness.scenario_forced_held_write(
+            container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+            make_executor=_ImmediateExecutor,
+            early_wake_now=lambda: clock[0], early_wake_sleep=fake_sleep,
+        )
+
+
+def test_scenario_forced_held_write_ignores_a_held_line_for_a_different_key(monkeypatch):
+    container, swc_entity, current, calls = _forced_held_write_fixture(
+        monkeypatch,
+        staged_logs=[
+            "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
+            "Writing pool:swc via REST fallback\n",
+            "Write heating:sp held behind cooldown: 10.0s remaining (post_write)\n",
+            "Write pool:swc held behind cooldown: 40.0s remaining (post_write)\n",
+            "Write pool:swc woken early by MQTT reconnect\n",
+        ],
+    )
+    read_count = [0]
+    real_logs_since = container.logs_since
+
+    def counting_logs_since(since_iso):
+        read_count[0] += 1
+        return real_logs_since(since_iso)
+
+    container.logs_since = counting_logs_since
+    unblock_read_counts = []
+    calls.clear()
+
+    def fake_block(container_name, teardown, rest_ips, port=443, **kwargs):
+        teardown.defer(lambda: unblock_read_counts.append(read_count[0]))
+
+    monkeypatch.setattr(harness, "block_mqtt_via_rest_allowlist", fake_block)
+    teardown = harness.BestEffortTeardown()
+    clock = [0.0]
+
+    harness.scenario_forced_held_write(
+        container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+        make_executor=_ImmediateExecutor,
+        held_wait_now=lambda: clock[0], held_wait_sleep=lambda s: clock.__setitem__(0, clock[0] + s),
+        early_wake_now=lambda: clock[0], early_wake_sleep=lambda s: clock.__setitem__(0, clock[0] + s),
+    )
+
+    reads_before_correctly_keyed_held_line_seen = 4
+    assert unblock_read_counts == [reads_before_correctly_keyed_held_line_seen]
+
+
+def test_scenario_forced_held_write_fails_if_never_seen_held_before_unblocking(monkeypatch):
+    container, swc_entity, current, calls = _forced_held_write_fixture(
+        monkeypatch,
+        staged_logs=[
+            "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
+            "Writing pool:swc via REST fallback\n",
         ],
     )
     teardown = harness.BestEffortTeardown()
@@ -1259,7 +1491,7 @@ def test_scenario_forced_held_write_fails_if_never_seen_held_before_unblocking(m
             held_wait_now=fake_now, held_wait_sleep=fake_sleep,
         )
 
-    assert ("unblock", None, None) in calls  # cleaned up despite the failure
+    assert ("unblock", None, None) in calls
 
 
 def test_assert_mounted_code_is_loaded_raises_when_container_predates_newest_mtime(tmp_path):
@@ -1278,7 +1510,72 @@ def test_assert_mounted_code_is_loaded_raises_when_container_predates_newest_mti
     container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
 
     with pytest.raises(harness.StaleContainerError, match="docker restart ha-exo-pool-dev"):
-        harness.assert_mounted_code_is_loaded(container, runner=fake_runner)
+        harness.assert_mounted_code_is_loaded(container, expected_source=source_dir)
+
+
+def test_assert_mounted_code_is_loaded_does_not_raise_when_mount_is_fresh_and_matching(tmp_path):
+    source_dir = tmp_path / "exo_pool"
+    source_dir.mkdir()
+    older_mtime = datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp()
+    (source_dir / "api.py").write_text("# fine\n")
+    os.utime(source_dir / "api.py", (older_mtime, older_mtime))
+
+    def fake_runner(argv, **kwargs):
+        if "State.StartedAt" in argv[-2]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="2026-09-19T11:14:00.000000000Z\n", stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"{source_dir}\n", stderr="")
+
+    container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
+
+    harness.assert_mounted_code_is_loaded(container, expected_source=source_dir)
+
+
+def test_assert_mounted_code_is_loaded_raises_when_mount_does_not_match_expected_repo(tmp_path):
+    wrong_source = tmp_path / "other-checkout" / "exo_pool"
+    wrong_source.mkdir(parents=True)
+    (wrong_source / "api.py").write_text("# elsewhere\n")
+    expected_source = tmp_path / "this-checkout" / "exo_pool"
+
+    def fake_runner(argv, **kwargs):
+        if "State.StartedAt" in argv[-2]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="2026-09-19T11:14:00.000000000Z\n", stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"{wrong_source}\n", stderr="")
+
+    container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
+
+    with pytest.raises(harness.StaleContainerError, match=f"{re.escape(str(wrong_source))}.*{re.escape(str(expected_source))}"):
+        harness.assert_mounted_code_is_loaded(container, expected_source=expected_source)
+
+
+def test_parse_docker_timestamp_handles_no_fractional_seconds():
+    assert harness._parse_docker_timestamp("2026-09-19T06:40:31Z") == pytest.approx(
+        datetime(2026, 9, 19, 6, 40, 31, tzinfo=timezone.utc).timestamp()
+    )
+
+
+def test_container_mount_source_raises_when_destination_not_mounted():
+    def fake_runner(argv, **kwargs):
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="\n", stderr="")
+
+    container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
+
+    with pytest.raises(RuntimeError, match="/config/custom_components/exo_pool"):
+        container.mount_source("/config/custom_components/exo_pool")
+
+
+def test_assert_mounted_code_is_loaded_raises_when_no_py_files_found(tmp_path):
+    source_dir = tmp_path / "exo_pool"
+    source_dir.mkdir()
+
+    def fake_runner(argv, **kwargs):
+        if "State.StartedAt" in argv[-2]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="2026-09-19T11:14:00.000000000Z\n", stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"{source_dir}\n", stderr="")
+
+    container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
+
+    with pytest.raises(RuntimeError, match="no .py files"):
+        harness.assert_mounted_code_is_loaded(container, expected_source=source_dir)
 
 
 def test_best_effort_teardown_runs_all_actions_even_if_one_raises():
