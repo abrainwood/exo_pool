@@ -221,10 +221,11 @@ a simulated WAN outage - only ever against `ha-exo-pool-dev` on port 8125,
 never a live instance. It never calls an HA service: every HA API call
 goes through `_ha_request`, which allows only GETs and a POST to the
 config-entry reload path, raising before any request goes out for
-anything else. Container `exec` calls (network-namespace and `getent`
-work) aren't guarded the same way - they're scoped to
-iptables/ss/getent/docker-image commands only, never anything
-HA-facing. It runs four scenarios:
+anything else. `Container.exec` (and the netns sidecar's `docker run`)
+carry no such guard - they run whatever command they're given - but the
+only things this script ever asks them to do are read the HA log,
+manage iptables rules, and read/rewrite `/etc/hosts`. It runs four
+scenarios:
 
 - **reconnect-from-connected** (issue #2's actual reproduction): MQTT is
   connected, every one of its actual established peers is blocked (and
@@ -248,9 +249,13 @@ tested in `tests/test_api_write_manager_mqtt_throttle.py` instead of driven
 through this harness - it doesn't need a real device write to prove.
 `_ha_request`'s GET/reload-only allow-list is what keeps this harness from
 ever writing: `tests/test_verify_outage_reconnect.py` proves a write-service
-POST (and PUT/DELETE) never reach `urlopen`, that `urlopen` is called from
-nowhere but `_ha_request`, and that the script imports no alternate HTTP
-client that could route around it.
+POST (and PUT/DELETE) never reach `urlopen`, that the script imports
+exactly its expected set of modules (an allow-list, not a blocklist - any
+addition fails), and that `urlopen`/`build_opener`/`Request`/
+`HTTPConnection`/`HTTPSConnection` are named nowhere in the whole module
+except inside `_ha_request` itself - not just inside other functions, so a
+module-level call, a lambda, or an `async def` can't route around it
+either.
 
 Before any scenario runs, `assert_mounted_code_is_loaded()` checks the
 container against this checkout: that its mounted
