@@ -218,7 +218,7 @@ Regenerate it after changing `requirements-test.txt` with `make test-lock-regen`
 
 `scripts/verify_outage_reconnect.py` drives the running dev container through
 a simulated WAN outage - only ever against `ha-exo-pool-dev` on port 8125,
-never a live instance. It runs four scenarios:
+never a live instance. It runs five scenarios:
 
 - **reconnect-from-connected** (issue #2's actual reproduction): MQTT is
   connected, every one of its actual established peers is blocked (and
@@ -235,6 +235,34 @@ never a live instance. It runs four scenarios:
   `/etc/hosts` blackhole, while the config entry is reloaded - a different
   code path (setup, not the reconnect chain) - and pins what that does,
   including recovery once the outage clears.
+- **forced-held-write**: forces a write into its post-write cooldown while
+  MQTT is down at the same moment - the combination a 7-day soak never hit
+  on its own - and proves the write applies the instant MQTT reconnects
+  rather than waiting out the rest of the cooldown. Blocks by an
+  allow-list inversion, not a peer address or a blanket port: it resolves
+  the REST host from inside the container, drops every outbound connection
+  on 443, then re-allows just that host's resolved address. REST and MQTT
+  both use 443, so a blanket port block would also stop the forced-REST
+  write from landing, and a block on MQTT's own peer address doesn't hold -
+  AWS IoT's automatic reconnect can pick a fresh, unblocked address from
+  its rotating pool. Writes `number.swc_output` +1% - forced onto the REST
+  fallback path, which starts the cooldown - then writes -1% in the
+  background (that write's own service call blocks inside HA until it
+  applies, so it can't run on the main thread) and polls for the
+  held-behind-cooldown log line before unblocking. Unblocking then checks
+  the wake-up log line lands before the cooldown's own deadline would have,
+  and joins the background write to confirm it actually applied. The only
+  entity any scenario here writes to - always restored to its original
+  value in a `finally`, even if the scenario fails, since the dev container
+  talks to the live Zodiac cloud and this toggles real pool hardware.
+
+Before any scenario runs, `assert_mounted_code_is_loaded()` compares the
+container's `State.StartedAt` against the newest mtime under the mounted
+`custom_components/exo_pool/*.py`. Config-entry reloads re-run setup but
+never re-import Python modules, so a container that predates an edit keeps
+running the old code with no error - indistinguishable from a real
+regression until you notice the timestamps. Restart with
+`docker restart ha-exo-pool-dev` if this fires.
 
 Two blocking mechanisms, deliberately not unified: reconnect-from-connected
 and interrupt-resume-recovers block by address - read from the container's

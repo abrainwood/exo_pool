@@ -7,7 +7,9 @@ script's module docstring).
 """
 from __future__ import annotations
 
+import concurrent.futures
 import importlib.util
+import os
 import pathlib
 import subprocess
 import sys
@@ -694,6 +696,46 @@ def test_block_port_total_outage_rolls_back_when_undo_verification_fails():
     ]
 
 
+def test_block_mqtt_via_rest_allowlist_inserts_drop_then_accept_ahead_of_it():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv[-1])
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    teardown = harness.BestEffortTeardown()
+    harness.block_mqtt_via_rest_allowlist(
+        "ha-exo-pool-dev", teardown, rest_ips=["45.60.157.189"], port=443, runner=fake_runner,
+    )
+
+    assert calls == [
+        "iptables -I OUTPUT -p tcp --dport 443 -j DROP",
+        "iptables -L -n",
+        "iptables -I OUTPUT -d 45.60.157.189 -p tcp -j ACCEPT",
+    ]
+
+
+def test_block_mqtt_via_rest_allowlist_teardown_removes_accept_and_drop_rules():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv[-1])
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    teardown = harness.BestEffortTeardown()
+    harness.block_mqtt_via_rest_allowlist(
+        "ha-exo-pool-dev", teardown, rest_ips=["45.60.157.189"], port=443, runner=fake_runner,
+    )
+    calls.clear()
+
+    teardown.run()
+
+    assert sorted(calls) == sorted([
+        "iptables -D OUTPUT -d 45.60.157.189 -p tcp -j ACCEPT",
+        "iptables -D OUTPUT -p tcp --dport 443 -j DROP",
+    ])
+
+
 def test_ensure_harness_tools_image_skips_build_when_already_present():
     calls = []
 
@@ -829,6 +871,45 @@ def test_get_established_peer_ips_runs_ss_with_no_apk_install():
     assert calls[-1][-1] == "ss -tn state established"
 
 
+class _FakeExecContainer:
+    """Container stand-in whose exec() returns a canned CompletedProcess."""
+
+    def __init__(self, name, result):
+        self.name = name
+        self._result = result
+        self.calls = []
+
+    def exec(self, cmd, **kwargs):
+        self.calls.append(cmd)
+        return self._result
+
+
+def test_resolve_host_ips_parses_getent_hosts_output():
+    container = _FakeExecContainer(
+        "ha-exo-pool-dev",
+        subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="45.60.157.189     5dkmh5g.impervadns.net  5dkmh5g.impervadns.net prod.zodiac-io.com\n",
+            stderr="",
+        ),
+    )
+
+    ips = harness.resolve_host_ips(container, "prod.zodiac-io.com")
+
+    assert ips == ["45.60.157.189"]
+    assert container.calls == [["getent", "hosts", "prod.zodiac-io.com"]]
+
+
+def test_resolve_host_ips_raises_when_getent_fails():
+    container = _FakeExecContainer(
+        "ha-exo-pool-dev",
+        subprocess.CompletedProcess(args=[], returncode=2, stdout="", stderr="not found"),
+    )
+
+    with pytest.raises(RuntimeError, match="prod.zodiac-io.com"):
+        harness.resolve_host_ips(container, "prod.zodiac-io.com")
+
+
 def test_check_net_admin_capable_true_when_sidecar_iptables_succeeds():
     def fake_runner(*args, **kwargs):
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
@@ -862,6 +943,342 @@ def test_check_net_admin_capable_false_when_probe_fails_despite_image_present():
         return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="Operation not permitted")
 
     assert harness.check_net_admin_capable("ha-exo-pool-dev", runner=fake_runner) is False
+
+
+def test_resolve_swc_output_entity_id_picks_the_matching_number():
+    entity_ids = ["number.exo_pool_swc_low_output", "number.exo_pool_swc_output"]
+
+    resolved = harness.resolve_swc_output_entity_id(entity_ids)
+
+    assert resolved == "number.exo_pool_swc_output"
+
+
+def test_resolve_swc_output_entity_id_lists_exo_candidates_when_no_match():
+    entity_ids = ["sensor.exo_pool_temperature", "number.other_thing"]
+
+    with pytest.raises(harness.SwcOutputEntityResolutionError, match="sensor.exo_pool_temperature"):
+        harness.resolve_swc_output_entity_id(entity_ids)
+
+
+def test_resolve_swc_output_entity_id_rejects_multiple_matches():
+    entity_ids = ["number.exo_pool_swc_output", "number.exo_pool2_swc_output"]
+
+    with pytest.raises(
+        harness.SwcOutputEntityResolutionError,
+        match="number.exo_pool_swc_output.*number.exo_pool2_swc_output",
+    ):
+        harness.resolve_swc_output_entity_id(entity_ids)
+
+
+def test_matches_write_via_rest_fallback_true_for_matching_key():
+    log_text = (
+        "2026-09-19 10:00:00.100 INFO (MainThread) [custom_components.exo_pool.api] "
+        "Writing pool:swc via REST fallback\n"
+    )
+
+    assert harness.matches_write_via_rest_fallback(log_text, "pool:swc") is True
+
+
+def test_matches_write_via_rest_fallback_false_for_a_different_key():
+    log_text = (
+        "2026-09-19 10:00:00.100 INFO (MainThread) [custom_components.exo_pool.api] "
+        "Writing heating:sp via REST fallback\n"
+    )
+
+    assert harness.matches_write_via_rest_fallback(log_text, "pool:swc") is False
+
+
+def test_matches_write_held_true_for_matching_key():
+    log_text = (
+        "2026-09-19 10:00:05.100 INFO (MainThread) [custom_components.exo_pool.api] "
+        "Write pool:swc held behind cooldown: 42.0s remaining (post_write)\n"
+    )
+
+    assert harness.matches_write_held(log_text, "pool:swc") is True
+
+
+def test_matches_write_held_false_for_a_different_key():
+    log_text = (
+        "2026-09-19 10:00:05.100 INFO (MainThread) [custom_components.exo_pool.api] "
+        "Write heating:sp held behind cooldown: 42.0s remaining (post_write)\n"
+    )
+
+    assert harness.matches_write_held(log_text, "pool:swc") is False
+
+
+def test_matches_write_woken_early_true_for_matching_key():
+    log_text = (
+        "2026-09-19 10:00:20.100 INFO (MainThread) [custom_components.exo_pool.api] "
+        "Write pool:swc woken early by MQTT reconnect\n"
+    )
+
+    assert harness.matches_write_woken_early(log_text, "pool:swc") is True
+
+
+def test_matches_write_woken_early_false_for_a_different_key():
+    log_text = (
+        "2026-09-19 10:00:20.100 INFO (MainThread) [custom_components.exo_pool.api] "
+        "Write heating:sp woken early by MQTT reconnect\n"
+    )
+
+    assert harness.matches_write_woken_early(log_text, "pool:swc") is False
+
+
+def test_call_service_posts_entity_id_and_extra_data(monkeypatch):
+    calls = []
+
+    def fake_ha_request(method, path, token, data=None, timeout=10.0):
+        calls.append((method, path, token, data))
+
+    monkeypatch.setattr(harness, "_ha_request", fake_ha_request)
+
+    harness.call_service("tok", "number", "set_value", "number.exo_pool_swc_output", {"value": 46})
+
+    assert calls == [
+        ("POST", "/api/services/number/set_value", "tok", {"entity_id": "number.exo_pool_swc_output", "value": 46})
+    ]
+
+
+def test_call_service_uses_a_generous_timeout_for_a_write_that_falls_back_to_rest(monkeypatch):
+    calls = []
+
+    def fake_ha_request(method, path, token, data=None, timeout=10.0):
+        calls.append(timeout)
+
+    monkeypatch.setattr(harness, "_ha_request", fake_ha_request)
+
+    harness.call_service("tok", "number", "set_value", "number.exo_pool_swc_output", {"value": 46})
+
+    assert calls == [60.0]
+
+
+def test_set_number_value_calls_the_number_set_value_service(monkeypatch):
+    calls = []
+
+    def fake_call_service(token, domain, service, entity_id, data=None):
+        calls.append((token, domain, service, entity_id, data))
+
+    monkeypatch.setattr(harness, "call_service", fake_call_service)
+
+    harness.set_number_value("tok", "number.exo_pool_swc_output", 46)
+
+    assert calls == [("tok", "number", "set_value", "number.exo_pool_swc_output", {"value": 46})]
+
+
+class _FakeContainerLogs:
+    """Container stand-in whose logs_since() returns canned text per call."""
+
+    def __init__(self, name: str, texts: list[str]):
+        self.name = name
+        self._texts = iter(texts)
+        self._last = ""
+
+    def logs_since(self, since_iso: str) -> str:
+        try:
+            self._last = next(self._texts)
+        except StopIteration:
+            pass
+        return self._last
+
+
+def test_wait_for_early_wake_or_fail_returns_when_pattern_appears_before_deadline():
+    container = _FakeContainerLogs(
+        "ha-exo-pool-dev",
+        texts=[
+            "no match yet\n",
+            "Write pool:swc woken early by MQTT reconnect\n",
+        ],
+    )
+    clock = [0.0]
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    text = harness.wait_for_early_wake_or_fail(
+        container, "2026-09-19T10:00:00Z", deadline=100.0, key="pool:swc",
+        poll_interval=5.0, now=lambda: clock[0], sleep=fake_sleep,
+    )
+
+    assert "woken early" in text
+    assert sleeps == [5.0]
+
+
+def test_wait_for_early_wake_or_fail_rejects_a_write_that_only_waits_out_the_cooldown():
+    # A materially-simpler impl never wakes early: the write only applies
+    # once the cooldown elapses on its own, logged as a plain REST-fallback
+    # retry, never "woken early". Must fail at `deadline`, not keep polling
+    # past it and mistake that later line for success.
+    container = _FakeContainerLogs(
+        "ha-exo-pool-dev",
+        texts=["no match yet\n"] * 10 + ["Writing pool:swc via REST fallback\n"] * 10,
+    )
+    clock = [0.0]
+
+    def fake_sleep(seconds):
+        clock[0] += seconds
+
+    with pytest.raises(harness.ScenarioFailure, match="pool:swc"):
+        harness.wait_for_early_wake_or_fail(
+            container, "2026-09-19T10:00:00Z", deadline=10.0, key="pool:swc",
+            poll_interval=5.0, now=lambda: clock[0], sleep=fake_sleep,
+        )
+
+
+class _ImmediateExecutor:
+    """Executor stand-in that runs a submitted call synchronously and hands
+    back an already-resolved future - keeps the scenario's own choreography
+    (submit the second write, poll for "held", unblock, poll for the early
+    wake, then join) testable without a real thread or a real sleep anywhere."""
+
+    def submit(self, fn, *args, **kwargs):
+        future = concurrent.futures.Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    def shutdown(self, wait=True):
+        pass
+
+
+def _forced_held_write_fixture(monkeypatch, staged_logs):
+    """Wires the collaborators scenario_forced_held_write needs, without touching
+    docker or a live HA instance: entity state lives in `current`, every HA
+    REST call is recorded in `calls`, and the container's log reads step
+    through `staged_logs` in call order (sticking on the last one)."""
+    current = [50]
+    calls = []
+    swc_entity = "number.exo_pool_swc_output"
+
+    def fake_ha_request(method, path, token, data=None, timeout=10.0):
+        calls.append((method, path, data))
+        if method == "GET" and path == f"/api/states/{swc_entity}":
+            return {"state": str(current[0])}
+        if method == "POST" and path == "/api/services/number/set_value":
+            current[0] = data["value"]
+            return None
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    monkeypatch.setattr(harness, "_ha_request", fake_ha_request)
+    monkeypatch.setattr(harness, "check_net_admin_capable", lambda name: True)
+    monkeypatch.setattr(
+        harness, "ensure_scenario_precondition", lambda *a, **k: ["34.196.232.7"]
+    )
+    monkeypatch.setattr(harness, "resolve_host_ips", lambda container, hostname: ["45.60.157.189"])
+
+    def fake_block(container_name, teardown, rest_ips, port=443, **kwargs):
+        calls.append(("block", tuple(rest_ips), None))
+        teardown.defer(lambda: calls.append(("unblock", None, None)))
+
+    monkeypatch.setattr(harness, "block_mqtt_via_rest_allowlist", fake_block)
+
+    container = _FakeContainerLogs("ha-exo-pool-dev", staged_logs)
+    return container, swc_entity, current, calls
+
+
+def test_scenario_forced_held_write_wakes_early_and_restores_the_original_value(monkeypatch):
+    container, swc_entity, current, calls = _forced_held_write_fixture(
+        monkeypatch,
+        staged_logs=[
+            "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
+            "Writing pool:swc via REST fallback\n",
+            "Write pool:swc held behind cooldown: 40.0s remaining (post_write)\n",
+            "Write pool:swc woken early by MQTT reconnect\n",
+        ],
+    )
+    teardown = harness.BestEffortTeardown()
+
+    outcome = harness.scenario_forced_held_write(
+        container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+        make_executor=_ImmediateExecutor,
+    )
+
+    assert outcome is True
+    assert current[0] == 50
+    assert ("block", ("45.60.157.189",), None) in calls
+    assert ("unblock", None, None) in calls
+
+
+def test_scenario_forced_held_write_fails_and_still_restores_when_early_wake_never_fires(monkeypatch):
+    # A materially-simpler impl (just waits out the cooldown) never logs
+    # "woken early" - the scenario must fail rather than pass once its
+    # deadline is reached, and the original value must still be restored.
+    container, swc_entity, current, calls = _forced_held_write_fixture(
+        monkeypatch,
+        staged_logs=[
+            "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
+            "Writing pool:swc via REST fallback\n",
+            "Write pool:swc held behind cooldown: 40.0s remaining (post_write)\n",
+            "Writing pool:swc via REST fallback\n",  # cooldown elapsed, applied plainly
+        ],
+    )
+    monkeypatch.setattr(harness, "POST_WRITE_COOLDOWN_SECONDS", 0.0)
+    teardown = harness.BestEffortTeardown()
+
+    with pytest.raises(harness.ScenarioFailure, match="pool:swc"):
+        harness.scenario_forced_held_write(
+            container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+            make_executor=_ImmediateExecutor,
+        )
+
+    teardown.run()  # main() always runs the shared teardown in its own outer finally
+
+    assert current[0] == 50
+    assert ("unblock", None, None) in calls
+
+
+def test_scenario_forced_held_write_fails_if_never_seen_held_before_unblocking(monkeypatch):
+    # The call-then-poll bug this scenario used to have: an impl that moves
+    # on to unblocking without ever having observed "held behind cooldown"
+    # for the second write must fail loudly, not silently accept whatever
+    # that write ends up doing.
+    container, swc_entity, current, calls = _forced_held_write_fixture(
+        monkeypatch,
+        staged_logs=[
+            "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
+            "Writing pool:swc via REST fallback\n",
+            # No "held behind cooldown" line ever appears for the second write.
+        ],
+    )
+    teardown = harness.BestEffortTeardown()
+    clock = [0.0]
+
+    def fake_now():
+        return clock[0]
+
+    def fake_sleep(seconds):
+        clock[0] += seconds
+
+    with pytest.raises(harness.ScenarioFailure, match="held behind cooldown"):
+        harness.scenario_forced_held_write(
+            container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+            make_executor=_ImmediateExecutor,
+            held_wait_now=fake_now, held_wait_sleep=fake_sleep,
+        )
+
+    assert ("unblock", None, None) in calls  # cleaned up despite the failure
+
+
+def test_assert_mounted_code_is_loaded_raises_when_container_predates_newest_mtime(tmp_path):
+    source_dir = tmp_path / "exo_pool"
+    source_dir.mkdir()
+    edited_after_start = source_dir / "api.py"
+    edited_after_start.write_text("# edited after the container started\n")
+    newer_mtime = 1_800_000_100.0
+    os.utime(edited_after_start, (newer_mtime, newer_mtime))
+
+    def fake_runner(argv, **kwargs):
+        if "State.StartedAt" in argv[-2]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="2026-09-11T11:14:00.000000000Z\n", stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"{source_dir}\n", stderr="")
+
+    container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
+
+    with pytest.raises(harness.StaleContainerError, match="docker restart ha-exo-pool-dev"):
+        harness.assert_mounted_code_is_loaded(container, runner=fake_runner)
 
 
 def test_best_effort_teardown_runs_all_actions_even_if_one_raises():
