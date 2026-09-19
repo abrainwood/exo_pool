@@ -279,7 +279,7 @@ def start_docker() -> None:
 
     print("Starting HA container...")
     subprocess.run(
-        ["docker", "compose", "-f", "docker-compose.dev.yml", "up", "-d"],
+        ["docker", "compose", "-p", "exo_pool", "-f", "docker-compose.dev.yml", "up", "-d"],
         capture_output=True,
     )
 
