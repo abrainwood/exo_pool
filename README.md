@@ -218,7 +218,8 @@ Regenerate it after changing `requirements-test.txt` with `make test-lock-regen`
 
 `scripts/verify_outage_reconnect.py` drives the running dev container through
 a simulated WAN outage - only ever against `ha-exo-pool-dev` on port 8125,
-never a live instance. It runs five scenarios:
+never a live instance. It never writes to any entity - only reads state and
+blocks/unblocks network traffic. It runs four scenarios:
 
 - **reconnect-from-connected** (issue #2's actual reproduction): MQTT is
   connected, every one of its actual established peers is blocked (and
@@ -235,33 +236,16 @@ never a live instance. It runs five scenarios:
   `/etc/hosts` blackhole, while the config entry is reloaded - a different
   code path (setup, not the reconnect chain) - and pins what that does,
   including recovery once the outage clears.
-- **forced-held-write**: forces a write into its post-write cooldown while
-  MQTT is down at the same moment - the combination a 7-day soak never hit
-  on its own - and proves the write applies the instant MQTT reconnects
-  rather than waiting out the rest of the cooldown. Blocks by an
-  allow-list inversion, not a peer address or a blanket port: it resolves
-  the REST host from inside the container, drops every outbound connection
-  on 443, then re-allows just that host's resolved address. REST and MQTT
-  both use 443, so a blanket port block would also stop the forced-REST
-  write from landing, and a block on MQTT's own peer address doesn't hold -
-  AWS IoT's automatic reconnect can pick a fresh, unblocked address from
-  its rotating pool. Writes `number.swc_output` +1% - forced onto the REST
-  fallback path, which starts the cooldown - then writes -1% in the
-  background (that write's own service call blocks inside HA until it
-  applies, so it can't run on the main thread) and polls for the
-  held-behind-cooldown log line before unblocking. Unblocking then checks
-  the wake-up log line lands before the cooldown's own deadline would have,
-  and joins the background write to confirm it actually applied. Writes
-  `number.swc_output` 1% away from its current value, in whichever
-  direction stays inside range - down at the max, up everywhere else. The
-  only entity any scenario here writes to - restoring it is deferred onto
-  the teardown stack (so Ctrl+C still restores it) and, on the normal path,
-  called directly so a failed restore raises rather than reporting PASS.
-  Restoring writes the original value, forces a real device refresh via
-  `homeassistant.update_entity`, and re-reads the state - `set_pool_value`
-  sets HA's state optimistically ahead of the actual cloud write (see
-  api.py's `_apply_desired_update`), so reading straight back after the
-  write could show success on a write the device never applied.
+
+The #12 early-wake-on-reconnect behaviour (a held write retries the instant
+MQTT reconnects rather than waiting out the rest of its cooldown) is unit
+tested in `tests/test_api_write_manager_mqtt_throttle.py` instead of driven
+through this harness - it doesn't need a real device write to prove, and an
+earlier version of this harness that did force one against the dev
+container's real chlorinator left it stuck off-target for hours. This
+harness makes no writes to any entity, ever; a source-scan test in
+`tests/test_verify_outage_reconnect.py` fails if a write service call is
+ever reintroduced.
 
 Before any scenario runs, `assert_mounted_code_is_loaded()` checks the
 container against this checkout: that its mounted

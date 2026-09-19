@@ -14,7 +14,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import ipaddress
 import json
 import logging
@@ -36,14 +35,6 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from custom_components.exo_pool.api import (  # noqa: E402
-    DATA_URL_TEMPLATE,
-    POST_WRITE_COOLDOWN_SECONDS,
-    WRITE_HELD_BEHIND_COOLDOWN_LOG,
-    WRITE_VIA_REST_FALLBACK_LOG,
-    WRITE_WOKEN_EARLY_LOG,
-)
-from custom_components.exo_pool.number import ExoPoolSwcOutputNumber  # noqa: E402
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -222,66 +213,6 @@ def matches_transport_reconnected(log_text: str) -> bool:
     return bool(_TRANSPORT_RECONNECTED_RE.search(log_text))
 
 
-_LOG_FORMAT_TOKEN_RE = re.compile(r"%\.1fs|%s")
-
-
-def _pattern_from_log_format(fmt: str) -> re.Pattern:
-    """Build a search regex from an api.py `_LOGGER.info` %-style format string,
-    keyed on its first %s (always `item.key`) so the two stay in lockstep."""
-    parts = []
-    key_captured = False
-    pos = 0
-    for m in _LOG_FORMAT_TOKEN_RE.finditer(fmt):
-        parts.append(re.escape(fmt[pos:m.start()]))
-        if m.group() == "%s" and not key_captured:
-            parts.append(r"(?P<key>\S+)")
-            key_captured = True
-        elif m.group() == "%s":
-            parts.append(r"\S+")
-        else:
-            parts.append(r"[\d.]+s")
-        pos = m.end()
-    parts.append(re.escape(fmt[pos:]))
-    return re.compile("".join(parts))
-
-
-_WRITE_REST_FALLBACK_RE = _pattern_from_log_format(WRITE_VIA_REST_FALLBACK_LOG)
-_WRITE_HELD_RE = _pattern_from_log_format(WRITE_HELD_BEHIND_COOLDOWN_LOG)
-_WRITE_WOKEN_EARLY_RE = _pattern_from_log_format(WRITE_WOKEN_EARLY_LOG)
-
-
-def matches_write_via_rest_fallback(log_text: str, key: str) -> bool:
-    return any(m.group("key") == key for m in _WRITE_REST_FALLBACK_RE.finditer(log_text))
-
-
-def matches_write_held(log_text: str, key: str) -> bool:
-    return any(m.group("key") == key for m in _WRITE_HELD_RE.finditer(log_text))
-
-
-def matches_write_woken_early(log_text: str, key: str) -> bool:
-    return any(m.group("key") == key for m in _WRITE_WOKEN_EARLY_RE.finditer(log_text))
-
-
-def wait_for_early_wake_or_fail(
-    container: Container,
-    since: str,
-    deadline: float,
-    key: str,
-    poll_interval: float = 3.0,
-    now: Callable[[], float] = time.monotonic,
-    sleep: Callable[[float], None] = lambda s: time.sleep(s),
-) -> str:
-    """Poll for `key`'s early-wake log line, failing the instant `deadline` passes."""
-    while True:
-        text = container.logs_since(since)
-        if matches_write_woken_early(text, key):
-            return text
-        if now() >= deadline:
-            raise ScenarioFailure(
-                f"'{key}' was not woken early by MQTT reconnect before its cooldown "
-                f"deadline ({now() - deadline:.1f}s past)"
-            )
-        sleep(poll_interval)
 
 
 # --- Teardown (unit tested) ----------------------------------------------
@@ -536,36 +467,6 @@ def resolve_mqtt_entity_id(entity_ids: list[str]) -> str:
     )
 
 
-# --- SWC-output entity resolution (unit tested) ---------------------------
-
-NUMBER_ENTITY_DOMAIN = "number."
-SWC_OUTPUT_ENTITY_SUFFIX = "swc_output"
-
-
-class SwcOutputEntityResolutionError(RuntimeError):
-    """Raised when the exo_pool SWC-output number entity can't be uniquely resolved."""
-
-
-def resolve_swc_output_entity_id(entity_ids: list[str]) -> str:
-    """Pick the `number.*swc_output` entity out of `entity_ids` (see resolve_mqtt_entity_id)."""
-    matches = [
-        eid for eid in entity_ids
-        if eid.startswith(NUMBER_ENTITY_DOMAIN) and eid.endswith(SWC_OUTPUT_ENTITY_SUFFIX)
-    ]
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        exo_candidates = [eid for eid in entity_ids if "exo" in eid]
-        raise SwcOutputEntityResolutionError(
-            f"no {NUMBER_ENTITY_DOMAIN}*{SWC_OUTPUT_ENTITY_SUFFIX} entity found; "
-            f"exo-matching entities seen: {exo_candidates or 'none'}"
-        )
-    raise SwcOutputEntityResolutionError(
-        f"expected exactly one {NUMBER_ENTITY_DOMAIN}*{SWC_OUTPUT_ENTITY_SUFFIX} entity, "
-        f"found {len(matches)}: {matches}"
-    )
-
-
 # --- HA REST API -------------------------------------------------------
 
 
@@ -605,19 +506,6 @@ def _ha_request(method: str, path: str, token: str, data: dict | None = None, ti
 def get_entity_state(token: str, entity_id: str) -> str:
     state = _ha_request("GET", f"/api/states/{entity_id}", token)
     return state["state"]
-
-
-SERVICE_CALL_TIMEOUT_MARGIN_SECONDS = 15.0
-SERVICE_CALL_TIMEOUT = POST_WRITE_COOLDOWN_SECONDS + SERVICE_CALL_TIMEOUT_MARGIN_SECONDS
-
-
-def call_service(token: str, domain: str, service: str, entity_id: str, data: dict | None = None) -> None:
-    body = {"entity_id": entity_id, **(data or {})}
-    _ha_request("POST", f"/api/services/{domain}/{service}", token, data=body, timeout=SERVICE_CALL_TIMEOUT)
-
-
-def set_number_value(token: str, entity_id: str, value: float) -> None:
-    call_service(token, "number", "set_value", entity_id, {"value": value})
 
 
 def list_entity_ids(token: str) -> list[str]:
@@ -767,11 +655,6 @@ def iptables_rule_shell_cmd(ip: str, flag: str) -> str:
     never depends on a network it might itself be cutting.
     """
     return f"iptables {flag} OUTPUT -d {ip} -p tcp -j DROP"
-
-
-def accept_ip_shell_cmd(ip: str, flag: str) -> str:
-    """flag is '-I' to insert an ACCEPT rule for `ip` ahead of a blanket DROP, '-D' to remove it."""
-    return f"iptables {flag} OUTPUT -d {ip} -p tcp -j ACCEPT"
 
 
 def port_block_shell_cmd(flag: str, port: int) -> str:
@@ -1012,29 +895,6 @@ def block_port_total_outage(
             f"could not verify the port-{port} block can be undone "
             f"(sidecar iptables -L -n failed) - rolled back: {verify.stderr}"
         )
-
-
-def _remove_accept_rule(container_name: str, ip: str, runner: Callable[..., subprocess.CompletedProcess]) -> None:
-    result = run_netns_sidecar(container_name, accept_ip_shell_cmd(ip, "-D"), runner=runner)
-    if result.returncode != 0:
-        raise RuntimeError(f"failed to remove ACCEPT rule for {ip}: {result.stderr}")
-
-
-def block_mqtt_via_rest_allowlist(
-    container_name: str,
-    teardown: BestEffortTeardown,
-    rest_ips: list[str],
-    port: int = 443,
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-) -> None:
-    """Cut off every outbound connection on `port` except `rest_ips`, deferring each rule's removal onto `teardown`."""
-    block_port_total_outage(container_name, teardown, port=port, runner=runner)
-    for ip in rest_ips:
-        add_accept = run_netns_sidecar(container_name, accept_ip_shell_cmd(ip, "-I"), runner=runner)
-        if add_accept.returncode != 0:
-            raise RuntimeError(f"failed to add ACCEPT rule for {ip}: {add_accept.stderr}")
-        teardown.defer(lambda ip=ip: _remove_accept_rule(container_name, ip, runner))
-    print(f"Blocked outbound TCP port {port} except {rest_ips} via netns sidecar")
 
 
 # --- Scenario precondition (unit tested) -----------------------------------
@@ -1484,174 +1344,6 @@ def scenario_watchdog(container: Container, token: str, teardown: BestEffortTear
     return True
 
 
-# item.key for a `set_pool_value(hass, entry, "swc", ...)` write - see
-# number.py's ExoPoolSwcOutputNumber.async_set_native_value.
-WRITE_KEY_SWC_OUTPUT = "pool:swc"
-
-REST_HOST = urlparse(DATA_URL_TEMPLATE).hostname
-
-# HA's Entity backs _attr_* with a cached_property that only resolves on an
-# instance, not the class - object.__new__ skips __init__'s ConfigEntry/
-# coordinator args, which this constant has no need of.
-SWC_OUTPUT_MAX = object.__new__(ExoPoolSwcOutputNumber)._attr_native_max_value
-
-CONNECTION_INTERRUPT_TIMEOUT = 60.0
-HELD_WAIT_MARGIN_SECONDS = 25.0
-HELD_WAIT_TIMEOUT = POST_WRITE_COOLDOWN_SECONDS - HELD_WAIT_MARGIN_SECONDS
-
-
-def _resumed_diagnostic(log_text: str) -> str:
-    match = _CONNECTION_RESUMED_RE.search(log_text)
-    if not match:
-        return "MQTT connection resumed never appeared in the logs"
-    line_start = log_text.rfind("\n", 0, match.start()) + 1
-    ts_match = _LOG_LINE_TS_RE.match(log_text[line_start:])
-    when = ts_match.group(1) if ts_match else "unknown time"
-    return f"MQTT connection resumed at {when}"
-
-
-def _verify_restored(token: str, entity_id: str, original_value: int) -> str | None:
-    """Writes `entity_id` back to `original_value`, forces a real device
-    refresh - HA's own state is set optimistically ahead of the cloud write,
-    see api.py's _apply_desired_update - and verifies the refreshed value.
-    None on match, else a message naming both.
-    """
-    set_number_value(token, entity_id, original_value)
-    call_service(token, "homeassistant", "update_entity", entity_id)
-    state = get_entity_state(token, entity_id)
-    try:
-        current_value = int(float(state))
-    except (TypeError, ValueError):
-        return f"{entity_id} restore check failed: state is {state!r}, not numeric"
-    if current_value != original_value:
-        return f"{entity_id} did not return to its original value {original_value} (got {current_value})"
-    return None
-
-
-def scenario_forced_held_write(
-    container: Container, token: str, teardown: BestEffortTeardown, entry_id: str,
-    mqtt_entity: str, swc_entity: str,
-    make_executor: Callable[[], concurrent.futures.Executor] = (
-        lambda: concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    ),
-    held_wait_now: Callable[[], float] = time.monotonic,
-    held_wait_sleep: Callable[[float], None] = time.sleep,
-    early_wake_now: Callable[[], float] = time.monotonic,
-    early_wake_sleep: Callable[[float], None] = time.sleep,
-) -> bool | None:
-    """Forces a write to be held behind its post-write cooldown while MQTT is
-    down, then proves it applies the instant MQTT reconnects rather than
-    waiting out the rest of the cooldown - the path a 7-day soak never hit,
-    since it needs both conditions at once. Returns True on pass, None if
-    skipped (no NET_ADMIN for the allow-list block).
-    """
-    if not check_net_admin_capable(container.name):
-        print(
-            "SKIP forced-held-write: could not run iptables against the dev "
-            "container's network via a netns sidecar - cannot force a write "
-            "into its post-write cooldown while MQTT is unreachable. Needs "
-            "`docker run` access and network access to pull the sidecar "
-            "image and its iptables package."
-        )
-        return None
-
-    ensure_scenario_precondition(token, entry_id, mqtt_entity, container.name)
-    rest_ips = resolve_host_ips(container, REST_HOST)
-
-    state = get_entity_state(token, swc_entity)
-    try:
-        original_value = int(float(state))
-    except (TypeError, ValueError):
-        raise ScenarioFailure(f"{swc_entity} has a non-numeric state ({state!r}) - cannot force a write")
-
-    write1_target = original_value - 1 if original_value >= SWC_OUTPUT_MAX else original_value + 1
-
-    teardown.defer(lambda: set_number_value(token, swc_entity, original_value))
-    block_teardown = BestEffortTeardown()
-    teardown.defer(block_teardown.run)
-
-    since = now_utc_iso()
-    executor = make_executor()
-    since_write2 = since
-    second_write: concurrent.futures.Future | None = None
-    deadline = 0.0
-    unblock_at = 0.0
-    scenario_error: Exception | None = None
-    try:
-        block_mqtt_via_rest_allowlist(container.name, block_teardown, rest_ips=rest_ips)
-
-        wait_for_log_pattern(
-            container, _CONNECTION_INTERRUPTED_RE, since,
-            timeout=CONNECTION_INTERRUPT_TIMEOUT, label="connection interrupt",
-        )
-        print("PASS MQTT connection interrupted - now unreachable")
-
-        set_number_value(token, swc_entity, write1_target)
-        deadline = early_wake_now() + POST_WRITE_COOLDOWN_SECONDS
-
-        if not matches_write_via_rest_fallback(container.logs_since(since), WRITE_KEY_SWC_OUTPUT):
-            raise ScenarioFailure(
-                f"the first write for {WRITE_KEY_SWC_OUTPUT} did not go via REST fallback - "
-                "no cooldown was started, so the held-write scenario can't be forced"
-            )
-        print(f"PASS first write via REST fallback: cooldown started for {WRITE_KEY_SWC_OUTPUT}")
-
-        since_write2 = now_utc_iso()
-        second_write = executor.submit(set_number_value, token, swc_entity, original_value)
-
-        wait_for_log_pattern(
-            container, lambda text: matches_write_held(text, WRITE_KEY_SWC_OUTPUT), since_write2,
-            timeout=HELD_WAIT_TIMEOUT,
-            label=f"'{WRITE_KEY_SWC_OUTPUT}' held behind cooldown",
-            now=held_wait_now, sleep=held_wait_sleep,
-        )
-        print(f"PASS second write held behind cooldown: {WRITE_KEY_SWC_OUTPUT}")
-    except Exception as exc:
-        scenario_error = exc
-    finally:
-        unblock_at = early_wake_now()
-        block_teardown.run()
-        executor.shutdown(wait=True)
-
-    if scenario_error is None:
-        try:
-            wait_for_early_wake_or_fail(
-                container, since_write2, deadline, key=WRITE_KEY_SWC_OUTPUT,
-                now=early_wake_now, sleep=early_wake_sleep,
-            )
-            print(f"PASS woken early by MQTT reconnect before cooldown deadline: {WRITE_KEY_SWC_OUTPUT}")
-            second_write.result(timeout=SERVICE_CALL_TIMEOUT)
-        except Exception as exc:
-            try:
-                cooldown_left = deadline - unblock_at
-                diagnostic = _resumed_diagnostic(container.logs_since(since_write2))
-                scenario_error = ScenarioFailure(
-                    f"{exc} ({diagnostic}; {cooldown_left:.1f}s of cooldown remained when unblocked)"
-                )
-            except Exception:
-                scenario_error = ScenarioFailure(str(exc))
-
-    teardown.run()
-    try:
-        restore_error = _verify_restored(token, swc_entity, original_value)
-    except Exception as restore_exc:
-        if scenario_error is not None:
-            raise ScenarioFailure(
-                f"{scenario_error}; additionally, restore raised: {restore_exc}"
-            ) from scenario_error
-        raise
-
-    if scenario_error is not None:
-        if restore_error is not None:
-            raise ScenarioFailure(f"{scenario_error}; additionally, {restore_error}") from scenario_error
-        raise scenario_error
-    if restore_error is not None:
-        raise ScenarioFailure(restore_error)
-
-    print(f"PASS restore: {swc_entity} back at its original value ({original_value})")
-    return True
-
-
 # --- Entry point -------------------------------------------------------
 
 
@@ -1680,9 +1372,8 @@ def main() -> int:
     try:
         entity_ids = list_entity_ids(token)
         mqtt_entity = resolve_mqtt_entity_id(entity_ids)
-        swc_entity = resolve_swc_output_entity_id(entity_ids)
         entry_id = get_exo_pool_entry_id(token)
-    except (MqttEntityResolutionError, SwcOutputEntityResolutionError, RuntimeError) as e:
+    except (MqttEntityResolutionError, RuntimeError) as e:
         print(f"FATAL: could not resolve the exo_pool entity/entry: {e}")
         return 1
 
@@ -1760,15 +1451,6 @@ def main() -> int:
                 )
             except SCENARIO_EXCEPTIONS as e:
                 results["watchdog"] = f"FAIL: {e}"
-        _recover_between_scenarios()
-
-        try:
-            outcome = scenario_forced_held_write(container, token, teardown, entry_id, mqtt_entity, swc_entity)
-            results["forced_held_write"] = "PASS" if outcome else (
-                "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
-            )
-        except SCENARIO_EXCEPTIONS as e:
-            results["forced_held_write"] = f"FAIL: {e}"
     finally:
         teardown.run()
         if _ensure_recovered(token, entry_id, mqtt_entity):
