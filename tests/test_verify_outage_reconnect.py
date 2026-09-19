@@ -895,7 +895,6 @@ def test_get_established_peer_ips_runs_ss_with_no_apk_install():
 
 
 class _FakeExecContainer:
-
     def __init__(self, name, result):
         self.name = name
         self._result = result
@@ -1063,6 +1062,12 @@ def test_matches_write_held_false_for_a_different_key():
     assert harness.matches_write_held(log_text, "pool:swc") is False
 
 
+def test_matches_write_held_matches_the_log_format_constant_itself():
+    log_text = harness.WRITE_HELD_BEHIND_COOLDOWN_LOG % ("pool:swc", 40.0, "post_write")
+
+    assert harness.matches_write_held(log_text, "pool:swc") is True
+
+
 def test_matches_write_woken_early_true_for_matching_key():
     log_text = (
         "2026-09-19 10:00:20.100 INFO (MainThread) [custom_components.exo_pool.api] "
@@ -1106,7 +1111,7 @@ def test_call_service_uses_a_generous_timeout_for_a_write_that_falls_back_to_res
 
     harness.call_service("tok", "number", "set_value", "number.exo_pool_swc_output", {"value": 46})
 
-    assert calls == [60.0]
+    assert calls == [harness.SERVICE_CALL_TIMEOUT]
 
 
 def test_set_number_value_calls_the_number_set_value_service(monkeypatch):
@@ -1202,6 +1207,8 @@ def _forced_held_write_fixture(monkeypatch, staged_logs, original_value=50):
         if method == "POST" and path == "/api/services/number/set_value":
             current[0] = data["value"]
             return None
+        if method == "POST" and path == "/api/services/homeassistant/update_entity":
+            return None
         raise AssertionError(f"unexpected request {method} {path}")
 
     monkeypatch.setattr(harness, "_ha_request", fake_ha_request)
@@ -1242,8 +1249,91 @@ def test_scenario_forced_held_write_wakes_early_and_restores_the_original_value(
     assert current[0] == 50
     assert ("block", ("45.60.157.189",), None) in calls
     assert ("unblock", None, None) in calls
-    posted_values = [data["value"] for method, path, data in calls if method == "POST"]
+    posted_values = [data["value"] for method, path, data in calls if path == "/api/services/number/set_value"]
     assert posted_values[:2] == [51, 50]
+
+
+def test_scenario_forced_held_write_catches_a_restore_the_optimistic_state_would_hide(monkeypatch):
+    swc_entity = "number.exo_pool_swc_output"
+    optimistic_state = [50]
+    device_actual = [50]
+    calls = []
+
+    def fake_ha_request(method, path, token, data=None, timeout=10.0):
+        calls.append((method, path, data))
+        if method == "GET" and path == f"/api/states/{swc_entity}":
+            return {"state": str(optimistic_state[0])}
+        if method == "POST" and path == "/api/services/number/set_value":
+            optimistic_state[0] = data["value"]
+            return None
+        if method == "POST" and path == "/api/services/homeassistant/update_entity":
+            optimistic_state[0] = device_actual[0]
+            return None
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    monkeypatch.setattr(harness, "_ha_request", fake_ha_request)
+    monkeypatch.setattr(harness, "check_net_admin_capable", lambda name: True)
+    monkeypatch.setattr(harness, "ensure_scenario_precondition", lambda *a, **k: ["34.196.232.7"])
+    monkeypatch.setattr(harness, "resolve_host_ips", lambda container, hostname: ["45.60.157.189"])
+
+    def fake_block(container_name, teardown, rest_ips, port=443, **kwargs):
+        teardown.defer(lambda: calls.append(("unblock", None, None)))
+
+    monkeypatch.setattr(harness, "block_mqtt_via_rest_allowlist", fake_block)
+
+    container = _FakeContainerLogs(
+        "ha-exo-pool-dev",
+        texts=[
+            "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
+            "Writing pool:swc via REST fallback\n",
+            "Write pool:swc held behind cooldown: 40.0s remaining (post_write)\n",
+            "Write pool:swc woken early by MQTT reconnect\n",
+        ],
+    )
+    teardown = harness.BestEffortTeardown()
+    device_actual_value_the_cloud_write_never_applied = 51
+    device_actual[0] = device_actual_value_the_cloud_write_never_applied
+
+    with pytest.raises(harness.ScenarioFailure, match="did not return to its original value"):
+        harness.scenario_forced_held_write(
+            container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+            make_executor=_ImmediateExecutor,
+        )
+
+    assert ("POST", "/api/services/homeassistant/update_entity", {"entity_id": swc_entity}) in calls
+
+
+def test_scenario_forced_held_write_fails_when_first_write_does_not_go_via_rest_fallback(monkeypatch):
+    container, swc_entity, current, calls = _forced_held_write_fixture(
+        monkeypatch,
+        staged_logs=[
+            "MQTT connection interrupted: AWS_ERROR_MQTT_TIMEOUT\n",
+            "MQTT connected - REST fallback interval set to 3600s\n",  # published via MQTT, not REST
+        ],
+    )
+    teardown = harness.BestEffortTeardown()
+
+    with pytest.raises(harness.ScenarioFailure, match="did not go via REST fallback"):
+        harness.scenario_forced_held_write(
+            container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+            make_executor=_ImmediateExecutor,
+        )
+
+    assert ("unblock", None, None) in calls
+
+
+def test_scenario_forced_held_write_skips_when_not_net_admin_capable(monkeypatch):
+    container, swc_entity, current, calls = _forced_held_write_fixture(monkeypatch, staged_logs=[])
+    monkeypatch.setattr(harness, "check_net_admin_capable", lambda name: False)
+    teardown = harness.BestEffortTeardown()
+
+    outcome = harness.scenario_forced_held_write(
+        container, "tok", teardown, "entry1", "binary_sensor.exo_pool_mqtt_connected", swc_entity,
+        make_executor=_ImmediateExecutor,
+    )
+
+    assert outcome is None
+    assert calls == []
 
 
 def test_scenario_forced_held_write_first_write_points_away_from_the_upper_bound(monkeypatch):
@@ -1264,7 +1354,7 @@ def test_scenario_forced_held_write_first_write_points_away_from_the_upper_bound
         make_executor=_ImmediateExecutor,
     )
 
-    posted_values = [data["value"] for method, path, data in calls if method == "POST"]
+    posted_values = [data["value"] for method, path, data in calls if path == "/api/services/number/set_value"]
     assert posted_values[:2] == [99, 100]
 
 
@@ -1343,6 +1433,16 @@ def test_scenario_forced_held_write_fails_when_original_state_is_non_numeric(mon
         )
 
     assert calls == []
+
+
+def test_verify_restored_names_the_original_and_refreshed_values_on_mismatch(monkeypatch):
+    monkeypatch.setattr(harness, "set_number_value", lambda token, entity_id, value: None)
+    monkeypatch.setattr(harness, "call_service", lambda *a, **k: None)
+    monkeypatch.setattr(harness, "get_entity_state", lambda token, entity_id: "51")
+
+    message = harness._verify_restored("tok", "number.exo_pool_swc_output", 50)
+
+    assert message == "number.exo_pool_swc_output did not return to its original value 50 (got 51)"
 
 
 def test_scenario_forced_held_write_fails_when_the_restore_does_not_take(monkeypatch):
@@ -1509,7 +1609,7 @@ def test_assert_mounted_code_is_loaded_raises_when_container_predates_newest_mti
 
     container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
 
-    with pytest.raises(harness.StaleContainerError, match="docker restart ha-exo-pool-dev"):
+    with pytest.raises(harness.MountedCodeError, match="docker restart ha-exo-pool-dev"):
         harness.assert_mounted_code_is_loaded(container, expected_source=source_dir)
 
 
@@ -1543,7 +1643,7 @@ def test_assert_mounted_code_is_loaded_raises_when_mount_does_not_match_expected
 
     container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
 
-    with pytest.raises(harness.StaleContainerError, match=f"{re.escape(str(wrong_source))}.*{re.escape(str(expected_source))}"):
+    with pytest.raises(harness.MountedCodeError, match=f"{re.escape(str(wrong_source))}.*{re.escape(str(expected_source))}"):
         harness.assert_mounted_code_is_loaded(container, expected_source=expected_source)
 
 

@@ -43,6 +43,7 @@ from custom_components.exo_pool.api import (  # noqa: E402
     WRITE_VIA_REST_FALLBACK_LOG,
     WRITE_WOKEN_EARLY_LOG,
 )
+from custom_components.exo_pool.number import ExoPoolSwcOutputNumber  # noqa: E402
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -67,8 +68,9 @@ class NotDevInstanceError(Exception):
     """Raised when the target URL is not confirmed to be the dev container."""
 
 
-class StaleContainerError(Exception):
-    """Raised when a container's process predates its own mounted code."""
+class MountedCodeError(Exception):
+    """Raised when a container's mounted exo_pool code isn't this repo's, or
+    predates its own last edit."""
 
 
 MOUNTED_EXO_POOL_DESTINATION = "/config/custom_components/exo_pool"
@@ -328,6 +330,11 @@ class ScenarioFailure(Exception):
     """Raised when a scenario's assertion doesn't hold."""
 
 
+# A scenario or the preflight guard failing this way is a FAIL line in
+# main()'s summary, not a traceback.
+SCENARIO_EXCEPTIONS = (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError)
+
+
 # --- Container control -----------------------------------------------------
 
 
@@ -425,7 +432,7 @@ def assert_mounted_code_is_loaded(
     started_at = container.started_at()
     source_dir = pathlib.Path(container.mount_source(mounted_destination))
     if source_dir.resolve() != expected_source.resolve():
-        raise StaleContainerError(
+        raise MountedCodeError(
             f"{container.name} mounts {source_dir} at {mounted_destination}, not "
             f"this repo's {expected_source} - point the dev container at this "
             "checkout before running scenarios."
@@ -435,7 +442,7 @@ def assert_mounted_code_is_loaded(
         raise RuntimeError(f"no .py files found under {source_dir}")
     newest_mtime = max(p.stat().st_mtime for p in py_files)
     if newest_mtime > started_at:
-        raise StaleContainerError(
+        raise MountedCodeError(
             f"{container.name} started at {_epoch_to_iso(started_at)} but {source_dir} "
             f"has code modified at {_epoch_to_iso(newest_mtime)} - restart the dev "
             f"container (`docker restart {container.name}`) before running scenarios."
@@ -1483,8 +1490,10 @@ WRITE_KEY_SWC_OUTPUT = "pool:swc"
 
 REST_HOST = urlparse(DATA_URL_TEMPLATE).hostname
 
-# Mirrors number.py's ExoPoolSwcOutputNumber._attr_native_max_value.
-SWC_OUTPUT_MAX = 100
+# HA's Entity backs _attr_* with a cached_property that only resolves on an
+# instance, not the class - object.__new__ skips __init__'s ConfigEntry/
+# coordinator args, which this constant has no need of.
+SWC_OUTPUT_MAX = object.__new__(ExoPoolSwcOutputNumber)._attr_native_max_value
 
 CONNECTION_INTERRUPT_TIMEOUT = 60.0
 HELD_WAIT_MARGIN_SECONDS = 25.0
@@ -1502,7 +1511,13 @@ def _resumed_diagnostic(log_text: str) -> str:
 
 
 def _verify_restored(token: str, entity_id: str, original_value: int) -> str | None:
-    """None if `entity_id` reads back as `original_value`, else a message naming both."""
+    """Writes `entity_id` back to `original_value`, forces a real device
+    refresh - HA's own state is set optimistically ahead of the cloud write,
+    see api.py's _apply_desired_update - and verifies the refreshed value.
+    None on match, else a message naming both.
+    """
+    set_number_value(token, entity_id, original_value)
+    call_service(token, "homeassistant", "update_entity", entity_id)
     state = get_entity_state(token, entity_id)
     try:
         current_value = int(float(state))
@@ -1607,14 +1622,24 @@ def scenario_forced_held_write(
             print(f"PASS woken early by MQTT reconnect before cooldown deadline: {WRITE_KEY_SWC_OUTPUT}")
             second_write.result(timeout=SERVICE_CALL_TIMEOUT)
         except Exception as exc:
-            cooldown_left = deadline - unblock_at
-            diagnostic = _resumed_diagnostic(container.logs_since(since_write2))
-            scenario_error = ScenarioFailure(
-                f"{exc} ({diagnostic}; {cooldown_left:.1f}s of cooldown remained when unblocked)"
-            )
+            try:
+                cooldown_left = deadline - unblock_at
+                diagnostic = _resumed_diagnostic(container.logs_since(since_write2))
+                scenario_error = ScenarioFailure(
+                    f"{exc} ({diagnostic}; {cooldown_left:.1f}s of cooldown remained when unblocked)"
+                )
+            except Exception:
+                scenario_error = ScenarioFailure(str(exc))
 
     teardown.run()
-    restore_error = _verify_restored(token, swc_entity, original_value)
+    try:
+        restore_error = _verify_restored(token, swc_entity, original_value)
+    except Exception as restore_exc:
+        if scenario_error is not None:
+            raise ScenarioFailure(
+                f"{scenario_error}; additionally, restore raised: {restore_exc}"
+            ) from scenario_error
+        raise
 
     if scenario_error is not None:
         if restore_error is not None:
@@ -1646,7 +1671,7 @@ def main() -> int:
 
     try:
         assert_mounted_code_is_loaded(container)
-    except (StaleContainerError, RuntimeError) as e:
+    except (MountedCodeError, RuntimeError) as e:
         print(f"FATAL: {e}")
         return 1
 
@@ -1694,7 +1719,7 @@ def main() -> int:
         try:
             scenario_baseline(token, entry_id, mqtt_entity, container)
             results["baseline"] = "PASS"
-        except (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError) as e:
+        except SCENARIO_EXCEPTIONS as e:
             results["baseline"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1703,7 +1728,7 @@ def main() -> int:
             results["reconnect_from_connected"] = "PASS" if outcome else (
                 "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
             )
-        except (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError) as e:
+        except SCENARIO_EXCEPTIONS as e:
             results["reconnect_from_connected"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1712,7 +1737,7 @@ def main() -> int:
             results["interrupt_resume_recovers"] = "PASS" if outcome else (
                 "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
             )
-        except (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError) as e:
+        except SCENARIO_EXCEPTIONS as e:
             results["interrupt_resume_recovers"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1721,7 +1746,7 @@ def main() -> int:
             results["setup_under_outage"] = "PASS" if outcome else (
                 "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
             )
-        except (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError) as e:
+        except SCENARIO_EXCEPTIONS as e:
             results["setup_under_outage"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1733,7 +1758,7 @@ def main() -> int:
                 results["watchdog"] = "PASS" if outcome else (
                     "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
                 )
-            except (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError) as e:
+            except SCENARIO_EXCEPTIONS as e:
                 results["watchdog"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1742,7 +1767,7 @@ def main() -> int:
             results["forced_held_write"] = "PASS" if outcome else (
                 "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
             )
-        except (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError) as e:
+        except SCENARIO_EXCEPTIONS as e:
             results["forced_held_write"] = f"FAIL: {e}"
     finally:
         teardown.run()
