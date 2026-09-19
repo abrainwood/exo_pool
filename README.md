@@ -251,18 +251,31 @@ never a live instance. It runs five scenarios:
   applies, so it can't run on the main thread) and polls for the
   held-behind-cooldown log line before unblocking. Unblocking then checks
   the wake-up log line lands before the cooldown's own deadline would have,
-  and joins the background write to confirm it actually applied. The only
-  entity any scenario here writes to - always restored to its original
-  value in a `finally`, even if the scenario fails, since the dev container
-  talks to the live Zodiac cloud and this toggles real pool hardware.
+  and joins the background write to confirm it actually applied. Writes
+  `number.swc_output` 1% away from its current value, in whichever
+  direction stays inside range - down at the max, up everywhere else. The
+  only entity any scenario here writes to - restoring it is deferred onto
+  the teardown stack (so Ctrl+C still restores it) and, on the normal path,
+  called directly so a failed restore raises rather than reporting PASS.
+  Restoring writes the original value, forces a real device refresh via
+  `homeassistant.update_entity`, and re-reads the state - `set_pool_value`
+  sets HA's state optimistically ahead of the actual cloud write (see
+  api.py's `_apply_desired_update`), so reading straight back after the
+  write could show success on a write the device never applied.
 
-Before any scenario runs, `assert_mounted_code_is_loaded()` compares the
-container's `State.StartedAt` against the newest mtime under the mounted
-`custom_components/exo_pool/*.py`. Config-entry reloads re-run setup but
-never re-import Python modules, so a container that predates an edit keeps
-running the old code with no error - indistinguishable from a real
-regression until you notice the timestamps. Restart with
-`docker restart ha-exo-pool-dev` if this fires.
+Before any scenario runs, `assert_mounted_code_is_loaded()` checks the
+container against this checkout: that its mounted
+`custom_components/exo_pool` resolves to this repo's copy (not some other
+checkout's), and that `State.StartedAt` postdates the newest mtime under
+it. Config-entry reloads re-run setup but never re-import Python modules,
+so a container that predates an edit - or mounts a different checkout
+entirely - keeps running the old code with no error, indistinguishable
+from a real regression until you notice the mismatch. Run this script from
+the same checkout `docker-compose.dev.yml` mounts into `ha-exo-pool-dev`;
+if the mount points elsewhere, repoint it with
+`docker compose -p exo_pool -f docker-compose.dev.yml up -d --force-recreate`
+run from the checkout you want mounted. Restart with
+`docker restart ha-exo-pool-dev` if only the staleness check fires.
 
 Two blocking mechanisms, deliberately not unified: reconnect-from-connected
 and interrupt-resume-recovers block by address - read from the container's
