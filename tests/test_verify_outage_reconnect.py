@@ -33,28 +33,73 @@ def _load_harness_module():
 harness = _load_harness_module()
 
 
-def test_urlopen_is_called_only_inside_ha_request():
-    tree = ast.parse(_SCRIPT_PATH.read_text())
-    callers = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            for call in ast.walk(node):
-                if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "urlopen":
-                    callers.append(node.name)
+_ALLOWED_IMPORTS = {
+    "__future__", "__future__.annotations",
+    "argparse",
+    "ipaddress",
+    "json",
+    "logging",
+    "os",
+    "pathlib",
+    "re",
+    "signal",
+    "subprocess",
+    "sys",
+    "time",
+    "urllib.error",
+    "urllib.request",
+    "dataclasses", "dataclasses.dataclass",
+    "datetime", "datetime.datetime", "datetime.timezone",
+    "typing", "typing.Callable",
+    "urllib.parse", "urllib.parse.urlparse",
+}
 
-    assert callers == ["_ha_request"]
 
-
-def test_harness_source_imports_no_alternate_http_client():
-    tree = ast.parse(_SCRIPT_PATH.read_text())
-    imported = set()
+def _imported_names(tree: ast.Module) -> set[str]:
+    """Every module named by an import, plus `module.name` for each `from module import name`."""
+    names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names)
+            names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module)
+            names.add(node.module)
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return names
 
-    assert not imported & {"http.client", "requests", "aiohttp"}
+
+def test_harness_source_imports_exactly_the_expected_modules():
+    tree = ast.parse(_SCRIPT_PATH.read_text())
+
+    assert _imported_names(tree) == _ALLOWED_IMPORTS
+
+
+_FORBIDDEN_HTTP_NAMES = {
+    "urlopen", "build_opener", "OpenerDirector", "Request", "HTTPConnection", "HTTPSConnection",
+}
+
+
+def test_forbidden_http_names_are_used_only_inside_ha_request():
+    tree = ast.parse(_SCRIPT_PATH.read_text())
+    ha_request = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_ha_request"
+    )
+    allowed = {id(n) for n in ast.walk(ha_request)}
+
+    violations = [
+        (node.id if isinstance(node, ast.Name) else node.attr)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Name, ast.Attribute))
+        and (node.id if isinstance(node, ast.Name) else node.attr) in _FORBIDDEN_HTTP_NAMES
+        and id(node) not in allowed
+    ]
+    import_froms_urllib_request = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "urllib.request"
+    ]
+
+    assert violations == []
+    assert import_froms_urllib_request == []
 
 
 def test_parse_retry_attempts_extracts_attempt_and_delay():
