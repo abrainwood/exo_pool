@@ -387,6 +387,24 @@ def test_ha_request_rejects_put_and_delete_without_touching_the_network(monkeypa
         harness._ha_request("DELETE", "/api/states/number.exo_pool_swc_output", "token")
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/config/config_entries/entry/x?a=/reload",
+        "/api/config/config_entries/entry/../reload",
+        "/api/config/config_entries/entry/abc123/reload\n",
+    ],
+)
+def test_ha_request_rejects_a_reload_path_that_isnt_exactly_that_shape(monkeypatch, path):
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("urlopen must not be called for a disallowed request")
+
+    monkeypatch.setattr(harness.urllib.request, "urlopen", _fail_if_called)
+
+    with pytest.raises(harness.DisallowedHaRequestError):
+        harness._ha_request("POST", path, "token")
+
+
 def test_select_established_peer_ips_extracts_a_public_443_peer():
     ss_output = (
         "State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\n"
