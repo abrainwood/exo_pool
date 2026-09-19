@@ -33,25 +33,8 @@ def _load_harness_module():
 harness = _load_harness_module()
 
 
-_ALLOWED_IMPORTS = {
-    "__future__", "__future__.annotations",
-    "argparse",
-    "ipaddress",
-    "json",
-    "logging",
-    "os",
-    "pathlib",
-    "re",
-    "signal",
-    "subprocess",
-    "sys",
-    "time",
-    "urllib.error",
-    "urllib.request",
-    "dataclasses", "dataclasses.dataclass",
-    "datetime", "datetime.datetime", "datetime.timezone",
-    "typing", "typing.Callable",
-    "urllib.parse", "urllib.parse.urlparse",
+_DENIED_IMPORTS = {
+    "http", "http.client", "socket", "ssl", "requests", "aiohttp", "httpx", "urllib3",
 }
 
 
@@ -67,10 +50,15 @@ def _imported_names(tree: ast.Module) -> set[str]:
     return names
 
 
-def test_harness_source_imports_exactly_the_expected_modules():
+def test_harness_source_imports_no_alternate_http_stack():
     tree = ast.parse(_SCRIPT_PATH.read_text())
+    imports_from_urllib_request = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "urllib.request"
+    ]
 
-    assert _imported_names(tree) == _ALLOWED_IMPORTS
+    assert not _imported_names(tree) & _DENIED_IMPORTS
+    assert imports_from_urllib_request == []
 
 
 _FORBIDDEN_HTTP_NAMES = {

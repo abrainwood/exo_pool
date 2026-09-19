@@ -249,13 +249,15 @@ tested in `tests/test_api_write_manager_mqtt_throttle.py` instead of driven
 through this harness - it doesn't need a real device write to prove.
 `_ha_request`'s GET/reload-only allow-list is what keeps this harness from
 ever writing: `tests/test_verify_outage_reconnect.py` proves a write-service
-POST (and PUT/DELETE) never reach `urlopen`, that the script imports
-exactly its expected set of modules (an allow-list, not a blocklist - any
-addition fails), and that `urlopen`/`build_opener`/`Request`/
-`HTTPConnection`/`HTTPSConnection` are named nowhere in the whole module
-except inside `_ha_request` itself - not just inside other functions, so a
-module-level call, a lambda, or an `async def` can't route around it
-either.
+POST (and PUT/DELETE) never reach `urlopen`, that the script imports none
+of http/http.client/socket/ssl/requests/aiohttp/httpx/urllib3 (a denylist,
+so an unrelated new import like `itertools` doesn't fail it), and that
+`urlopen`/`build_opener`/`Request`/`HTTPConnection`/`HTTPSConnection` are
+named nowhere in the whole module except inside `_ha_request` itself - not
+just inside other functions. These guards catch accidental reintroduction
+of a device write; deliberate evasion (a string-built `getattr`, a
+host-side `subprocess` shelling out to `curl`, a container `exec`) is out
+of scope for them.
 
 Before any scenario runs, `assert_mounted_code_is_loaded()` checks the
 container against this checkout: that its mounted
