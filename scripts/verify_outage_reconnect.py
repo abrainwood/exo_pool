@@ -488,7 +488,18 @@ def load_ha_token() -> str:
     )
 
 
+class DisallowedHaRequestError(RuntimeError):
+    """Raised when _ha_request is asked for anything but a GET or a config-entry reload POST."""
+
+
+_ALLOWED_RELOAD_PATH_RE = re.compile(r"^/api/config/config_entries/entry/[^/]+/reload$")
+
+
 def _ha_request(method: str, path: str, token: str, data: dict | None = None, timeout: float = 10.0) -> dict | list | None:
+    if method != "GET" and not (method == "POST" and _ALLOWED_RELOAD_PATH_RE.match(path)):
+        raise DisallowedHaRequestError(
+            f"refusing {method} {path} - only GET and a config-entry reload POST are allowed"
+        )
     url = f"{HA_URL}{path}"
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(

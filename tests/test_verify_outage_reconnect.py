@@ -7,6 +7,7 @@ script's module docstring).
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 import pathlib
@@ -31,13 +32,29 @@ def _load_harness_module():
 
 harness = _load_harness_module()
 
-_FORBIDDEN_WRITE_SERVICE_RE = re.compile(r"[\"'](?:set_value|turn_on|turn_off|select_option|set_temperature)[\"']")
+
+def test_urlopen_is_called_only_inside_ha_request():
+    tree = ast.parse(_SCRIPT_PATH.read_text())
+    callers = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for call in ast.walk(node):
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "urlopen":
+                    callers.append(node.name)
+
+    assert callers == ["_ha_request"]
 
 
-def test_harness_source_never_references_a_write_service():
-    source = _SCRIPT_PATH.read_text()
+def test_harness_source_imports_no_alternate_http_client():
+    tree = ast.parse(_SCRIPT_PATH.read_text())
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
 
-    assert not _FORBIDDEN_WRITE_SERVICE_RE.search(source)
+    assert not imported & {"http.client", "requests", "aiohttp"}
 
 
 def test_parse_retry_attempts_extracts_attempt_and_delay():
@@ -285,6 +302,44 @@ def test_reload_entry_lets_a_non_timeout_url_error_propagate(monkeypatch):
 
     with pytest.raises(urllib.error.URLError):
         harness.reload_entry("token", "entry123")
+
+
+def test_ha_request_rejects_a_write_service_post_without_touching_the_network(monkeypatch):
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("urlopen must not be called for a disallowed request")
+
+    monkeypatch.setattr(harness.urllib.request, "urlopen", _fail_if_called)
+
+    with pytest.raises(harness.DisallowedHaRequestError):
+        harness._ha_request("POST", "/api/services/number/set_value", "token", data={"entity_id": "x"})
+
+
+def test_ha_request_allows_a_config_entry_reload_post(monkeypatch):
+    class _FakeResponse:
+        def read(self):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(harness.urllib.request, "urlopen", lambda *a, **k: _FakeResponse())
+
+    harness._ha_request("POST", "/api/config/config_entries/entry/abc123/reload", "token")
+
+
+def test_ha_request_rejects_put_and_delete_without_touching_the_network(monkeypatch):
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("urlopen must not be called for a disallowed request")
+
+    monkeypatch.setattr(harness.urllib.request, "urlopen", _fail_if_called)
+
+    with pytest.raises(harness.DisallowedHaRequestError):
+        harness._ha_request("PUT", "/api/states/number.exo_pool_swc_output", "token")
+    with pytest.raises(harness.DisallowedHaRequestError):
+        harness._ha_request("DELETE", "/api/states/number.exo_pool_swc_output", "token")
 
 
 def test_select_established_peer_ips_extracts_a_public_443_peer():
