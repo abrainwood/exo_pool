@@ -119,6 +119,9 @@ MIN_REQUEST_INTERVAL = 5.0
 DEBOUNCED_REFRESH_DELAY = 30.0
 WRITE_GAP_SECONDS = 8.0
 POST_WRITE_COOLDOWN_SECONDS = 45.0
+WRITE_HELD_BEHIND_COOLDOWN_LOG = "Write %s held behind cooldown: %.1fs remaining (%s)"
+WRITE_WOKEN_EARLY_LOG = "Write %s woken early by MQTT reconnect"
+WRITE_VIA_REST_FALLBACK_LOG = "Writing %s via REST fallback"
 NO_READ_WINDOW_SECONDS = 30.0
 MIN_REFRESH_GUARD_SECONDS = 120.0
 SCHEDULE_REFRESH_DELAY = 180.0
@@ -1012,7 +1015,7 @@ async def _execute_write(
         _record_pending_writes(hass, entry, [], desired, extra_seconds=cooldown)
         store = _get_entry_store(hass, entry)
         _LOGGER.info(
-            "Write %s held behind cooldown: %.1fs remaining (%s)",
+            WRITE_HELD_BEHIND_COOLDOWN_LOG,
             item.key,
             cooldown,
             store.get("cooldown_reason", "unknown"),
@@ -1024,11 +1027,11 @@ async def _execute_write(
             raise
         if _try_mqtt(hass, entry, item, desired):
             if outcome is CooldownWait.RECONNECTED:
-                _LOGGER.info("Write %s woken early by MQTT reconnect", item.key)
+                _LOGGER.info(WRITE_WOKEN_EARLY_LOG, item.key)
             return Transport.MQTT
 
     _record_pending_writes(hass, entry, [], desired)
-    _LOGGER.info("Writing %s via REST fallback", item.key)
+    _LOGGER.info(WRITE_VIA_REST_FALLBACK_LOG, item.key)
     try:
         await _execute_write_rest(hass, entry, item, desired)
     except (Exception, asyncio.CancelledError):
