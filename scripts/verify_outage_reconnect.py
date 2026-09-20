@@ -18,6 +18,7 @@ import ipaddress
 import json
 import logging
 import os
+import pathlib
 import re
 import signal
 import subprocess
@@ -26,8 +27,11 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Callable
 from urllib.parse import urlparse
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +54,14 @@ class HaLogUnavailableError(Exception):
 
 class NotDevInstanceError(Exception):
     """Raised when the target URL is not confirmed to be the dev container."""
+
+
+class MountedCodeError(Exception):
+    """Raised when a container's mounted exo_pool code isn't this repo's, or
+    predates its own last edit."""
+
+
+MOUNTED_EXO_POOL_DESTINATION = "/config/custom_components/exo_pool"
 
 
 def assert_dev_instance_url(url: str) -> None:
@@ -244,6 +256,9 @@ class ScenarioFailure(Exception):
     """Raised when a scenario's assertion doesn't hold."""
 
 
+SCENARIO_EXCEPTIONS = (ScenarioFailure, AssertionError, RuntimeError, urllib.error.URLError, TimeoutError)
+
+
 # --- Container control -----------------------------------------------------
 
 
@@ -270,6 +285,26 @@ class Container:
             docker_cmd, input=input_text, capture_output=True, text=True, timeout=timeout,
         )
 
+    def started_at(self) -> float:
+        result = self._runner(
+            ["docker", "inspect", "-f", "{{.State.StartedAt}}", self.name],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"could not inspect {self.name}: {result.stderr.strip()}")
+        return _parse_docker_timestamp(result.stdout.strip())
+
+    def mount_source(self, destination: str) -> str:
+        fmt = f'{{{{range .Mounts}}}}{{{{if eq .Destination "{destination}"}}}}{{{{.Source}}}}{{{{end}}}}{{{{end}}}}'
+        result = self._runner(
+            ["docker", "inspect", "--format", fmt, self.name],
+            capture_output=True, text=True, timeout=10,
+        )
+        source = result.stdout.strip()
+        if result.returncode != 0 or not source:
+            raise RuntimeError(f"{self.name} has no mount at {destination}: {result.stderr.strip()}")
+        return source
+
     def logs_since(self, since_iso: str) -> str:
         """Read HA_LOG_PATH inside the container, filtered to lines since `since_iso`.
 
@@ -286,6 +321,50 @@ class Container:
                 f"could not read {HA_LOG_PATH} in {self.name}: {result.stderr.strip()}"
             )
         return filter_log_lines_since(result.stdout, since_iso)
+
+
+def _parse_docker_timestamp(value: str) -> float:
+    """Parse a `docker inspect` RFC3339 timestamp (nanosecond fraction) to a Unix epoch float."""
+    if "." in value:
+        whole, frac_and_zone = value.split(".", 1)
+        frac = frac_and_zone.rstrip("Z")[:6]
+        value = f"{whole}.{frac}+00:00"
+    else:
+        value = value.rstrip("Z") + "+00:00"
+    return datetime.fromisoformat(value).timestamp()
+
+
+def _epoch_to_iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+
+EXPECTED_EXO_POOL_SOURCE = _REPO_ROOT / "custom_components" / "exo_pool"
+
+
+def assert_mounted_code_is_loaded(
+    container: Container,
+    mounted_destination: str = MOUNTED_EXO_POOL_DESTINATION,
+    expected_source: pathlib.Path = EXPECTED_EXO_POOL_SOURCE,
+) -> None:
+    """Fail loudly if `container` mounts the wrong checkout, or predates its own mounted code."""
+    started_at = container.started_at()
+    source_dir = pathlib.Path(container.mount_source(mounted_destination))
+    if source_dir.resolve() != expected_source.resolve():
+        raise MountedCodeError(
+            f"{container.name} mounts {source_dir} at {mounted_destination}, not "
+            f"this repo's {expected_source} - point the dev container at this "
+            "checkout before running scenarios."
+        )
+    py_files = sorted(source_dir.glob("*.py"))
+    if not py_files:
+        raise RuntimeError(f"no .py files found under {source_dir}")
+    newest_mtime = max(p.stat().st_mtime for p in py_files)
+    if newest_mtime > started_at:
+        raise MountedCodeError(
+            f"{container.name} started at {_epoch_to_iso(started_at)} but {source_dir} "
+            f"has code modified at {_epoch_to_iso(newest_mtime)} - restart the dev "
+            f"container (`docker restart {container.name}`) before running scenarios."
+        )
 
 
 def should_print_tick(elapsed: float, last_print: float | None, print_interval: float) -> bool:
@@ -392,7 +471,18 @@ def load_ha_token() -> str:
     )
 
 
+class DisallowedHaRequestError(RuntimeError):
+    """Raised when _ha_request is asked for anything but a GET or a config-entry reload POST."""
+
+
+_ALLOWED_RELOAD_PATH_RE = re.compile(r"/api/config/config_entries/entry/[0-9A-Za-z]+/reload")
+
+
 def _ha_request(method: str, path: str, token: str, data: dict | None = None, timeout: float = 10.0) -> dict | list | None:
+    if method != "GET" and not (method == "POST" and _ALLOWED_RELOAD_PATH_RE.fullmatch(path)):
+        raise DisallowedHaRequestError(
+            f"refusing {method} {path} - only GET and a config-entry reload POST are allowed"
+        )
     url = f"{HA_URL}{path}"
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(
@@ -1243,6 +1333,12 @@ def main() -> int:
         print(f"FATAL: container {CONTAINER_NAME!r} is not running. Run `make dev` first.")
         return 1
 
+    try:
+        assert_mounted_code_is_loaded(container)
+    except (MountedCodeError, RuntimeError) as e:
+        print(f"FATAL: {e}")
+        return 1
+
     token = load_ha_token()
 
     try:
@@ -1285,7 +1381,7 @@ def main() -> int:
         try:
             scenario_baseline(token, entry_id, mqtt_entity, container)
             results["baseline"] = "PASS"
-        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+        except SCENARIO_EXCEPTIONS as e:
             results["baseline"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1294,7 +1390,7 @@ def main() -> int:
             results["reconnect_from_connected"] = "PASS" if outcome else (
                 "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
             )
-        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+        except SCENARIO_EXCEPTIONS as e:
             results["reconnect_from_connected"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1303,7 +1399,7 @@ def main() -> int:
             results["interrupt_resume_recovers"] = "PASS" if outcome else (
                 "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
             )
-        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+        except SCENARIO_EXCEPTIONS as e:
             results["interrupt_resume_recovers"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1312,7 +1408,7 @@ def main() -> int:
             results["setup_under_outage"] = "PASS" if outcome else (
                 "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
             )
-        except (ScenarioFailure, AssertionError, RuntimeError) as e:
+        except SCENARIO_EXCEPTIONS as e:
             results["setup_under_outage"] = f"FAIL: {e}"
         _recover_between_scenarios()
 
@@ -1324,7 +1420,7 @@ def main() -> int:
                 results["watchdog"] = "PASS" if outcome else (
                     "SKIP (no NET_ADMIN)" if outcome is None else "FAIL"
                 )
-            except (ScenarioFailure, AssertionError, RuntimeError) as e:
+            except SCENARIO_EXCEPTIONS as e:
                 results["watchdog"] = f"FAIL: {e}"
     finally:
         teardown.run()

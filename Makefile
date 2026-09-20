@@ -33,11 +33,11 @@ lint-dup:
 # --- Dev environment ---
 
 dev:
-	docker compose -f docker-compose.dev.yml up -d
+	docker compose -p exo_pool -f docker-compose.dev.yml up -d
 	python3 scripts/dev-setup.py
 
 stop:
-	docker compose -f docker-compose.dev.yml down
+	docker compose -p exo_pool -f docker-compose.dev.yml down
 
 logs:
 	docker logs ha-exo-pool-dev -f --tail 50

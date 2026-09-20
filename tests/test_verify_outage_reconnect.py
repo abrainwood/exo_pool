@@ -7,10 +7,14 @@ script's module docstring).
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
+import os
 import pathlib
+import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -27,6 +31,63 @@ def _load_harness_module():
 
 
 harness = _load_harness_module()
+
+
+_DENIED_IMPORTS = {
+    "http", "http.client", "socket", "ssl", "requests", "aiohttp", "httpx", "urllib3",
+}
+
+
+def _imported_names(tree: ast.Module) -> set[str]:
+    """Every module named by an import, plus `module.name` for each `from module import name`."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return names
+
+
+def test_harness_source_imports_no_alternate_http_stack():
+    tree = ast.parse(_SCRIPT_PATH.read_text())
+    imports_from_urllib_request = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "urllib.request"
+    ]
+
+    assert not _imported_names(tree) & _DENIED_IMPORTS
+    assert imports_from_urllib_request == []
+
+
+_FORBIDDEN_HTTP_NAMES = {
+    "urlopen", "build_opener", "OpenerDirector", "Request", "HTTPConnection", "HTTPSConnection",
+}
+
+
+def test_forbidden_http_names_are_used_only_inside_ha_request():
+    tree = ast.parse(_SCRIPT_PATH.read_text())
+    ha_request = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_ha_request"
+    )
+    allowed = {id(n) for n in ast.walk(ha_request)}
+
+    violations = [
+        (node.id if isinstance(node, ast.Name) else node.attr)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Name, ast.Attribute))
+        and (node.id if isinstance(node, ast.Name) else node.attr) in _FORBIDDEN_HTTP_NAMES
+        and id(node) not in allowed
+    ]
+    import_froms_urllib_request = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "urllib.request"
+    ]
+
+    assert violations == []
+    assert import_froms_urllib_request == []
 
 
 def test_parse_retry_attempts_extracts_attempt_and_delay():
@@ -274,6 +335,62 @@ def test_reload_entry_lets_a_non_timeout_url_error_propagate(monkeypatch):
 
     with pytest.raises(urllib.error.URLError):
         harness.reload_entry("token", "entry123")
+
+
+def test_ha_request_rejects_a_write_service_post_without_touching_the_network(monkeypatch):
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("urlopen must not be called for a disallowed request")
+
+    monkeypatch.setattr(harness.urllib.request, "urlopen", _fail_if_called)
+
+    with pytest.raises(harness.DisallowedHaRequestError):
+        harness._ha_request("POST", "/api/services/number/set_value", "token", data={"entity_id": "x"})
+
+
+def test_ha_request_allows_a_config_entry_reload_post(monkeypatch):
+    class _FakeResponse:
+        def read(self):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(harness.urllib.request, "urlopen", lambda *a, **k: _FakeResponse())
+
+    harness._ha_request("POST", "/api/config/config_entries/entry/abc123/reload", "token")
+
+
+def test_ha_request_rejects_put_and_delete_without_touching_the_network(monkeypatch):
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("urlopen must not be called for a disallowed request")
+
+    monkeypatch.setattr(harness.urllib.request, "urlopen", _fail_if_called)
+
+    with pytest.raises(harness.DisallowedHaRequestError):
+        harness._ha_request("PUT", "/api/states/number.exo_pool_swc_output", "token")
+    with pytest.raises(harness.DisallowedHaRequestError):
+        harness._ha_request("DELETE", "/api/states/number.exo_pool_swc_output", "token")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/config/config_entries/entry/x?a=/reload",
+        "/api/config/config_entries/entry/../reload",
+        "/api/config/config_entries/entry/abc123/reload\n",
+    ],
+)
+def test_ha_request_rejects_a_reload_path_that_isnt_exactly_that_shape(monkeypatch, path):
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("urlopen must not be called for a disallowed request")
+
+    monkeypatch.setattr(harness.urllib.request, "urlopen", _fail_if_called)
+
+    with pytest.raises(harness.DisallowedHaRequestError):
+        harness._ha_request("POST", path, "token")
 
 
 def test_select_established_peer_ips_extracts_a_public_443_peer():
@@ -862,6 +979,90 @@ def test_check_net_admin_capable_false_when_probe_fails_despite_image_present():
         return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="Operation not permitted")
 
     assert harness.check_net_admin_capable("ha-exo-pool-dev", runner=fake_runner) is False
+
+
+def test_assert_mounted_code_is_loaded_raises_when_container_predates_newest_mtime(tmp_path):
+    source_dir = tmp_path / "exo_pool"
+    source_dir.mkdir()
+    edited_after_start = source_dir / "api.py"
+    edited_after_start.write_text("# edited after the container started\n")
+    newer_mtime = 1_800_000_100.0
+    os.utime(edited_after_start, (newer_mtime, newer_mtime))
+
+    def fake_runner(argv, **kwargs):
+        if "State.StartedAt" in argv[-2]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="2026-09-11T11:14:00.000000000Z\n", stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"{source_dir}\n", stderr="")
+
+    container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
+
+    with pytest.raises(harness.MountedCodeError, match="docker restart ha-exo-pool-dev"):
+        harness.assert_mounted_code_is_loaded(container, expected_source=source_dir)
+
+
+def test_assert_mounted_code_is_loaded_does_not_raise_when_mount_is_fresh_and_matching(tmp_path):
+    source_dir = tmp_path / "exo_pool"
+    source_dir.mkdir()
+    older_mtime = datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp()
+    (source_dir / "api.py").write_text("# fine\n")
+    os.utime(source_dir / "api.py", (older_mtime, older_mtime))
+
+    def fake_runner(argv, **kwargs):
+        if "State.StartedAt" in argv[-2]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="2026-09-19T11:14:00.000000000Z\n", stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"{source_dir}\n", stderr="")
+
+    container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
+
+    harness.assert_mounted_code_is_loaded(container, expected_source=source_dir)
+
+
+def test_assert_mounted_code_is_loaded_raises_when_mount_does_not_match_expected_repo(tmp_path):
+    wrong_source = tmp_path / "other-checkout" / "exo_pool"
+    wrong_source.mkdir(parents=True)
+    (wrong_source / "api.py").write_text("# elsewhere\n")
+    expected_source = tmp_path / "this-checkout" / "exo_pool"
+
+    def fake_runner(argv, **kwargs):
+        if "State.StartedAt" in argv[-2]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="2026-09-19T11:14:00.000000000Z\n", stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"{wrong_source}\n", stderr="")
+
+    container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
+
+    with pytest.raises(harness.MountedCodeError, match=f"{re.escape(str(wrong_source))}.*{re.escape(str(expected_source))}"):
+        harness.assert_mounted_code_is_loaded(container, expected_source=expected_source)
+
+
+def test_parse_docker_timestamp_handles_no_fractional_seconds():
+    assert harness._parse_docker_timestamp("2026-09-19T06:40:31Z") == pytest.approx(
+        datetime(2026, 9, 19, 6, 40, 31, tzinfo=timezone.utc).timestamp()
+    )
+
+
+def test_container_mount_source_raises_when_destination_not_mounted():
+    def fake_runner(argv, **kwargs):
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="\n", stderr="")
+
+    container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
+
+    with pytest.raises(RuntimeError, match="/config/custom_components/exo_pool"):
+        container.mount_source("/config/custom_components/exo_pool")
+
+
+def test_assert_mounted_code_is_loaded_raises_when_no_py_files_found(tmp_path):
+    source_dir = tmp_path / "exo_pool"
+    source_dir.mkdir()
+
+    def fake_runner(argv, **kwargs):
+        if "State.StartedAt" in argv[-2]:
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="2026-09-19T11:14:00.000000000Z\n", stderr="")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"{source_dir}\n", stderr="")
+
+    container = harness.Container("ha-exo-pool-dev", runner=fake_runner)
+
+    with pytest.raises(RuntimeError, match="no .py files"):
+        harness.assert_mounted_code_is_loaded(container, expected_source=source_dir)
 
 
 def test_best_effort_teardown_runs_all_actions_even_if_one_raises():

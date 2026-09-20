@@ -218,7 +218,14 @@ Regenerate it after changing `requirements-test.txt` with `make test-lock-regen`
 
 `scripts/verify_outage_reconnect.py` drives the running dev container through
 a simulated WAN outage - only ever against `ha-exo-pool-dev` on port 8125,
-never a live instance. It runs four scenarios:
+never a live instance. It never calls an HA service: every HA API call
+goes through `_ha_request`, which allows only GETs and a POST to the
+config-entry reload path, raising before any request goes out for
+anything else. `Container.exec` (and the netns sidecar's `docker run`)
+carry no such guard - they run whatever command they're given - but the
+only things this script ever asks them to do are read the HA log,
+manage iptables rules, and read/rewrite `/etc/hosts`. It runs four
+scenarios:
 
 - **reconnect-from-connected** (issue #2's actual reproduction): MQTT is
   connected, every one of its actual established peers is blocked (and
@@ -235,6 +242,39 @@ never a live instance. It runs four scenarios:
   `/etc/hosts` blackhole, while the config entry is reloaded - a different
   code path (setup, not the reconnect chain) - and pins what that does,
   including recovery once the outage clears.
+
+The #12 early-wake-on-reconnect behaviour (a held write retries the instant
+MQTT reconnects rather than waiting out the rest of its cooldown) is unit
+tested in `tests/test_api_write_manager_mqtt_throttle.py` instead of driven
+through this harness - it doesn't need a real device write to prove.
+`_ha_request`'s GET/reload-only allow-list is what keeps this harness from
+ever writing: `tests/test_verify_outage_reconnect.py` proves a write-service
+POST (and PUT/DELETE) never reach `urlopen`, that the script imports none
+of http/http.client/socket/ssl/requests/aiohttp/httpx/urllib3 (a denylist,
+so an unrelated new import like `itertools` doesn't fail it), and that
+`urlopen`/`build_opener`/`Request`/`HTTPConnection`/`HTTPSConnection` are
+named nowhere in the whole module except inside `_ha_request` itself - not
+just inside other functions. These guards catch accidental reintroduction
+of a device write; deliberate evasion (a string-built `getattr`, a
+host-side `subprocess` shelling out to `curl`, a container `exec`) is out
+of scope for them.
+
+Before any scenario runs, `assert_mounted_code_is_loaded()` checks the
+container against this checkout: that its mounted
+`custom_components/exo_pool` resolves to this repo's copy (not some other
+checkout's), and that `State.StartedAt` postdates the newest mtime under
+it. Config-entry reloads re-run setup but never re-import Python modules,
+so a container that predates an edit - or mounts a different checkout
+entirely - keeps running the old code with no error, indistinguishable
+from a real regression until you notice the mismatch. Run this script from
+the same checkout `docker-compose.dev.yml` mounts into `ha-exo-pool-dev`;
+if the mount points elsewhere, repoint it with
+`docker compose -p exo_pool -f docker-compose.dev.yml up -d --force-recreate`
+run from the checkout you want mounted. Restart with
+`docker restart ha-exo-pool-dev` if only the staleness check fires.
+`make dev` always passes `-p exo_pool`, so running it from a worktree
+reuses this same project and config volume instead of standing up a
+second, empty one under the worktree directory's own name.
 
 Two blocking mechanisms, deliberately not unified: reconnect-from-connected
 and interrupt-resume-recovers block by address - read from the container's

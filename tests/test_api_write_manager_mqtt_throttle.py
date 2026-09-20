@@ -428,6 +428,7 @@ class TestNoRestInsideCooldownAfterEarlyWake:
 
 
 class TestStateChangedCallbackWiring:
+    @pytest.mark.timeout(5)
     async def test_reconnect_callback_wakes_a_held_write_before_the_cooldown_ends(
         self, hass, entry, disconnected_mqtt, monkeypatch, fake_clock,
         post_write_cooldown_seconds,
