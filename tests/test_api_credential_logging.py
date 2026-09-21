@@ -445,7 +445,9 @@ async def test_async_update_data_refresh_token_exception_does_not_log_the_refres
     hass, entry, monkeypatch, caplog
 ):
     async def fake_refresh_token(hass, entry, session):
-        raise RuntimeError(f"refresh call failed for refresh_token={entry.data['refresh_token']}")
+        raise RuntimeError(
+            f"refresh call failed for refresh_token={entry.data['refresh_token']}"
+        )
 
     async def fake_full_login(hass, entry, session):
         return None
@@ -470,7 +472,9 @@ async def test_refresh_authentication_write_path_exception_does_not_log_the_refr
     hass, entry, monkeypatch, caplog
 ):
     async def fake_refresh_token(hass, entry, session):
-        raise RuntimeError(f"refresh call failed for refresh_token={entry.data['refresh_token']}")
+        raise RuntimeError(
+            f"refresh call failed for refresh_token={entry.data['refresh_token']}"
+        )
 
     async def fake_full_login(hass, entry, session):
         return None

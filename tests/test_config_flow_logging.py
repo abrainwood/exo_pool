@@ -22,7 +22,7 @@ LOGIN_RESPONSE = {
 class _FakeResponse:
     def __init__(self, status: int, payload: dict):
         self.status = status
-        self.headers: dict = {}
+        self.headers: dict = {"Set-Cookie": "session=leak-me"}
         self._payload = payload
 
     async def json(self):
@@ -66,8 +66,9 @@ async def test_config_flow_login_success_does_not_log_any_secret_value(
         await flow.async_step_user({"email": "pool.owner@example.com", "password": "hunter2"})
 
     log_text = caplog.text
-    for secret in ("auth-tok-abc123", "id-tok-abc123"):
+    for secret in ("auth-tok-abc123", "id-tok-abc123", "hunter2"):
         assert secret not in log_text
+    assert "leak-me" not in log_text
 
 
 async def test_config_flow_login_missing_id_token_does_not_log_the_partial_response(
@@ -334,6 +335,28 @@ async def test_login_client_response_error_logs_the_status_but_not_the_url(
 
     assert "429" in caplog.text
     assert "hunter2" not in caplog.text
+    assert config_flow.API_KEY_PROD not in caplog.text
+
+
+async def test_login_arbitrary_exception_does_not_log_the_query_string_secrets(
+    hass, monkeypatch, caplog
+):
+    session = _RaisingSession(
+        RuntimeError(
+            f"boom while posting to {config_flow.LOGIN_URL}"
+            f"?api_key={config_flow.API_KEY_PROD}"
+        )
+    )
+    monkeypatch.setattr(
+        config_flow.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+
+    flow = config_flow.ExoPoolConfigFlow()
+    flow.hass = hass
+
+    with caplog.at_level(logging.DEBUG):
+        await flow.async_step_user({"email": "pool.owner@example.com", "password": "hunter2"})
+
     assert config_flow.API_KEY_PROD not in caplog.text
 
 
