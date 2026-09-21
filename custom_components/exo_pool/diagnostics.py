@@ -28,4 +28,3 @@ async def async_get_config_entry_diagnostics(
         },
     }
     return async_redact_data(diag, SENSITIVE_KEYS)
-

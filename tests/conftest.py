@@ -51,6 +51,31 @@ def load_exo_pool_module(name: str):
     return module
 
 
+@pytest.fixture(autouse=True)
+def _reset_api_auth_state():
+    """Reset api's module-global auth-error state around each test.
+
+    load_exo_pool_module caches api in sys.modules for the whole session, so
+    these globals would otherwise leak between tests.
+    """
+    api = load_exo_pool_module("api")
+    api._last_auth_error = None
+    api._authentication_failed = False
+    yield
+    api._last_auth_error = None
+    api._authentication_failed = False
+
+
+SECRET_ENTRY_DATA = {
+    "serial_number": "JT00000000",
+    "email": "pool.owner@example.com",
+    "password": "hunter2",
+    "auth_token": "auth-tok-abc123",
+    "id_token": "id-tok-abc123",
+    "refresh_token": "refresh-tok-abc123",
+    "user_id": 42,
+}
+
 SAMPLE_CREDENTIALS = {
     "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
     "SecretKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
