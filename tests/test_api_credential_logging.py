@@ -339,7 +339,18 @@ async def test_full_login_auth_failure_leaves_no_raw_secret_in_last_auth_error(
     assert api._last_auth_error["password"] != "hunter2"
 
 
-def test_last_auth_error_state_does_not_leak_in_from_an_earlier_test():
+def test_reset_api_auth_state_fixture_clears_globals_dirtied_during_the_test():
+    from tests.conftest import _reset_api_auth_state
+
+    fixture = _reset_api_auth_state.__wrapped__()
+    next(fixture)
+
+    api._last_auth_error = {"password": "hunter2"}
+    api._authentication_failed = True
+
+    with pytest.raises(StopIteration):
+        next(fixture)
+
     assert api._last_auth_error is None
     assert api._authentication_failed is False
 

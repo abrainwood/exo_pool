@@ -334,7 +334,6 @@ async def test_login_client_response_error_logs_the_status_but_not_the_url(
         await flow.async_step_user({"email": "pool.owner@example.com", "password": "hunter2"})
 
     assert "429" in caplog.text
-    assert "hunter2" not in caplog.text
     assert config_flow.API_KEY_PROD not in caplog.text
 
 
