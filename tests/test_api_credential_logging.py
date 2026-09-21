@@ -339,11 +339,23 @@ async def test_full_login_auth_failure_leaves_no_raw_secret_in_last_auth_error(
     assert api._last_auth_error["password"] != "hunter2"
 
 
+def test_reset_api_auth_state_fixture_is_registered_autouse():
+    from tests.conftest import _reset_api_auth_state
+
+    assert _reset_api_auth_state._pytestfixturefunction.autouse is True
+
+
 def test_reset_api_auth_state_fixture_clears_globals_dirtied_during_the_test():
     from tests.conftest import _reset_api_auth_state
 
+    api._last_auth_error = {"password": "hunter2"}
+    api._authentication_failed = True
+
     fixture = _reset_api_auth_state.__wrapped__()
     next(fixture)
+
+    assert api._last_auth_error is None
+    assert api._authentication_failed is False
 
     api._last_auth_error = {"password": "hunter2"}
     api._authentication_failed = True
