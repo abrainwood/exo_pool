@@ -5,15 +5,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
-
-REDACT_FIELDS: set[str] = {
-    "email",
-    "password",
-    "auth_token",
-    "id_token",
-    "refresh_token",
-    "user_id",
-}
+from .redact import SENSITIVE_KEYS
 
 
 async def async_get_config_entry_diagnostics(
@@ -35,5 +27,4 @@ async def async_get_config_entry_diagnostics(
             "data": getattr(coordinator, "data", None),
         },
     }
-    return async_redact_data(diag, REDACT_FIELDS)
-
+    return async_redact_data(diag, SENSITIVE_KEYS)

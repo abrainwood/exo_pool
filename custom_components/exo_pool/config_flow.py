@@ -1,11 +1,13 @@
 import logging
 import urllib.parse
+import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import aiohttp_client
 
 from .const import DOMAIN
+from .redact import redact
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -58,18 +60,14 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     },
                 ) as resp:
                     _LOGGER.debug("Login raw response status: %s", resp.status)
-                    _LOGGER.debug("Login raw response headers: %s", resp.headers)
-                    raw_response = await resp.text()
-                    _LOGGER.debug("Login raw response text: %s", raw_response)
 
                     # Parse JSON response
                     try:
                         result = await resp.json()
                     except Exception as e:
                         _LOGGER.error(
-                            "Failed to parse login response JSON: %s, Raw: %s",
-                            e,
-                            raw_response,
+                            "Failed to parse login response JSON: %s",
+                            type(e).__name__,
                         )
                         errors["base"] = "unknown"
                         return self.async_show_form(
@@ -78,7 +76,7 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             errors=errors,
                         )
 
-                    _LOGGER.debug("Login response parsed: %s", result)
+                    _LOGGER.debug("Login response parsed: %s", redact(result))
                     _LOGGER.debug(
                         "Condition check: status=%s, auth_token=%s, userPoolOAuth=%s",
                         resp.status == 200,
@@ -96,7 +94,7 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         self.user_id = result["id"]
                         if not self.id_token:
                             _LOGGER.error(
-                                "No userPoolOAuth.IdToken in response: %s", result
+                                "No userPoolOAuth.IdToken in response: %s", redact(result)
                             )
                             errors["base"] = "auth_failed"
                         else:
@@ -108,12 +106,20 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         _LOGGER.error(
                             "Login response invalid: Status=%s, Result=%s",
                             resp.status,
-                            result,
+                            redact(result),
                         )
                         errors["base"] = "auth_failed"
 
+            except aiohttp.ClientResponseError as e:
+                # str(e) can embed the request URL's query-string secrets.
+                _LOGGER.error(
+                    "Unexpected error during login: %s (status %s)",
+                    type(e).__name__,
+                    e.status,
+                )
+                errors["base"] = "unknown"
             except Exception as e:
-                _LOGGER.exception("Unexpected error during login: %s", e)
+                _LOGGER.error("Unexpected error during login: %s", type(e).__name__)
                 errors["base"] = "unknown"
 
         return self.async_show_form(
@@ -141,7 +147,7 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         try:
             async with session.get(system_url) as resp:
                 result = await resp.json()
-                _LOGGER.debug("System discovery result: %s", result)
+                _LOGGER.debug("System discovery result: %s", redact(result))
 
             if not isinstance(result, list) or not result:
                 errors["base"] = "no_systems"
@@ -177,7 +183,16 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors={},
             )
 
-        except Exception:
-            _LOGGER.exception("Error during system selection")
+        except aiohttp.ClientResponseError as err:
+            # str(err) can embed the request URL's query-string secrets.
+            _LOGGER.error(
+                "Error during system selection: %s (status %s)",
+                type(err).__name__,
+                err.status,
+            )
+            errors["base"] = "unknown"
+            return self.async_show_form(step_id="select_system", errors=errors)
+        except Exception as err:
+            _LOGGER.error("Error during system selection: %s", type(err).__name__)
             errors["base"] = "unknown"
             return self.async_show_form(step_id="select_system", errors=errors)

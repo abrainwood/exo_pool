@@ -8,6 +8,7 @@ import logging
 from .const import DOMAIN
 from .api import get_coordinator, cleanup_entry
 from . import api as exo_api
+from .redact import redact
 from homeassistant.helpers.device_registry import DeviceRegistry, async_get
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
@@ -20,7 +21,7 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Exo Pool from a config entry."""
-    _LOGGER.debug("Setting up Exo Pool: %s", entry.data)
+    _LOGGER.debug("Setting up Exo Pool: %s", redact(entry.data))
     hass.data.setdefault(DOMAIN, {})
 
     # Initialize shared coordinator
