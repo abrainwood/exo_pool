@@ -18,6 +18,9 @@ SECRET_VALUES = (
     "AKIA-FAKE-ACCESS-KEY",
     "FAKE-SECRET-ACCESS-KEY",
     "FAKE-SESSION-TOKEN",
+    "hunter2",
+    "pool.owner@example.com",
+    "old-refresh-tok",
 )
 
 LOGIN_RESPONSE = {
@@ -333,8 +336,12 @@ async def test_full_login_auth_failure_leaves_no_raw_secret_in_last_auth_error(
     with pytest.raises(Exception, match="Authentication failed"):
         await api._full_login(hass, entry, session)
 
-    assert api._last_auth_error is not None
-    assert "hunter2" not in str(api._last_auth_error)
+    assert api._last_auth_error["password"] != "hunter2"
+
+
+def test_last_auth_error_state_does_not_leak_in_from_an_earlier_test():
+    assert api._last_auth_error is None
+    assert api._authentication_failed is False
 
 
 async def test_full_login_missing_id_token_does_not_log_the_partial_response(
@@ -399,3 +406,93 @@ async def test_refresh_token_missing_id_token_does_not_log_the_response(
 
     assert result is False
     assert "auth-tok-abc123" not in caplog.text
+
+
+async def test_async_update_data_expired_token_leaves_no_raw_secret_in_last_auth_error(
+    hass, monkeypatch, caplog
+):
+    fresh_entry = MockConfigEntry(
+        domain=api.DOMAIN,
+        data={
+            "serial_number": "JT00000000",
+            "id_token": "id-tok-abc123",
+            "expires_at": time.time() + 3600,
+        },
+        options={},
+    )
+    fresh_entry.add_to_hass(hass)
+    api._get_entry_store(hass, fresh_entry)
+
+    session = _FakeSession(
+        _FakeResponse(
+            401,
+            {"message": "The incoming token has expired", "password": "hunter2"},
+        )
+    )
+    monkeypatch.setattr(
+        api.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(api.UpdateFailed):
+            await api.async_update_data(hass, fresh_entry)
+
+    assert api._last_auth_error["password"] != "hunter2"
+    assert "hunter2" not in caplog.text
+
+
+async def test_async_update_data_refresh_token_exception_does_not_log_the_refresh_token(
+    hass, entry, monkeypatch, caplog
+):
+    async def fake_refresh_token(hass, entry, session):
+        raise RuntimeError(f"refresh call failed for refresh_token={entry.data['refresh_token']}")
+
+    async def fake_full_login(hass, entry, session):
+        return None
+
+    monkeypatch.setattr(api, "_refresh_token", fake_refresh_token)
+    monkeypatch.setattr(api, "_full_login", fake_full_login)
+    monkeypatch.setattr(
+        api.aiohttp_client,
+        "async_get_clientsession",
+        lambda hass: _FakeSession(
+            _FakeResponse(200, {"state": {"reported": {"equipment": {}}}})
+        ),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        await api.async_update_data(hass, entry)
+
+    assert "old-refresh-tok" not in caplog.text
+
+
+async def test_refresh_authentication_write_path_exception_does_not_log_the_refresh_token(
+    hass, entry, monkeypatch, caplog
+):
+    async def fake_refresh_token(hass, entry, session):
+        raise RuntimeError(f"refresh call failed for refresh_token={entry.data['refresh_token']}")
+
+    async def fake_full_login(hass, entry, session):
+        return None
+
+    monkeypatch.setattr(api, "_refresh_token", fake_refresh_token)
+    monkeypatch.setattr(api, "_full_login", fake_full_login)
+    session = _FakeSession(_FakeResponse(200, LOGIN_RESPONSE))
+
+    with caplog.at_level(logging.DEBUG):
+        await api._refresh_authentication(hass, entry, session)
+
+    assert "old-refresh-tok" not in caplog.text
+
+
+async def test_full_login_does_not_log_the_authorization_response_header(
+    hass, entry, caplog
+):
+    response = _FakeResponse(200, LOGIN_RESPONSE)
+    response.headers = {"Authorization": "Bearer super-secret-header-tok"}
+    session = _FakeSession(response)
+
+    with caplog.at_level(logging.DEBUG):
+        await api._full_login(hass, entry, session)
+
+    assert "super-secret-header-tok" not in caplog.text

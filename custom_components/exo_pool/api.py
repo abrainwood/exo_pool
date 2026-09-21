@@ -420,7 +420,10 @@ async def async_update_data(hass: HomeAssistant, entry: ConfigEntry):
             try:
                 refreshed = await _refresh_token(hass, entry, session)
             except Exception as e:
-                _LOGGER.debug("Token refresh failed: %s, falling back to full login", e)
+                _LOGGER.debug(
+                    "Token refresh failed: %s, falling back to full login",
+                    type(e).__name__,
+                )
 
         if not refreshed:
             # Full login
@@ -889,7 +892,9 @@ async def _refresh_authentication(
         try:
             refreshed = await _refresh_token(hass, entry, session)
         except Exception as err:
-            _LOGGER.debug("Token refresh failed during write: %s", err)
+            _LOGGER.debug(
+                "Token refresh failed during write: %s", type(err).__name__
+            )
 
     if not refreshed:
         await _full_login(hass, entry, session)

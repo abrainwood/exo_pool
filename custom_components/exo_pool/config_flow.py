@@ -65,7 +65,10 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     try:
                         result = await resp.json()
                     except Exception as e:
-                        _LOGGER.error("Failed to parse login response JSON: %s", e)
+                        _LOGGER.error(
+                            "Failed to parse login response JSON: %s",
+                            type(e).__name__,
+                        )
                         errors["base"] = "unknown"
                         return self.async_show_form(
                             step_id="user",
@@ -107,8 +110,16 @@ class ExoPoolConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         )
                         errors["base"] = "auth_failed"
 
+            except aiohttp.ClientResponseError as e:
+                # str(e) can embed the request URL's query-string secrets.
+                _LOGGER.error(
+                    "Unexpected error during login: %s (status %s)",
+                    type(e).__name__,
+                    e.status,
+                )
+                errors["base"] = "unknown"
             except Exception as e:
-                _LOGGER.exception("Unexpected error during login: %s", e)
+                _LOGGER.error("Unexpected error during login: %s", type(e).__name__)
                 errors["base"] = "unknown"
 
         return self.async_show_form(

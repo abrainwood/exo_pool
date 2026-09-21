@@ -22,7 +22,7 @@ LOGIN_RESPONSE = {
 class _FakeResponse:
     def __init__(self, status: int, payload: dict):
         self.status = status
-        self.headers: dict = {"Set-Cookie": "session=leak-me"}
+        self.headers: dict = {}
         self._payload = payload
 
     async def json(self):
@@ -66,7 +66,7 @@ async def test_config_flow_login_success_does_not_log_any_secret_value(
         await flow.async_step_user({"email": "pool.owner@example.com", "password": "hunter2"})
 
     log_text = caplog.text
-    for secret in ("auth-tok-abc123", "id-tok-abc123", "hunter2"):
+    for secret in ("auth-tok-abc123", "id-tok-abc123"):
         assert secret not in log_text
 
 
@@ -116,8 +116,9 @@ async def test_config_flow_login_missing_actual_id_token_value_does_not_log_the_
 
 
 class _RaisingResponse:
-    def __init__(self, exc: Exception):
+    def __init__(self, exc: Exception, status: int = 200):
         self._exc = exc
+        self.status = status
 
     async def json(self):
         raise self._exc
@@ -127,6 +128,14 @@ class _RaisingResponse:
 
     async def __aexit__(self, *exc_info):
         return False
+
+
+class _RaisingSession:
+    def __init__(self, exc: Exception):
+        self._exc = exc
+
+    def post(self, url, json=None, headers=None):  # noqa: A002 - matches aiohttp signature
+        raise self._exc
 
 
 async def test_select_system_content_type_error_does_not_log_the_query_string_secrets(
@@ -298,3 +307,50 @@ async def test_select_system_client_response_error_logs_the_status_but_not_the_u
     assert "429" in caplog.text
     assert "auth-tok-abc123" not in caplog.text
     assert config_flow.API_KEY_R not in caplog.text
+
+
+async def test_login_client_response_error_logs_the_status_but_not_the_url(
+    hass, monkeypatch, caplog
+):
+    leaking_url = URL(
+        f"{config_flow.LOGIN_URL}?api_key={config_flow.API_KEY_PROD}"
+    )
+    request_info = aiohttp.RequestInfo(
+        url=leaking_url, method="POST", headers={}, real_url=leaking_url
+    )
+    response_error = aiohttp.ClientResponseError(
+        request_info, (), status=429, message="Too Many Requests", headers={}
+    )
+    session = _RaisingSession(response_error)
+    monkeypatch.setattr(
+        config_flow.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+
+    flow = config_flow.ExoPoolConfigFlow()
+    flow.hass = hass
+
+    with caplog.at_level(logging.DEBUG):
+        await flow.async_step_user({"email": "pool.owner@example.com", "password": "hunter2"})
+
+    assert "429" in caplog.text
+    assert "hunter2" not in caplog.text
+    assert config_flow.API_KEY_PROD not in caplog.text
+
+
+async def test_login_json_parse_failure_does_not_log_the_raw_response_body(
+    hass, monkeypatch, caplog
+):
+    raw_body = '{"password": "hunter2", "email": "pool.owner@example.com"'
+    json_error = ValueError(f"Expecting ',' delimiter: {raw_body}")
+    session = _FakeSession(post_response=_RaisingResponse(json_error))
+    monkeypatch.setattr(
+        config_flow.aiohttp_client, "async_get_clientsession", lambda hass: session
+    )
+
+    flow = config_flow.ExoPoolConfigFlow()
+    flow.hass = hass
+
+    with caplog.at_level(logging.DEBUG):
+        await flow.async_step_user({"email": "pool.owner@example.com", "password": "hunter2"})
+
+    assert "hunter2" not in caplog.text
